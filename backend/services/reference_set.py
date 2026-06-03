@@ -62,9 +62,16 @@ def material_role(material: dict) -> str:
     return "support" if (material.get("role") == "support") else "character"
 
 
-def cap(items: list, max_n: int) -> list:
-    """Return the highest-priority *max_n* items (stable within a priority tier)."""
-    items = [it for it in (items or []) if it.get("b64")]
+def cap(items: list, max_n: int, require_b64: bool = True) -> list:
+    """Return the highest-priority *max_n* items (stable within a priority tier).
+
+    require_b64=True（生成时）：只保留真正随附了 b64 的图，与最终发送的图片数组一一
+    对应。False（工作台预览）：按相同优先级排序/裁剪资产元数据（不读 b64），使预览
+    的【画面定义】@图N 编号与实际发送数组逐位一致。"""
+    if require_b64:
+        items = [it for it in (items or []) if it.get("b64")]
+    else:
+        items = list(items or [])
     if max_n is None or max_n <= 0:
         return items
     # Python's sort is stable, so equal-rank items keep their insertion order.

@@ -305,26 +305,26 @@ def build_video_prompt(task: dict, image_prompt: str) -> str:
     return vid or (image_prompt or "")
 
 
-def _preview_definition_block(task: dict, kind: str = "video") -> str:
-    """工作台预览用【画面定义】块：按本镜已校验有参考图的资产元数据（角色/场景/道具）
-    预排编号，给用户可见的近似定义行。生成时由 compose_prompt 以权威定义（含运行期
-    尾帧/导演图/站位图）覆盖，且幂等不重复堆叠。"""
-    items = []
-    for m in task.get("materials", []) or []:
-        if not m.get("ref_image"):
-            continue
-        items.append({"role": reference_set.material_role(m), "name": m.get("name")})
-    if not items:
+def _preview_definition_block(pid: Optional[str], task: dict,
+                              kind: str = "video") -> str:
+    """工作台预览用【画面定义】块：复用与「实际生成」完全相同的 _asset_ref_items +
+    cap 排序逻辑（含场景鸟瞰图 scene_aerial 注入、相同优先级裁剪），仅不读 b64。
+    这样预览里 @图N 的编号/对象与点生成后真正发送的参考图数组逐位一致，杜绝错乱。
+
+    生成时由 compose_prompt 以权威定义（另含运行期尾帧/导演图/站位图等仅运行期可知
+    的图）覆盖，且幂等不重复堆叠。"""
+    items = _asset_ref_items(pid, task, with_b64=False)
+    kept = reference_set.cap(items, _max_refs(), require_b64=False)
+    if not kept:
         return ""
-    items.sort(key=lambda it: reference_set.ROLE_RANK.get(it.get("role"), 99))
-    items = items[:_max_refs()]
-    return reference_set.build_definition_block(items, kind, require_b64=False)
+    return reference_set.build_definition_block(kept, kind, require_b64=False)
 
 
-def _with_preview_def(task: dict, video_prompt: str, kind: str = "video") -> str:
+def _with_preview_def(pid: Optional[str], task: dict, video_prompt: str,
+                      kind: str = "video") -> str:
     """Prepend the preview【画面定义】block to *video_prompt* (idempotent)."""
     body = reference_set.strip_definition_block(video_prompt or "")
-    head = _preview_definition_block(task, kind)
+    head = _preview_definition_block(pid, task, kind)
     if not head:
         return body
     return head + "\n\n" + body if body else head
@@ -339,6 +339,7 @@ def build_shot_prompts(project: dict, shot_nos: Optional[list] = None) -> dict:
     video variant is rendered from the user-editable `video_prompt` template
     (default = image description + engine-composed 【镜头动态】).
     """
+    pid = project.get("_pid") or project.get("id")
     want = {str(n) for n in shot_nos} if shot_nos else None
     out: dict = {}
     prev_ho = ""  # 上一镜的收尾接口(handoff)，用于本镜首帧承接 → 整体联动
@@ -349,7 +350,7 @@ def build_shot_prompts(project: dict, shot_nos: Optional[list] = None) -> dict:
         if want is None or str(no) in want:
             img = t.get("prompt", "") or ""
             out[no] = {"image": img,
-                       "video": _with_preview_def(t, build_video_prompt(t, img))}
+                       "video": _with_preview_def(pid, t, build_video_prompt(t, img))}
         prev_ho = (t.get("handoff_ref") or t.get("handoff") or "").strip()
     return out
 
@@ -383,6 +384,7 @@ def infer_shot_prompt(project: dict, shot_no, *, model: Optional[str] = None) ->
     ②本镜关联资产的说明文本（@角色/#场景/$道具 → 名称+描述+外观）；③本镜结构字段
     与目标时长。剔除非画面元素（心理活动/旁白叙述等）。任何 LLM 异常回落到确定性合成。
     """
+    pid = project.get("_pid") or project.get("id")
     target, prev_ho = None, ""
     for t in build_tasks_from_shots(project):  # 全量按序，取得上一镜 handoff
         if str(t.get("shot_no")) == str(shot_no):
@@ -426,14 +428,15 @@ def infer_shot_prompt(project: dict, shot_no, *, model: Optional[str] = None) ->
         vid = video or build_video_prompt(target, image or img_draft)
         return {
             "image": image or img_draft,
-            "video": _with_preview_def(target, vid),
+            "video": _with_preview_def(pid, target, vid),
             "source": "llm",
         }
     except Exception as e:  # noqa: BLE001 — 任意异常都回落到确定性合成，保证可用
         logger.warning("infer_shot_prompt 回落确定性合成 (%s): %s", shot_no, e)
         return {
             "image": img_draft,
-            "video": _with_preview_def(target, build_video_prompt(target, img_draft)),
+            "video": _with_preview_def(pid, target,
+                                       build_video_prompt(target, img_draft)),
             "source": "fallback",
             "error": str(e),
         }
@@ -458,11 +461,17 @@ def _max_refs() -> int:
         return 8
 
 
-def _asset_ref_items(pid: str, task: dict) -> list:
+def _asset_ref_items(pid: str, task: dict, with_b64: bool = True) -> list:
     """Reference items for a task's @/#/$ asset materials (those with a ref image).
 
     场景资产若另有「鸟瞰图」(aerial_image)，紧随其主场景图一并作为参考喂入，用于
-    固定场景空间位置与机位布局（角色 scene_aerial，优先级紧随主场景图之后）。"""
+    固定场景空间位置与机位布局（角色 scene_aerial，优先级紧随主场景图之后）。
+
+    with_b64=True（生成）：读取并附带 base64，作为实际发送的参考图数组。
+    with_b64=False（预览）：只做存在性校验并产出同序的元数据（role/name/asset_id），
+    供工作台【画面定义】@图N 与实际发送数组逐位对齐用，避免读盘开销。"""
+    if not pid:
+        return []
     asset_dir = PROJECTS_DIR / pid / "assets"
     by_id = {a.get("id"): a for a in assets_core.list_assets(pid)}
     items = []
@@ -473,24 +482,29 @@ def _asset_ref_items(pid: str, task: dict) -> list:
         path = asset_dir / fn
         if not path.exists():
             continue
-        items.append({
-            "b64": base64.b64encode(path.read_bytes()).decode("utf-8"),
+        it = {
             "role": reference_set.material_role(m),
             "name": m.get("name"),
             "asset_id": m.get("asset_id"),
             "old_ph": m.get("placeholder"),
-        })
+        }
+        if with_b64:
+            it["b64"] = base64.b64encode(path.read_bytes()).decode("utf-8")
+        items.append(it)
         asset = by_id.get(m.get("asset_id")) or {}
         aerial_fn = asset.get("aerial_image")
         if aerial_fn:
             aerial_path = asset_dir / aerial_fn
             if aerial_path.exists():
-                items.append({
-                    "b64": base64.b64encode(aerial_path.read_bytes()).decode("utf-8"),
+                ait = {
                     "role": "scene_aerial",
                     "name": m.get("name"),
                     "asset_id": m.get("asset_id"),
-                })
+                }
+                if with_b64:
+                    ait["b64"] = base64.b64encode(
+                        aerial_path.read_bytes()).decode("utf-8")
+                items.append(ait)
     return items
 
 

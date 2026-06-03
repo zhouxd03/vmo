@@ -411,7 +411,7 @@ def register(app: Flask) -> None:
         _eid, ep = _resolve_episode(pid, body)
         if not ep:
             return jsonify({"error": "分集不存在"}), 404
-        ctx = {**ep, "assets": p.get("assets", []),
+        ctx = {**ep, "_pid": pid, "assets": p.get("assets", []),
                "story_bible": p.get("story_bible")}
         prompts = batch_engine.build_shot_prompts(ctx, body.get("shot_nos"))
         return jsonify({"prompts": prompts})
@@ -429,7 +429,7 @@ def register(app: Flask) -> None:
         _eid, ep = _resolve_episode(pid, body)
         if not ep:
             return jsonify({"error": "分集不存在"}), 404
-        ctx = {**ep, "assets": p.get("assets", []),
+        ctx = {**ep, "_pid": pid, "assets": p.get("assets", []),
                "story_bible": p.get("story_bible")}
         try:
             res = batch_engine.infer_shot_prompt(ctx, shot_no, model=body.get("model"))
