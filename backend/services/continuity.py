@@ -145,6 +145,7 @@ def decide_handoff(shot: dict, prev_state: dict, *, use_llm: bool = False,
             "props": "、".join(sorted(_names(shot.get("props")))) or "（无）",
             "action": shot.get("action", ""),
             "camera": shot.get("camera", ""),
+            "handoff": shot.get("handoff", ""),
         })
         out = llm.chat_json([{"role": "user", "content": prompt}], model=model, temperature=0.2)
         if isinstance(out, dict):
