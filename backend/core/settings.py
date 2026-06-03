@@ -12,6 +12,10 @@ DEFAULTS = {
     "video_resolution": "720p",
     "video_duration": 10,
     "video_timeout": 300,
+    # 分镜：单个分镜的目标时长（秒）。拆解剧本时按此折算单镜承载的文字量——
+    # 纯画面/旁白 ≈8字/秒（120字≈15秒），对白 ≈5字/秒；一镜对白越多则承载文字
+    # 越少，避免"对话过载"。单镜估算时长也以此为中心，最终钳制到模型 15s 上限。
+    "shot_target_seconds": 10,
     # llm: model used for multimodal continuity review (must support image input)
     "vision_model": "qwen3-vl-plus",
     # batch engine

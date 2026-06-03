@@ -28,6 +28,52 @@ def register(app: Flask) -> None:
             return jsonify({"error": "项目不存在"}), 404
         return jsonify(p)
 
+    @app.route("/api/projects/<pid>/overview", methods=["GET"])
+    def project_overview(pid):
+        """项目概览：每集的体量 + 按批次聚合的图片/视频任务进度（done/total/error）。
+        供概览页项目管理钻取使用，一次返回，避免逐集多次请求。"""
+        p = projects.get_project(pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        # 按 episode_id + kind 聚合批次进度
+        agg: dict = {}
+        for b in batches.list_batches(pid):
+            eid = b.get("episode_id")
+            kind = b.get("kind", "image")
+            slot = agg.setdefault(eid, {
+                "image": {"done": 0, "total": 0, "error": 0},
+                "video": {"done": 0, "total": 0, "error": 0},
+            })
+            if kind in slot:
+                slot[kind]["done"] += b.get("done", 0)
+                slot[kind]["total"] += b.get("total", 0)
+                slot[kind]["error"] += b.get("error", 0)
+        eps = []
+        for ep in p.get("episodes", []):
+            prog = agg.get(ep["id"], {
+                "image": {"done": 0, "total": 0, "error": 0},
+                "video": {"done": 0, "total": 0, "error": 0},
+            })
+            eps.append({
+                "id": ep["id"],
+                "idx": ep.get("idx"),
+                "name": ep.get("name", ""),
+                "stage": ep.get("stage", "imported"),
+                "segment_count": len(ep.get("segments", [])),
+                "shot_count": len(ep.get("shots", [])),
+                "char_count": ep.get("char_count", 0),
+                "progress": prog,
+            })
+        return jsonify({
+            "id": p["id"],
+            "name": p.get("name", ""),
+            "episode_count": len(eps),
+            "segment_count": sum(e["segment_count"] for e in eps),
+            "shot_count": sum(e["shot_count"] for e in eps),
+            "updated_at": p.get("updated_at"),
+            "episodes": eps,
+        })
+
     @app.route("/api/projects/<pid>", methods=["DELETE"])
     def delete_project(pid):
         projects.delete_project(pid)
@@ -41,10 +87,17 @@ def register(app: Flask) -> None:
         name = body.get("name", "")
         if not text.strip():
             return jsonify({"error": "文本为空"}), 400
-        episodes = episode_splitter.split_into_episodes(text, file_type)
+        use_llm = body.get("use_llm", True)
+        llm_model = body.get("llm_model") or None
+        split_meta: dict = {}
+        episodes = episode_splitter.split_into_episodes(
+            text, file_type, use_llm=use_llm, llm_model=llm_model, meta=split_meta)
         if not episodes:
             return jsonify({"error": "未解析出任何片段，请检查文件格式"}), 400
         project = projects.create_project(name, episodes=episodes)
+        # 自适应分集结果（method: markers/llm/volume；episodes: 集数）供前端 toast 提示
+        project = dict(project)
+        project["split"] = split_meta
         return jsonify(project)
 
     # ── episodes (集) ──

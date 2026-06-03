@@ -91,18 +91,56 @@ def build_tasks_from_shots(project: dict, shot_nos: Optional[list] = None) -> li
     return tasks
 
 
+_CONSISTENCY_GUARD = (
+    "镜头运动自然流畅、画面无跳帧；保持人物外形、服装与道具形制和参考图严格一致；"
+    "物体保持刚性不变形/不融化、手与道具咬合自然、人物不随镜头平移滑步、重力方向真实、"
+    "禁止多手多指/穿模；禁止字幕、禁止水印"
+)
+
+_LONG_TAKE_KW = ("长镜头", "一镜到底", "无缝", "不切", "连续运动")
+
+
+def _transition_of(task: dict) -> str:
+    """衔接方式：默认切镜头/景别切换；仅当 handoff/camera 显式标注长镜头时才连续。"""
+    blob = f"{task.get('handoff','')} {task.get('camera','')}"
+    if any(k in blob for k in _LONG_TAKE_KW):
+        return "长镜头无缝衔接，运动/构图/光线自上一镜自然延续"
+    return "与上一镜切镜头/景别切换衔接，承接其人物状态与站位"
+
+
+def _first_frame_anchor(task: dict) -> str:
+    """首帧动作锚定（权重最高）：先写主体+姿态/动作，再写所在场景。"""
+    chars = "、".join(task.get("characters", []) or [])
+    scene = (task.get("scene") or "").strip()
+    act = (task.get("action") or "").strip()
+    lead = chars or "主体"
+    bits = [b for b in (f"{lead}{('，' + act) if act else ''}", scene and f"位于{scene}") if b]
+    return "，".join(bits)
+
+
 def _video_dynamics(task: dict) -> str:
-    """Motion/pacing directives that turn a static image prompt into a video
-    prompt: camera movement, subject action, emotional pacing + duration, and a
-    consistency guard. Deterministic (no LLM) so it works offline & spends no
-    credits, while staying editable by the user in the worktable."""
+    """Turn a static image prompt into a rich video directive by weaving together
+    分镜信息 (景别/运镜/动作/情绪/时长/台词) 与 衔接信息 (handoff/转场)，组织成
+    「首帧锚定→运镜→动作过程→衔接→台词→节奏→防穿帮」的结构化镜头描述。
+    Deterministic (no LLM) so it works offline & spends no credits, while staying
+    fully editable by the user in the worktable / 模板 tab."""
     parts = []
+    anchor = _first_frame_anchor(task)
+    if anchor:
+        parts.append(f"首帧锚定（最高权重）：{anchor}，作为视频起幅画面")
     cam = (task.get("camera") or "").strip()
     if cam:
         parts.append(f"运镜与景别：{cam}")
     act = (task.get("action") or "").strip()
     if act:
-        parts.append(f"主体动作：{act}")
+        parts.append(f"动作过程：{act}")
+    parts.append(f"衔接：{_transition_of(task)}")
+    ho = (task.get("handoff") or "").strip()
+    if ho:
+        parts.append(f"本镜收尾接口：{ho}")
+    dlg = (task.get("dialogue") or "").strip()
+    if dlg:
+        parts.append(f"台词/旁白（声画同步，不出字幕）：{dlg}")
     emo = (task.get("emotion") or "").strip()
     dur = task.get("duration")
     pace = []
@@ -115,11 +153,8 @@ def _video_dynamics(task: dict) -> str:
         pass
     if pace:
         parts.append("节奏：" + "，".join(pace))
-    parts.append(_CONSISTENCY_GUARD)
+    parts.append("防穿帮/一致性：" + _CONSISTENCY_GUARD)
     return "；".join(parts)
-
-
-_CONSISTENCY_GUARD = "镜头运动自然流畅、画面无跳帧；保持人物外形、服装与道具形制和参考图一致"
 
 
 def _video_prompt_vars(task: dict, image_prompt: str) -> dict:
@@ -135,14 +170,17 @@ def _video_prompt_vars(task: dict, image_prompt: str) -> dict:
     return {
         "image_prompt": (image_prompt or "").rstrip("。，、 "),
         "dynamics": _video_dynamics(task),
+        "first_frame": _first_frame_anchor(task),
+        "transition": _transition_of(task),
+        "handoff": (task.get("handoff") or "").strip(),
         "camera": (task.get("camera") or "").strip(),
         "action": (task.get("action") or "").strip(),
         "emotion": (task.get("emotion") or "").strip(),
         "duration": dur,
         "dialogue": (task.get("dialogue") or "").strip(),
         "scene": (task.get("scene") or "").strip(),
-        "characters": " ".join(task.get("characters", []) or []),
-        "props": " ".join(task.get("props", []) or []),
+        "characters": "、".join(task.get("characters", []) or []),
+        "props": "、".join(task.get("props", []) or []),
         "consistency": _CONSISTENCY_GUARD,
     }
 
@@ -209,10 +247,12 @@ def _asset_ref_items(pid: str, task: dict) -> list:
     return items
 
 
-def _finalize_refs(task: dict, items: list) -> tuple[list, str]:
-    """Cap *items* by priority and build the labeled prompt. Returns (b64s, prompt)."""
+def _finalize_refs(task: dict, items: list, kind: str = "video") -> tuple[list, str]:
+    """Cap *items* by priority and build the unified-@ reference prompt.
+    Returns (b64s, prompt)."""
     kept = reference_set.cap(items, _max_refs())
-    prompt = reference_set.compose_prompt(task.get("prompt", ""), task.get("materials", []), kept)
+    prompt = reference_set.compose_prompt(
+        task.get("prompt", ""), task.get("materials", []), kept, kind=kind)
     return [it["b64"] for it in kept], prompt
 
 
@@ -250,7 +290,7 @@ def _out_dir(pid: str, bid: str):
 
 # ── generators (real) ───────────────────────────────────────────────────────
 def _gen_image_task(pid, batch, task, params):
-    refs, prompt = _finalize_refs(task, _asset_ref_items(pid, task))
+    refs, prompt = _finalize_refs(task, _asset_ref_items(pid, task), kind="image")
     out = image_gen.generate_image(
         prompt,
         model=params.get("model"),

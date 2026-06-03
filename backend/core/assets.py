@@ -127,23 +127,27 @@ def resolve_mentions(text: str, assets: list) -> dict:
     """Scan text, auto-detect referenced assets, build materials + placeholder text.
 
     Returns {
-      "materials": [{asset_id, trigger, name, ref_image, placeholder}],
-      "text": text with each mention replaced by @image1/@image2/…,
+      "materials": [{asset_id, trigger, type, role, name, ref_image, placeholder}],
+      "text": text with each mention replaced by a unified @名 token,
       "warnings": ["引用了 @X 但缺少参考图"],
     }
     Matches by explicit "@name"/"#name"/"$name" first, then by bare name.
+
+    生成提示词里所有引用统一用 ``@`` 前缀（``@角色``/``@背景``/``@道具``）——库内
+    #场景/$道具 仅作分类，喂给生成模型时一律 @名。库分类符先被替换成与名字无关的
+    哨兵，最后再一次性映射为 @名，避免名字互为子串时的二次替换串台。
     """
     text = text or ""
     materials: list = []
     warnings: list = []
     seen: dict = {}
+    sentinels: dict = {}
 
-    def _placeholder_for(asset):
+    def _token_for(asset) -> str:
         if asset["id"] in seen:
             return seen[asset["id"]]
-        idx = len(materials) + 1
-        ph = f"@image{idx}"
-        seen[asset["id"]] = ph
+        token = "@" + asset["name"]          # 统一 @名（不论 @/#/$ 分类）
+        seen[asset["id"]] = token
         materials.append({
             "asset_id": asset["id"],
             "trigger": asset["trigger"],
@@ -151,28 +155,27 @@ def resolve_mentions(text: str, assets: list) -> dict:
             "role": asset.get("role") or "main",
             "name": asset["name"],
             "ref_image": asset.get("ref_image"),
-            "placeholder": ph,
+            "placeholder": token,
         })
         if not asset.get("ref_image"):
             warnings.append(f"引用了 {asset['trigger']}{asset['name']} 但缺少参考图，将跳过垫图")
-        return ph
+        return token
 
     # longer names first to avoid partial shadowing
     ordered = sorted(assets, key=lambda a: len(a["name"]), reverse=True)
-    for a in ordered:
+    for idx, a in enumerate(ordered):
         name = re.escape(a["name"])
         trig = re.escape(a["trigger"])
-        # explicit trigger form: @name / #name / $name
-        pat_explicit = re.compile(trig + name)
-        # bare form: just the name
-        pat_bare = re.compile(name)
-        if pat_explicit.search(text):
-            ph = _placeholder_for(a)
-            text = pat_explicit.sub(ph, text)
-            text = pat_bare.sub(ph, text)
-        elif pat_bare.search(text):
-            ph = _placeholder_for(a)
-            text = pat_bare.sub(ph, text)
+        pat_explicit = re.compile(trig + name)   # @name / #name / $name
+        pat_bare = re.compile(name)              # bare name
+        if pat_explicit.search(text) or pat_bare.search(text):
+            _token_for(a)
+            sent = f"\x00M{idx}\x00"             # 名字无关的哨兵，杜绝子串串台
+            sentinels[sent] = seen[a["id"]]
+            text = pat_explicit.sub(sent, text)
+            text = pat_bare.sub(sent, text)
+    for sent, token in sentinels.items():
+        text = text.replace(sent, token)
     return {"materials": materials, "text": text, "warnings": warnings}
 
 

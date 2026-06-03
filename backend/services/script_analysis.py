@@ -14,6 +14,7 @@ import logging
 from typing import Any, Callable, Optional
 
 from ..core import prompt_templates as tpl
+from ..core import settings as settings_store
 from . import llm, pacing
 
 logger = logging.getLogger("batch_studio")
@@ -153,6 +154,14 @@ def run_decompose(
     total = len(chunks)
     body = tpl.get_template_body("batch_decompose")
     bible_sum = _bible_summary(bible)
+    # 「单镜目标时长」(设置) → 单镜承载字数（纯画面≈8字/秒）。拆解时按此控制每镜体量；
+    # 对白多的镜由模板按≈5字/秒折算降低字数（避免对话过载）。
+    try:
+        shot_target = int(settings_store.load_settings().get("shot_target_seconds", 10))
+    except (TypeError, ValueError):
+        shot_target = 10
+    shot_target = max(pacing.MIN_SEC, min(pacing.MAX_SEC, shot_target))
+    shot_chars = pacing.target_chars(shot_target)
 
     shots: list[dict] = list(existing_shots or [])
     blocks: list[dict] = []
@@ -168,6 +177,8 @@ def run_decompose(
             "story_bible": bible_sum,
             "prev_handoff": prev_handoff,
             "chunk": chunk_text,
+            "shot_target": shot_target,
+            "shot_chars": shot_chars,
         })
         logger.info(f"[Analysis] Stage2 拆解块 {ci+1}/{total}（{len(chunk)} 段）")
         result = llm.chat_json(
@@ -186,7 +197,8 @@ def run_decompose(
             if not sh.get("duration"):
                 sh["duration"] = pacing.estimate_shot_seconds(
                     sh.get("dialogue", ""), sh.get("action", ""),
-                    sh.get("emotion") or sh.get("mood") or "")
+                    sh.get("emotion") or sh.get("mood") or "",
+                    target_seconds=shot_target)
             shots.append(sh)
             block_shot_nos.append(sh["shot_no"])
             prev_handoff = sh.get("handoff") or prev_handoff

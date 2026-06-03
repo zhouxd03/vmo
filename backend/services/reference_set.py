@@ -23,11 +23,6 @@ A "reference item" is a plain dict:
     }
 """
 
-import re
-from typing import Optional
-
-_PH_RE = re.compile(r"@image\d+")
-
 # lower rank = higher priority (kept first when capping)
 ROLE_RANK = {
     "first_frame": 0,   # 上一镜尾帧作为首帧
@@ -77,53 +72,80 @@ def has_first_frame(kept: list) -> bool:
     return any(it.get("role") in _FIRST_FRAME_ROLES for it in (kept or []))
 
 
-def build_legend(kept: list) -> str:
-    """Human + model-readable legend mapping @imageN → role/usage."""
-    parts = []
-    for i, it in enumerate(kept or [], 1):
-        label = ROLE_LABEL.get(it.get("role"), "参考")
-        name = it.get("name")
-        parts.append(f"@image{i}={label}" + (f"：{name}" if name else ""))
-    return "；".join(parts)
+def token_for(it: dict) -> str:
+    """Unified @ token for a reference item. 连续性图用固定别名，资产用 @名。"""
+    role = it.get("role")
+    if role == "first_frame":
+        return "@首帧"
+    if role == "director":
+        return "@导演图"
+    if role == "staging":
+        return "@站位图"
+    name = (it.get("name") or "").strip()
+    return ("@" + name) if name else "@参考"
 
 
-def compose_prompt(base_text: str, materials: list, kept: list) -> str:
-    """Prepend a reference legend to *base_text* and renumber its placeholders.
+def _sentence_for(role: str, token: str, kind: str) -> str:
+    """Reference explanation phrasing per role (放在提示词前方的引用说明)。"""
+    is_video = (kind == "video")
+    if role == "character":
+        return f"{token} 是主要角色"
+    if role == "support":
+        return f"{token} 是配角"
+    if role == "scene":
+        return f"{token} 是背景/场景"
+    if role == "prop":
+        return f"{token} 是道具"
+    if role == "director":
+        return (f"参考 {token} 生成视频，遵循其构图、分镜与镜头语言"
+                if is_video else f"参考 {token} 确定画面构图与分镜")
+    if role == "staging":
+        return (f"生成视频时参考 {token} 确定角色站位"
+                if is_video else f"参考 {token} 确定角色站位关系")
+    if role == "first_frame":
+        return f"{token} 作为视频首帧画面，从该画面自然运动起势"
+    return f"{token} 作为参考"
 
-    *materials* are the asset materials originally produced by resolve_mentions
-    (each may carry an ``@imageN`` placeholder baked into *base_text*). For the
-    final *kept* set we:
-      - remap surviving asset placeholders to their new @imageN position,
-      - replace dropped asset placeholders with the asset name (so the prompt
-        text stays readable instead of dangling a stale @imageN),
-      - prepend a legend describing every kept image's role / usage.
+
+def build_legend(kept: list, kind: str = "video") -> tuple[list, str]:
+    """Return (ordered tokens, joined reference-explanation sentences)."""
+    tokens = [token_for(it) for it in (kept or [])]
+    sentences = "；".join(
+        _sentence_for(it.get("role"), tok, kind)
+        for it, tok in zip(kept or [], tokens)
+    )
+    return tokens, sentences
+
+
+def compose_prompt(base_text: str, materials: list, kept: list,
+                   kind: str = "video") -> str:
+    """Prepend a unified @ reference legend to *base_text*.
+
+    生成提示词里所有引用统一 @：资产 @名、连续性图 @导演图/@站位图/@首帧。
+    *base_text* 已由 resolve_mentions 把提及替换成 @名（即各 material 的
+    placeholder）。对最终 *kept* 集：
+      - 留存的资产 @名 原样保留（已在文中）；
+      - 被裁掉的资产把 @名 还原为纯名字（去掉 @，避免悬空引用无配图）；
+      - 在最前面注入「随附参考图依次为 …」+ 逐条引用说明文本。
     """
     text = base_text or ""
 
-    # new placeholder per kept item (by asset_id when present)
-    new_ph_by_asset = {}
-    for i, it in enumerate(kept or [], 1):
-        if it.get("asset_id"):
-            new_ph_by_asset[it["asset_id"]] = f"@image{i}"
-
-    # build a single old-placeholder → replacement map (survivors remap to their
-    # new @imageN; dropped ones fall back to the asset name) so the rewrite is a
-    # single pass and old/new tokens can't collide with each other.
-    repl = {}
+    # dropped assets → strip their @名 back to bare name (longest token first so
+    # @林夏 is handled before @林).
+    kept_ids = {it.get("asset_id") for it in (kept or []) if it.get("asset_id")}
+    drop_repl = {}
     for m in (materials or []):
-        old_ph = m.get("placeholder")
-        if not old_ph:
-            continue
-        new_ph = new_ph_by_asset.get(m.get("asset_id"))
-        repl[old_ph] = new_ph if new_ph else (m.get("name") or "")
-    if repl:
-        text = _PH_RE.sub(lambda mo: repl.get(mo.group(0), mo.group(0)), text)
+        ph = m.get("placeholder")
+        if ph and m.get("asset_id") not in kept_ids:
+            drop_repl[ph] = m.get("name") or ph.lstrip("@")
+    for ph in sorted(drop_repl, key=len, reverse=True):
+        text = text.replace(ph, drop_repl[ph])
 
-    legend = build_legend(kept)
-    if not legend:
+    tokens, sentences = build_legend(kept, kind)
+    if not tokens:
         return text
     head = (
-        "【参考图说明】以下 @imageN 依次对应随附的参考图，请严格保持其形象/场景一致；"
-        "标注「作为首帧」的请用作视频首帧画面，其余仅作参考：" + legend
+        "【参考图引用】随附参考图依次为：" + "、".join(tokens) + "。" + sentences +
+        "。务必严格保持各 @ 引用对象的形象/服装/场景/道具与参考图一致。"
     )
     return head + "\n" + text if text else head

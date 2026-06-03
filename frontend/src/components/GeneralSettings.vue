@@ -27,11 +27,19 @@ const SCHEMA = [
     ],
   },
   {
+    group: '分镜拆解',
+    hint: '拆解剧本生成分镜时按「单镜目标时长」折算每镜承载文字：纯画面/旁白≈8字/秒（如15秒≈120字），对白≈5字/秒；对白越多单镜字数越少，避免对话过载。单镜估算时长以此为中心，最终钳制到 3–15 秒。',
+    fields: [
+      { key: 'shot_target_seconds', label: '单镜目标时长(秒)', type: 'number', min: 3, max: 15 },
+    ],
+  },
+  {
     group: '批量引擎',
     fields: [
       { key: 'max_concurrency', label: '最大并发', type: 'number', min: 1, max: 16 },
       { key: 'max_retries', label: '失败重试次数', type: 'number', min: 0, max: 10 },
       { key: 'task_interval_ms', label: '任务间隔(ms)', type: 'number', min: 0, max: 10000 },
+      { key: 'max_parallel_episodes', label: '并发分集数', type: 'number', min: 1, max: 8 },
     ],
   },
   {

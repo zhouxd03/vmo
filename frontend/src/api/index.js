@@ -74,6 +74,7 @@ export const api = {
   // projects (Phase 2)
   listProjects: () => req('GET', '/api/projects'),
   getProject: (pid) => req('GET', `/api/projects/${pid}`),
+  getProjectOverview: (pid) => req('GET', `/api/projects/${pid}/overview`),
   deleteProject: (pid) => req('DELETE', `/api/projects/${pid}`),
   importProject: (body) => req('POST', '/api/projects/import', body),
   analyzeProject: (pid, body) => req('POST', `/api/projects/${pid}/analyze`, body),
