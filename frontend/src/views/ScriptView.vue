@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NSelect, NButton, NIcon, NCard, NTag, NEmpty, NSpace, NProgress, NSpin,
@@ -12,15 +12,18 @@ import PageHeader from '../components/PageHeader.vue'
 import EpisodeBar from '../components/EpisodeBar.vue'
 import { api } from '../api'
 import { useProjectStore } from '../stores/project'
+import { useTasksStore } from '../stores/tasks'
 
 const router = useRouter()
 const message = useMessage()
 const store = useProjectStore()
+const tasks = useTasksStore()
 
-const analyzing = ref(false)
-const decomposing = ref(false)
-const jobProgress = ref({ done: 0, total: 0 })
-let pollTimer = null
+// analyze/decompose run in the global tasks store so they keep polling and
+// stay live across tab switches (§8.2). These are derived views of store state.
+const analyzing = computed(() => tasks.isAnalyzing(store.currentId, store.currentEpisodeId))
+const decomposing = computed(() => tasks.isDecomposing(store.currentId, store.currentEpisodeId))
+const progressPct = computed(() => tasks.decomposePercent)
 
 onMounted(async () => {
   await store.refreshList()
@@ -28,7 +31,20 @@ onMounted(async () => {
     await store.select(store.projects[0].id)
   }
 })
-onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
+
+// Surface success/failure toasts when a job this view started finishes (the
+// store keeps polling even if we navigate away, so the toast only shows if we
+// happen to be on this page when it lands — data is reloaded by the store).
+watch(() => tasks.decomposeStatus, (s, prev) => {
+  if (prev !== 'running' || tasks.decomposeProjectId !== store.currentId) return
+  if (s === 'done') message.success(`分批拆解完成，共 ${shots.value.length} 个分镜`)
+  else if (s === 'error') message.error('拆解失败: ' + tasks.decomposeError)
+})
+watch(() => tasks.analyzeStatus, (s, prev) => {
+  if (prev !== 'running' || tasks.analyzeProjectId !== store.currentId) return
+  if (s === 'done') message.success('全局分析完成，已并入小说级故事圣经（全集共享）')
+  else if (s === 'error') message.error('全局分析失败: ' + tasks.analyzeError)
+})
 
 const projectOptions = computed(() =>
   store.projects.map((p) => ({ label: `${p.name}（${p.episode_count || 1}集·${p.shot_count || 0}镜）`, value: p.id })))
@@ -63,42 +79,12 @@ async function saveStyle() {
 
 async function runAnalyze() {
   if (!store.current) return
-  analyzing.value = true
-  try {
-    await api.analyzeProject(store.current.id, { episode_id: store.currentEpisodeId })
-    await store.reloadCurrent()
-    message.success('全局分析完成，已并入小说级故事圣经（全集共享）')
-  } catch (e) {
-    message.error('全局分析失败: ' + e.message)
-  } finally {
-    analyzing.value = false
-  }
+  await tasks.runAnalyze(store.current.id, store.currentEpisodeId)
 }
 
 async function runDecompose() {
   if (!store.current) return
-  decomposing.value = true
-  jobProgress.value = { done: 0, total: 0 }
-  try {
-    const { job_id } = await api.decomposeProject(store.current.id, { episode_id: store.currentEpisodeId })
-    pollTimer = setInterval(async () => {
-      const job = await api.getJob(job_id)
-      jobProgress.value = { done: job.progress, total: job.total }
-      if (job.status === 'done') {
-        clearInterval(pollTimer); pollTimer = null
-        await store.reloadCurrent()
-        decomposing.value = false
-        message.success(`分批拆解完成，共 ${shots.value.length} 个分镜`)
-      } else if (job.status === 'error') {
-        clearInterval(pollTimer); pollTimer = null
-        decomposing.value = false
-        message.error('拆解失败: ' + job.error)
-      }
-    }, 1000)
-  } catch (e) {
-    decomposing.value = false
-    message.error('拆解失败: ' + e.message)
-  }
+  await tasks.startDecompose(store.current.id, store.currentEpisodeId)
 }
 
 const shotColumns = [
@@ -110,11 +96,6 @@ const shotColumns = [
   { title: '对白', key: 'dialogue', width: 140, ellipsis: { tooltip: true } },
   { title: '接口(handoff)', key: 'handoff', ellipsis: { tooltip: true } },
 ]
-
-const progressPct = computed(() => {
-  const { done, total } = jobProgress.value
-  return total ? Math.round((done / total) * 100) : 0
-})
 </script>
 
 <template>

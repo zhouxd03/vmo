@@ -5,12 +5,18 @@ The window is frameless (no native title bar); the Vue app draws its own 44px
 titlebar with window controls wired to the pywebview API.
 """
 
+import ctypes
 import os
 import socket
 import sys
 import threading
 import time
 import urllib.request
+from ctypes import wintypes
+
+# Win32 constants for native (OS-driven) title-bar dragging.
+_WM_NCLBUTTONDOWN = 0x00A1
+_HTCAPTION = 0x0002
 
 # Ensure the repo root is importable even when Python runs in isolated mode
 # (-I ignores cwd / PYTHONPATH). Harmless under PyInstaller (frozen) too.
@@ -54,6 +60,7 @@ class Api:
 
     def __init__(self):
         self._window = None
+        self._maximized = False
 
     def set_window(self, window):
         self._window = window
@@ -63,12 +70,80 @@ class Api:
             self._window.minimize()
 
     def toggle_maximize(self):
-        if self._window:
-            self._window.toggle_fullscreen()
+        # A frameless window has no native caption, so we track the maximize
+        # state ourselves and toggle maximize/restore. (The old code toggled
+        # *fullscreen*, which hides the taskbar — not what a maximize button
+        # should do.)
+        if not self._window:
+            return
+        if self._maximized:
+            self._window.restore()
+            self._maximized = False
+        else:
+            self._window.maximize()
+            self._maximized = True
 
     def close(self):
         if self._window:
             self._window.destroy()
+
+    def _native_hwnd(self):
+        """Resolve the top-level HWND of the pywebview (winforms) window."""
+        try:
+            from webview.platforms.winforms import BrowserView
+            form = BrowserView.instances.get(self._window.uid)
+            if form is not None:
+                return int(form.Handle.ToInt32()), form
+        except Exception:
+            pass
+        # Fallback: locate the window by its (unique) title.
+        try:
+            hwnd = ctypes.windll.user32.FindWindowW(None, self._window.title)
+            if hwnd:
+                return int(hwnd), None
+        except Exception:
+            pass
+        return None, None
+
+    def start_drag(self):
+        """Hand the drag off to the OS window manager (native title-bar drag).
+
+        The CSS ``.pywebview-drag-region`` / JS ``window.move`` approach proved
+        unreliable (synthetic move events weren't treated as a continuous drag).
+        The robust Win32 idiom is: ``ReleaseCapture()`` then post
+        ``WM_NCLBUTTONDOWN`` with ``HTCAPTION`` so ``DefWindowProc`` runs the
+        native modal move loop — identical to dragging a real title bar.
+
+        ``ReleaseCapture`` + ``SendMessage`` must run on the GUI thread that
+        owns the window (the WebView2 child holds the mouse capture there), so
+        we marshal onto it via ``Control.Invoke`` when called from the js_api
+        worker thread.
+        """
+        if not self._window:
+            return
+        hwnd, form = self._native_hwnd()
+        if not hwnd:
+            return
+
+        def _do():
+            user32 = ctypes.windll.user32
+            user32.SendMessageW.argtypes = [
+                wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+            ]
+            user32.ReleaseCapture()
+            user32.SendMessageW(hwnd, _WM_NCLBUTTONDOWN, _HTCAPTION, 0)
+
+        try:
+            if form is not None and bool(form.InvokeRequired):
+                from System import Action
+                form.Invoke(Action(_do))
+            else:
+                _do()
+        except Exception:
+            try:
+                _do()
+            except Exception:
+                pass
 
 
 def main() -> None:

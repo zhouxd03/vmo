@@ -6,21 +6,31 @@ function call(method) {
   const api = window.pywebview && window.pywebview.api
   if (api && api[method]) api[method]()
 }
+
+// On a frameless window the title bar must initiate dragging itself. We hand
+// off to the OS via the Win32 native move loop (api.start_drag) on left-button
+// mousedown over the drag region; this is far more reliable than the CSS
+// .pywebview-drag-region / window.move approach. Window-control buttons stop
+// propagation so clicking them never starts a drag.
+function onDragStart(e) {
+  if (e.button !== 0) return
+  call('start_drag')
+}
 </script>
 
 <template>
-  <header class="titlebar">
-    <div class="brand pywebview-drag-region">
+  <header class="titlebar" @mousedown="onDragStart" @dblclick="call('toggle_maximize')">
+    <div class="brand">
       <span class="logo-dot" />
       <span class="brand-name">连续性批量创作</span>
       <span class="brand-sub">Batch Anime Studio</span>
     </div>
-    <div class="spacer pywebview-drag-region" />
-    <div class="win-controls">
+    <div class="spacer" />
+    <div class="win-controls" @mousedown.stop @dblclick.stop>
       <button class="win-btn" title="最小化" @click="call('minimize')">
         <n-icon :component="RemoveOutline" />
       </button>
-      <button class="win-btn" title="最大化" @click="call('toggle_maximize')">
+      <button class="win-btn" title="最大化/还原" @click="call('toggle_maximize')">
         <n-icon :component="SquareOutline" />
       </button>
       <button class="win-btn close" title="关闭" @click="call('close')">
@@ -38,7 +48,6 @@ function call(method) {
   padding: 0 8px 0 16px;
   background: color-mix(in srgb, var(--app-bg-soft) 88%, transparent);
   border-bottom: 1px solid var(--app-border);
-  -webkit-app-region: drag;
   user-select: none;
 }
 .brand {
@@ -69,7 +78,6 @@ function call(method) {
 .win-controls {
   display: flex;
   gap: 2px;
-  -webkit-app-region: no-drag;
 }
 .win-btn {
   width: 38px;

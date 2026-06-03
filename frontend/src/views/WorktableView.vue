@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NSelect, NButton, NIcon, NEmpty, NInput, NTag, NImage, NSwitch, NTooltip,
@@ -20,21 +20,22 @@ import EpisodeBar from '../components/EpisodeBar.vue'
 import PipelineView from './PipelineView.vue'
 import { api } from '../api'
 import { useProjectStore } from '../stores/project'
+import { useTasksStore } from '../stores/tasks'
 
 const router = useRouter()
 const message = useMessage()
 const store = useProjectStore()
+const tasks = useTasksStore()
 
-const batches = ref([])          // all batches of the project
+// batch list lives in the global tasks store so polling/progress survive tab
+// switches (§8.2). This view just reads it and derives per-episode materials.
+const batches = computed(() => tasks.batches)
 const rowState = reactive({})    // shot_no -> { promptDraft, chosen, running }
 const locks = ref(new Set())     // locked shot_no (skipped in batch)
-let poll = null
 
 // live generation status (per shot) + overall progress of active batches
 const statusByShot = reactive({}) // shot_no -> { status, attempts, error, kind, decision, updated }
 const genProgress = reactive({ active: false, done: 0, total: 0, running: '', kind: '', name: '' })
-const genStart = ref(0)
-const nowTick = ref(Date.now())
 
 // toolbar batch params
 const tb = reactive({
@@ -63,7 +64,8 @@ onMounted(async () => {
   if (!store.current && store.projects.length) await store.select(store.projects[0].id)
   await reload()
 })
-onUnmounted(() => stopPolling())
+// NOTE: we intentionally do NOT stop polling on unmount — the tasks store keeps
+// polling across tab switches so an in-flight batch keeps updating (§8.2).
 
 const projectOptions = computed(() =>
   store.projects.map((p) => ({ label: `${p.name}（${p.episode_count || 1}集·${p.shot_count || 0}镜）`, value: p.id })))
@@ -122,11 +124,26 @@ async function reload() {
   if (!store.current) return
   loadLocks()
   ensureRows(shots.value)
-  batches.value = await api.listBatches(store.current.id)
+  tasks.setBatchProject(store.current.id)
+  await tasks.refreshBatches()
   await rebuildMaterials()
-  // if a batch is already running (e.g. started elsewhere), surface its progress live
-  if (batches.value.some((b) => ['running', 'pending'].includes(b.status))) startPolling()
+  // if a batch is already running (e.g. started before we navigated here), the
+  // store keeps polling so its progress stays live.
+  if (tasks.batchActive) tasks.ensureBatchPolling()
 }
+
+// Re-derive per-episode materials whenever the store's batch list changes
+// (driven by the store's persistent polling loop) so progress stays live even
+// when we return to this view after a tab switch.
+watch(() => tasks.batches, async () => {
+  await rebuildMaterials()
+  shots.value.forEach((s) => {
+    if (rowState[s.shot_no]?.running && (materialsByShot[s.shot_no] || []).length) {
+      rowState[s.shot_no].running = false
+    }
+  })
+  if (!tasks.batchActive) shots.value.forEach((s) => { if (rowState[s.shot_no]) rowState[s.shot_no].running = false })
+}, { deep: true })
 
 // materials of the CURRENT episode only (batches tagged with episode_id, or shot_no prefix match)
 function isEpisodeBatch(b) {
@@ -220,14 +237,12 @@ function decisionLabel(no) {
 }
 const genPercent = computed(() => genProgress.total ? Math.round((genProgress.done / genProgress.total) * 100) : 0)
 const elapsedText = computed(() => {
-  if (!genStart.value) return '0秒'
-  const s = Math.max(0, Math.floor((nowTick.value - genStart.value) / 1000))
+  // genStart/nowTick live in the tasks store so the elapsed timer keeps counting
+  // across tab switches (§8.2).
+  if (!tasks.genStart) return '0秒'
+  const s = Math.max(0, Math.floor((tasks.nowTick - tasks.genStart) / 1000))
   const m = Math.floor(s / 60)
   return m ? `${m}分${s % 60}秒` : `${s}秒`
-})
-watch(() => genProgress.active, (a) => {
-  if (a && !genStart.value) genStart.value = Date.now()
-  if (!a) genStart.value = 0
 })
 
 function isVideoFile(fn) { return /\.(mp4|webm|mov)$/i.test(fn || '') }
@@ -299,8 +314,8 @@ async function genRow(no, kind) {
     })
     await api.startBatch(store.current.id, b.id)
     message.success(`已提交 ${no} ${kind === 'video' ? '生视频' : '生图'}`)
-    await refreshNow()  // surface the progress bar immediately; heavy polling starts after 100s
-    startPolling()
+    // surface the progress bar immediately; heavy polling (store) starts after 100s
+    await tasks.ensureBatchPolling({ immediate: true })
   } catch (e) {
     message.error(e.message)
     rowState[no].running = false
@@ -319,52 +334,9 @@ async function genBatch(kind) {
     })
     await api.startBatch(store.current.id, b.id)
     message.success(`已提交批量${kind === 'video' ? '生视频' : '生图'}（${targets.length} 镜${locks.value.size ? `，跳过 ${locks.value.size} 锁定` : ''}）`)
-    await refreshNow()  // surface the progress bar immediately; heavy polling starts after 100s
-    startPolling()
+    // surface the progress bar immediately; heavy polling (store) starts after 100s
+    await tasks.ensureBatchPolling({ immediate: true })
   } catch (e) { message.error(e.message) }
-}
-
-// Polling cadence: video generation is slow, so we DON'T hammer the server.
-// First status query fires 100s after generation starts, then every 20s.
-// A separate lightweight 1s clock only advances the elapsed timer (no network,
-// no material rebuild) so the running video can still be clicked/played.
-const POLL_INITIAL_DELAY = 100_000
-const POLL_INTERVAL = 20_000
-let clock = null
-
-async function pollOnce() {
-  nowTick.value = Date.now()
-  batches.value = await api.listBatches(store.current.id)
-  await rebuildMaterials()
-  const active = batches.value.some((b) => ['running', 'pending'].includes(b.status))
-  // clear per-row running flags for shots that now have done materials
-  shots.value.forEach((s) => {
-    if (rowState[s.shot_no]?.running && (materialsByShot[s.shot_no] || []).length) rowState[s.shot_no].running = false
-  })
-  if (!active) { stopPolling(); shots.value.forEach((s) => { if (rowState[s.shot_no]) rowState[s.shot_no].running = false }) }
-  else { poll = setTimeout(pollOnce, POLL_INTERVAL) }
-}
-
-function startPolling() {
-  if (poll || clock) return  // already polling — don't reset the timer/clock
-  if (!genStart.value) genStart.value = Date.now()
-  // smooth elapsed-time clock (cheap; never rebuilds materials → no playback disruption)
-  clock = setInterval(() => { if (genProgress.active) nowTick.value = Date.now() }, 1000)
-  // first heavy status query only after the initial delay
-  poll = setTimeout(pollOnce, POLL_INITIAL_DELAY)
-}
-
-function stopPolling() {
-  if (poll) { clearTimeout(poll); poll = null }
-  if (clock) { clearInterval(clock); clock = null }
-}
-
-// one-shot fetch + rebuild (no scheduling) — for initial paint / right after a manual start
-async function refreshNow() {
-  if (!store.current) return
-  nowTick.value = Date.now()
-  batches.value = await api.listBatches(store.current.id)
-  await rebuildMaterials()
 }
 
 // preview (storyboard) modal
