@@ -54,6 +54,12 @@ VAR_META: dict[str, dict[str, str]] = {
     "handoff": {"desc": "本镜衔接接口/长镜头标记", "sample": "陈默逼近，林夏后退半步（普通切镜）"},
     "prev_blocking": {"desc": "需保持的空间/朝向关系（承接上一镜）", "sample": "林夏居中偏左，面向画面右侧"},
     "context": {"desc": "复核用文字上下文", "sample": "上一镜尾帧：林夏立于场中；本镜拟用站位图……"},
+    "image_prompt": {"desc": "本镜图片提示词（风格+景别+场景/人物/道具解析）", "sample": "中国现代,3D动漫风格，过肩中景，废弃停车场，陈默从阴影中走出，两人对峙，@林夏 @陈默 $青铜酒爵"},
+    "dynamics": {"desc": "镜头动态（引擎按运镜/动作/情绪/时长自动合成，可改）", "sample": "运镜与景别：过肩中景；主体动作：陈默从阴影中走出，两人对峙；节奏：紧张情绪，约6秒；镜头运动自然流畅、画面无跳帧；保持人物外形、服装与道具形制和参考图一致"},
+    "dialogue": {"desc": "本镜对白（无则空）", "sample": "「你来了。」"},
+    "emotion": {"desc": "本镜情绪", "sample": "紧张"},
+    "duration": {"desc": "本镜时长（秒，按台词/情绪估算）", "sample": "6"},
+    "consistency": {"desc": "一致性约束句（固定守则，可改）", "sample": "镜头运动自然流畅、画面无跳帧；保持人物外形、服装与道具形制和参考图一致"},
 }
 
 
@@ -62,6 +68,7 @@ STAGE_LABELS: dict[str, str] = {
     "stage2": "剧本解析 · 阶段二",
     "asset": "资产参考图",
     "continuity": "连续性引擎",
+    "video": "视频生成",
 }
 
 
@@ -226,6 +233,14 @@ CONTINUITY_REVIEW = """你是动漫连续性复核员。下面给出相关图片
 {{context}}"""
 
 
+# ── 视频生成提示词模板 ──────────────────────────────────────────────────────
+# 把静态「图片提示词」升级为「视频提示词」：在画面描述之上叠加镜头动态（运镜/景别、
+# 主体动作、情绪节奏+时长、一致性守则）。引擎已确定性地把这些字段合成为 {{dynamics}}
+# （空字段自动省略），默认方案直接拼接即可、零额度；想要更强控制可改写本方案，
+# 直接引用 {{camera}}/{{action}}/{{emotion}}/{{duration}}/{{dialogue}}/{{consistency}} 等粒度变量。
+VIDEO_PROMPT = """{{image_prompt}}。
+【镜头动态】{{dynamics}}"""
+
 DEFAULT_TEMPLATES = {
     "global_analysis": {
         "name": "全局分析（故事圣经）",
@@ -285,6 +300,13 @@ DEFAULT_TEMPLATES = {
         "body": CONTINUITY_REVIEW,
         "variables": ["context"],
         "version": 2,
+    },
+    "video_prompt": {
+        "name": "视频生成提示词（镜头动态）",
+        "stage": "video",
+        "body": VIDEO_PROMPT,
+        "variables": ["image_prompt", "dynamics"],
+        "version": 1,
     },
 }
 

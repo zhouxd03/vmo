@@ -55,6 +55,27 @@ export const useTasksStore = defineStore('tasks', {
       s.decomposeStatus === 'running' && s.decomposeProjectId === pid && s.decomposeEpisodeId === eid,
     isAnalyzing: (s) => (pid, eid) =>
       s.analyzeStatus === 'running' && s.analyzeProjectId === pid && s.analyzeEpisodeId === eid,
+
+    // Per-episode generation status aggregated from the (episode_id-tagged)
+    // batch summaries. Returns null when an episode has no batches. status:
+    // running | queued | error | done. Used by the episode tabs + worktable so
+    // multiple episodes generating concurrently each show their own progress.
+    episodeStat: (s) => (eid) => {
+      if (!eid) return null
+      const bs = s.batches.filter((b) => b.episode_id === eid)
+      if (!bs.length) return null
+      let total = 0, done = 0, error = 0
+      let running = false, queued = false
+      for (const b of bs) {
+        total += b.total || 0
+        done += b.done || 0
+        error += b.error || 0
+        if (b.status === 'running') running = true
+        else if (b.status === 'pending') queued = true
+      }
+      const status = running ? 'running' : queued ? 'queued' : error ? 'error' : 'done'
+      return { total, done, error, status, percent: total ? Math.round((done / total) * 100) : 0 }
+    },
   },
   actions: {
     // ───────────────────────── batch generation ─────────────────────────

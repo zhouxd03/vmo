@@ -367,10 +367,17 @@ def _download(video_url, model, duration, save_dir, filename_prefix) -> dict:
     filename = f"{video_id}_{model.replace('/', '_')}.mp4"
     filepath = save_dir / filename
     try:
-        dl = http.get(video_url, timeout=180)
-        dl.raise_for_status()
-        filepath.write_bytes(dl.content)
-        logger.info(f"[Video] 已保存 {filepath} ({len(dl.content)} bytes)")
+        # stream to disk in chunks so the whole video never sits in RAM at once
+        # (keeps memory bounded when several episodes generate concurrently)
+        size = 0
+        with http.get(video_url, timeout=180, stream=True) as dl:
+            dl.raise_for_status()
+            with open(filepath, "wb") as fh:
+                for chunk in dl.iter_content(chunk_size=1 << 20):
+                    if chunk:
+                        fh.write(chunk)
+                        size += len(chunk)
+        logger.info(f"[Video] 已保存 {filepath} ({size} bytes)")
         saved = str(filepath)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[Video] 下载失败: {e}; 仅返回 URL")

@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import {
   NSelect, NButton, NIcon, NEmpty, NInput, NTag, NImage, NSwitch, NTooltip,
   NModal, NCard, NSpace, NInputNumber, NScrollbar, NBadge, NPopover, NDropdown,
-  NDrawer, NDrawerContent, NProgress, NSpin,
+  NDrawer, NDrawerContent, NProgress, NSpin, NCheckbox, NCheckboxGroup,
   useMessage,
 } from 'naive-ui'
 import {
@@ -383,6 +383,42 @@ const batchMenuOptions = [
 function onBatchMenu(key) { genBatch(key) }
 function notImpl(name) { message.info(`「${name}」即将支持`) }
 
+// ── 多集并发生成：单集串行 · 多集并发（每集独立 tab + 进度徽标）──
+const showEpiGen = ref(false)
+const epiGen = reactive({ kind: 'image', maxParallel: 2, selected: [] })
+function epiShotCount(e) { return e.shot_count ?? (e.shots ? e.shots.length : 0) }
+const decomposedEpisodes = computed(() =>
+  (store.episodes || []).filter((e) => e.stage === 'decomposed' || epiShotCount(e) > 0))
+function openEpiGen() {
+  if (!decomposedEpisodes.value.length) { message.warning('没有已拆解的分集（请先在「剧本解析」拆解分镜）'); return }
+  epiGen.selected = decomposedEpisodes.value.map((e) => e.id)
+  showEpiGen.value = true
+}
+async function submitEpiGen() {
+  if (!epiGen.selected.length) { message.warning('请至少选择一个分集'); return }
+  // The worktable only holds edited prompts for the *current* episode; other
+  // episodes fall back to engine-default prompts (image desc / video template).
+  const episodes = epiGen.selected.map((eid) => {
+    const e = { episode_id: eid }
+    if (eid === store.currentEpisodeId) {
+      const targets = shots.value.map((s) => s.shot_no).filter((no) => !locks.value.has(no))
+      e.shot_nos = targets
+      e.prompt_overrides = overridesFor(targets, epiGen.kind)
+    }
+    return e
+  })
+  try {
+    const r = await api.createEpisodeBatches(store.current.id, {
+      kind: epiGen.kind, episodes, params: buildParams(epiGen.kind), max_parallel: epiGen.maxParallel,
+    })
+    showEpiGen.value = false
+    const n = r.created?.length || 0
+    const sk = r.skipped?.length ? `，跳过 ${r.skipped.length} 集` : ''
+    message.success(`已启动 ${n} 集并发${epiGen.kind === 'video' ? '生视频' : '生图'}（最多 ${r.max_parallel} 集同时运行，单集串行）${sk}`)
+    await tasks.ensureBatchPolling({ immediate: true })
+  } catch (e) { message.error(e.message) }
+}
+
 // ── 导入剪映: export current episode's storyboard as a 剪映 draft (zip) ──
 const exportingJy = ref(false)
 async function exportJianying() {
@@ -593,6 +629,7 @@ async function exportJianying() {
           <n-dropdown trigger="click" placement="top" :options="batchMenuOptions" @select="onBatchMenu">
             <button class="pbtn accent"><n-icon :component="FlashOutline" /><span>批量生成</span><n-icon :component="ChevronDownOutline" size="12" /></button>
           </n-dropdown>
+          <button class="pbtn" @click="openEpiGen"><n-icon :component="AlbumsOutline" /><span>多集并发</span></button>
           <button class="pbtn" :disabled="exportingJy" @click="exportJianying"><n-icon :component="FilmOutline" /><span>{{ exportingJy ? '导出中…' : '导入剪映' }}</span></button>
           <span v-if="locks.size" class="lock-pill">🔒 {{ locks.size }}</span>
         </div>
@@ -636,11 +673,55 @@ async function exportJianying() {
         <PipelineView />
       </n-drawer-content>
     </n-drawer>
+
+    <!-- 多集并发生成 modal -->
+    <n-modal v-model:show="showEpiGen">
+      <n-card style="width: 560px; max-width: 94vw" title="多集并发生成" :bordered="false" role="dialog" closable @close="showEpiGen = false">
+        <div class="epi-gen">
+          <div class="eg-row">
+            <span class="eg-label">生成类型</span>
+            <n-select v-model:value="epiGen.kind" style="width: 160px"
+              :options="[{ label: '生成图片', value: 'image' }, { label: '生成视频', value: 'video' }]" />
+          </div>
+          <div class="eg-row">
+            <span class="eg-label">最大并发集数</span>
+            <n-input-number v-model:value="epiGen.maxParallel" :min="1" :max="8" style="width: 120px" />
+            <span class="eg-hint">单集内串行，多集并行（越大越占内存）</span>
+          </div>
+          <div class="eg-row eg-top">
+            <span class="eg-label">选择分集</span>
+            <n-checkbox-group v-model:value="epiGen.selected" class="eg-eps">
+              <n-checkbox v-for="e in decomposedEpisodes" :key="e.id" :value="e.id">
+                {{ e.name }} · {{ epiShotCount(e) }}镜
+              </n-checkbox>
+            </n-checkbox-group>
+          </div>
+          <div class="eg-note">
+            仅当前分集会带上工作台已编辑/锁定的提示词；其余分集使用引擎默认提示词（视频按「视频生成提示词」模板合成）。
+          </div>
+        </div>
+        <template #footer>
+          <n-space justify="end">
+            <n-button @click="showEpiGen = false">取消</n-button>
+            <n-button type="primary" :disabled="!epiGen.selected.length" @click="submitEpiGen">
+              启动并发（{{ epiGen.selected.length }} 集）
+            </n-button>
+          </n-space>
+        </template>
+      </n-card>
+    </n-modal>
   </div>
 </template>
 
 <style scoped>
 .wt { display: flex; flex-direction: column; --wt-media-h: 200px; }
+.epi-gen { display: flex; flex-direction: column; gap: 16px; }
+.eg-row { display: flex; align-items: center; gap: 12px; }
+.eg-row.eg-top { align-items: flex-start; }
+.eg-label { width: 88px; flex-shrink: 0; font-size: 13px; color: var(--app-text-muted); }
+.eg-hint, .eg-note { font-size: 12px; color: var(--app-text-muted); }
+.eg-eps { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.eg-note { line-height: 1.6; padding: 8px 10px; border-radius: 8px; background: var(--app-bg-soft); }
 .row {
   display: grid;
   grid-template-columns: 260px minmax(0, 1fr) 230px 250px;

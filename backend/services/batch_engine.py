@@ -19,6 +19,7 @@ from typing import Callable, Optional
 
 from ..core import assets as assets_core
 from ..core import batches
+from ..core import prompt_templates
 from ..core import settings as settings_store
 from ..core import story_state
 from ..core.paths import OUTPUT_DIR, PROJECTS_DIR
@@ -114,8 +115,43 @@ def _video_dynamics(task: dict) -> str:
         pass
     if pace:
         parts.append("节奏：" + "，".join(pace))
-    parts.append("镜头运动自然流畅、画面无跳帧；保持人物外形、服装与道具形制和参考图一致")
+    parts.append(_CONSISTENCY_GUARD)
     return "；".join(parts)
+
+
+_CONSISTENCY_GUARD = "镜头运动自然流畅、画面无跳帧；保持人物外形、服装与道具形制和参考图一致"
+
+
+def _video_prompt_vars(task: dict, image_prompt: str) -> dict:
+    """Variables exposed to the editable `video_prompt` template. `image_prompt`
+    is the resolved picture description; `dynamics` is the engine-composed motion
+    block (empty fields auto-omitted); the rest are granular fields for power
+    users who rewrite the template."""
+    dur = task.get("duration")
+    try:
+        dur = int(dur) if dur else ""
+    except (TypeError, ValueError):
+        dur = ""
+    return {
+        "image_prompt": (image_prompt or "").rstrip("。，、 "),
+        "dynamics": _video_dynamics(task),
+        "camera": (task.get("camera") or "").strip(),
+        "action": (task.get("action") or "").strip(),
+        "emotion": (task.get("emotion") or "").strip(),
+        "duration": dur,
+        "dialogue": (task.get("dialogue") or "").strip(),
+        "scene": (task.get("scene") or "").strip(),
+        "characters": " ".join(task.get("characters", []) or []),
+        "props": " ".join(task.get("props", []) or []),
+        "consistency": _CONSISTENCY_GUARD,
+    }
+
+
+def build_video_prompt(task: dict, image_prompt: str) -> str:
+    """Render the active `video_prompt` template for one shot/task."""
+    body = prompt_templates.get_template_body("video_prompt")
+    vid = prompt_templates.render(body, _video_prompt_vars(task, image_prompt)).strip()
+    return vid or (image_prompt or "")
 
 
 def build_shot_prompts(project: dict, shot_nos: Optional[list] = None) -> dict:
@@ -124,15 +160,13 @@ def build_shot_prompts(project: dict, shot_nos: Optional[list] = None) -> dict:
     Returns ``{shot_no: {"image": str, "video": str}}`` using the same engine
     logic as real generation (style + camera + resolved @/#/$ shot text), so the
     worktable can show editable, what-you-see-is-what-gets-generated prompts. The
-    video variant augments the image scene with motion/pacing dynamics.
+    video variant is rendered from the user-editable `video_prompt` template
+    (default = image description + engine-composed 【镜头动态】).
     """
     out: dict = {}
     for t in build_tasks_from_shots(project, shot_nos):
         img = t.get("prompt", "") or ""
-        dyn = _video_dynamics(t)
-        base = img.rstrip("。，、 ")
-        vid = f"{base}。【镜头动态】{dyn}" if base else dyn
-        out[t.get("shot_no", "")] = {"image": img, "video": vid}
+        out[t.get("shot_no", "")] = {"image": img, "video": build_video_prompt(t, img)}
     return out
 
 

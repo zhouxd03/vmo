@@ -55,6 +55,9 @@ def _summarize(b: dict) -> dict:
         "done": done,
         "error": err,
         "concurrency": b.get("concurrency", 2),
+        # surface episode membership in the lightweight index so the worktable /
+        # episode bar can group batches per-episode without fetching every detail
+        "episode_id": (b.get("params") or {}).get("episode_id"),
         "created_at": b.get("created_at"),
         "updated_at": b.get("updated_at"),
     }

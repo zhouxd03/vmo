@@ -6,11 +6,12 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 from .core import assets as assets_core
 from .core import batches, jobs, projects
 from .core import prompt_templates as tpl
+from .core import settings as settings_store
 from .core import story_state
 from .core.paths import OUTPUT_DIR, PROJECTS_DIR
-from .services import (asset_gen, batch_engine, continuity, episode_splitter,
-                       ffmpeg_util, image_gen, jianying_export,
-                       script_analysis, script_parser)
+from .services import (asset_gen, batch_engine, continuity, episode_runner,
+                       episode_splitter, ffmpeg_util, image_gen,
+                       jianying_export, script_analysis, script_parser)
 from .services import llm as llm_service
 
 
@@ -295,6 +296,20 @@ def register(app: Flask) -> None:
         prompts = batch_engine.build_shot_prompts(ctx, body.get("shot_nos"))
         return jsonify({"prompts": prompts})
 
+    def _apply_prompts(tasks, kind, overrides):
+        """Resolve each task's final generation prompt:
+        - explicit per-shot override (the worktable's edited text) wins;
+        - else for video, render the user-editable `video_prompt` template
+          (image description + 【镜头动态】) so engine-default video batches use
+          the same video prompt the worktable shows;
+        - else (image) keep the engine image prompt as-is."""
+        for t in tasks:
+            ov = (overrides or {}).get(t.get("shot_no"))
+            if ov and ov.strip():
+                t["prompt"] = ov.strip()
+            elif kind == "video":
+                t["prompt"] = batch_engine.build_video_prompt(t, t.get("prompt", ""))
+
     @app.route("/api/projects/<pid>/batches", methods=["POST"])
     def create_batch(pid):
         p = projects.get_project(pid)
@@ -322,12 +337,7 @@ def register(app: Flask) -> None:
             ctx = {**ep, "assets": p.get("assets", []),
                    "story_bible": p.get("story_bible")}
             tasks = batch_engine.build_tasks_from_shots(ctx, body.get("shot_nos"))
-            # per-shot prompt overrides from the worktable (keep materials intact)
-            overrides = body.get("prompt_overrides") or {}
-            for t in tasks:
-                ov = overrides.get(t.get("shot_no"))
-                if ov and ov.strip():
-                    t["prompt"] = ov.strip()
+            _apply_prompts(tasks, kind, body.get("prompt_overrides") or {})
         if not tasks:
             return jsonify({"error": "没有可生成的任务"}), 400
         params = dict(body.get("params", {}) or {})
@@ -380,6 +390,56 @@ def register(app: Flask) -> None:
             return jsonify({"error": "批次不存在"}), 404
         batches.reset_failed(pid, bid)
         return jsonify({"job_id": _start_batch_job(pid, bid)})
+
+    @app.route("/api/projects/<pid>/episode_batches", methods=["POST"])
+    def create_episode_batches(pid):
+        """Per-episode concurrent generation: one serial batch per episode, run
+        with bounded cross-episode parallelism (单集串行 · 多集并发).
+
+        body: {kind, episodes:[{episode_id, shot_nos?, prompt_overrides?}],
+               params?, max_parallel?}
+        """
+        p = projects.get_project(pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        body = request.json or {}
+        kind = body.get("kind", "image")
+        eps = body.get("episodes") or []
+        if not eps:
+            return jsonify({"error": "未选择任何分集"}), 400
+        params_base = dict(body.get("params") or {})
+        default_cap = settings_store.load_settings().get("max_parallel_episodes", 2)
+        max_parallel = int(body.get("max_parallel") or default_cap)
+        created, skipped = [], []
+        for item in eps:
+            eid = (item or {}).get("episode_id")
+            ep = projects.get_episode(pid, eid)
+            if not ep or (ep.get("stage") != "decomposed" and not ep.get("shots")):
+                skipped.append({"episode_id": eid, "reason": "未拆解或不存在"})
+                continue
+            ctx = {**ep, "assets": p.get("assets", []),
+                   "story_bible": p.get("story_bible")}
+            tasks = batch_engine.build_tasks_from_shots(ctx, item.get("shot_nos"))
+            _apply_prompts(tasks, kind, item.get("prompt_overrides") or {})
+            if not tasks:
+                skipped.append({"episode_id": eid, "reason": "无可生成分镜"})
+                continue
+            label = f"{ep.get('name', eid)}-并发{'生视频' if kind == 'video' else '生图'}"
+            params = {**params_base, "episode_id": eid}
+            try:
+                # 单集串行：concurrency=1（含连续性链路）
+                batch = batches.create_batch(
+                    pid, kind, label, tasks, concurrency=1, params=params,
+                    max_attempts=body.get("max_attempts", 3))
+            except ValueError as e:
+                skipped.append({"episode_id": eid, "reason": str(e)})
+                continue
+            created.append({"episode_id": eid, "batch_id": batch["id"], "total": len(tasks)})
+        if not created:
+            return jsonify({"error": "没有可生成的分集", "skipped": skipped}), 400
+        job_id = episode_runner.start(pid, [c["batch_id"] for c in created], max_parallel)
+        return jsonify({"created": created, "skipped": skipped,
+                        "job_id": job_id, "max_parallel": max_parallel})
 
     @app.route("/api/output/<pid>/<bid>/<path:filename>", methods=["GET"])
     def serve_output(pid, bid, filename):

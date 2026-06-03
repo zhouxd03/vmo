@@ -18,6 +18,10 @@ DEFAULTS = {
     "max_concurrency": 3,
     "max_retries": 2,
     "task_interval_ms": 800,
+    # per-episode concurrency: how many 分集 may generate at once. Each episode
+    # runs serially内部 (concurrency=1) so memory stays bounded; raising this
+    # runs more episodes in parallel at the cost of more RAM / API pressure.
+    "max_parallel_episodes": 2,
     # reference images: hard cap on how many垫图 a single shot may feed the model.
     # When exceeded, lowest-priority images are dropped first, in the order
     # 导演图/首帧图 ＞ 角色图 ＞ 背景图 ＞ 配角图 ＞ 道具图.
