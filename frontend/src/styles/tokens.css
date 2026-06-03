@@ -1,0 +1,123 @@
+/* Design tokens — single source of truth.
+   Values verified against the real xingyao build (accent #21fe84 etc.).
+   Change theme/skin by editing tokens only; never hardcode colors elsewhere. */
+
+:root {
+  /* base surfaces (dark) */
+  --app-bg: #0c0d0f;
+  --app-bg-soft: #121418;
+  --app-surface: #16181d;
+  --app-surface-2: #1c1f26;
+  --app-elevated: #21242c;
+
+  /* text */
+  --app-text-primary: #ffffff;
+  --app-text-secondary: #b6bcc6;
+  --app-text-muted: #7b828d;
+
+  /* accent (fluorescent green) + alt (blue) */
+  --app-accent: #21fe84;
+  --app-accent-soft: color-mix(in srgb, var(--app-accent) 16%, transparent);
+  --app-accent-strong: color-mix(in srgb, var(--app-accent) 78%, #0a3a22);
+  --app-accent-alt: #4da3ff;
+
+  /* status */
+  --app-success: #21fe84;
+  --app-warning: #ffc24b;
+  --app-error: #ff5d6c;
+  --app-running: #4da3ff;
+
+  /* borders / lines */
+  --app-border: color-mix(in srgb, #ffffff 9%, transparent);
+  --app-border-strong: color-mix(in srgb, #ffffff 16%, transparent);
+
+  /* radii */
+  --r-card: 16px;
+  --r-panel: 24px;
+  --r-pill: 999px;
+  --r-sm: 10px;
+
+  /* shadows / glass */
+  --app-shadow: 0 8px 32px rgba(0, 0, 0, 0.42);
+  --app-glass-blur: 16px;
+
+  /* layout */
+  --titlebar-h: 44px;
+  --sidebar-width: clamp(220px, 12.5vw, 300px);
+
+  /* fonts */
+  --app-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--app-bg);
+  color: var(--app-text-primary);
+  font-family: var(--app-font);
+  font-size: 14px;
+  overflow: hidden;
+}
+
+/* radial glow backdrop */
+.app-glow {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(60% 50% at 18% 0%, color-mix(in srgb, var(--app-accent) 10%, transparent), transparent 70%),
+    radial-gradient(50% 50% at 100% 100%, color-mix(in srgb, var(--app-accent-alt) 9%, transparent), transparent 70%);
+}
+
+/* custom scrollbar (accent) */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--app-accent) 30%, transparent);
+  border-radius: var(--r-pill);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--app-accent) 55%, transparent);
+  background-clip: padding-box;
+}
+
+/* glass card */
+.glass {
+  background: color-mix(in srgb, var(--app-surface) 82%, transparent);
+  backdrop-filter: blur(var(--app-glass-blur));
+  border: 1px solid var(--app-border);
+  border-radius: var(--r-card);
+  box-shadow: var(--app-shadow);
+}
+
+/* empty state */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 48px 24px;
+  color: var(--app-text-muted);
+  border: 1px dashed var(--app-border-strong);
+  border-radius: var(--r-card);
+  text-align: center;
+}

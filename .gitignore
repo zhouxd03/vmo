@@ -1,0 +1,23 @@
+# ---- secrets & runtime user data (DO NOT COMMIT) ----
+data/                 # credentials.json (real API keys) + user projects/templates
+output/               # generated images/videos (large)
+*.log
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- node / frontend ----
+node_modules/
+frontend/dist/
+frontend/.vite/
+.DS_Store
+
+# ---- packaging artifacts ----
+build/
+dist/
+*.spec
