@@ -8,8 +8,9 @@ from .core import batches, jobs, projects
 from .core import prompt_templates as tpl
 from .core import story_state
 from .core.paths import OUTPUT_DIR, PROJECTS_DIR
-from .services import (asset_gen, batch_engine, continuity, ffmpeg_util,
-                       image_gen, jianying_export, script_analysis, script_parser)
+from .services import (asset_gen, batch_engine, continuity, episode_splitter,
+                       ffmpeg_util, image_gen, jianying_export,
+                       script_analysis, script_parser)
 from .services import llm as llm_service
 
 
@@ -39,10 +40,10 @@ def register(app: Flask) -> None:
         name = body.get("name", "")
         if not text.strip():
             return jsonify({"error": "文本为空"}), 400
-        parsed = script_parser.parse_script(text, file_type)
-        if not parsed["segments"]:
+        episodes = episode_splitter.split_into_episodes(text, file_type)
+        if not episodes:
             return jsonify({"error": "未解析出任何片段，请检查文件格式"}), 400
-        project = projects.create_project(name, parsed["source_type"], text, parsed)
+        project = projects.create_project(name, episodes=episodes)
         return jsonify(project)
 
     # ── episodes (集) ──
@@ -121,6 +122,21 @@ def register(app: Flask) -> None:
     def _resolve_episode(pid, body):
         eid = (body or {}).get("episode_id") or projects.first_episode_id(pid)
         return eid, projects.get_episode(pid, eid)
+
+    # ── story bible: manual edit of novel-level scalar fields ──
+    # 风格({{style}})/标题/梗概可手动设定；手设后全流程沿用该值，且重新分析不覆盖。
+    @app.route("/api/projects/<pid>/story_bible", methods=["PATCH"])
+    def update_story_bible(pid):
+        p = projects.get_project(pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        body = request.json or {}
+        bible = dict(p.get("story_bible") or {})
+        for k in ("title", "logline", "style", "summary"):
+            if k in body:
+                bible[k] = (body.get(k) or "").strip()
+        projects.update_project(pid, {"story_bible": bible})
+        return jsonify({"story_bible": bible})
 
     # ── stage 1: global analysis (per episode → merged into shared bible) ──
     @app.route("/api/projects/<pid>/analyze", methods=["POST"])

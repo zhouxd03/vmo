@@ -51,7 +51,9 @@ async function doImport() {
       file_type: fileType.value,
       text: rawText.value,
     })
-    message.success(`已导入「${project.name}」，解析出 ${project.segments.length} 个片段`)
+    const eps = project.episodes || []
+    const segCount = eps.reduce((n, e) => n + ((e.segments && e.segments.length) || 0), 0)
+    message.success(`已导入「${project.name}」：自动分为 ${eps.length} 集，共 ${segCount} 个片段`)
     router.push('/script')
   } catch (e) {
     message.error('导入失败: ' + e.message)

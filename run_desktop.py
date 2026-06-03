@@ -5,10 +5,16 @@ The window is frameless (no native title bar); the Vue app draws its own 44px
 titlebar with window controls wired to the pywebview API.
 """
 
+import os
 import socket
+import sys
 import threading
 import time
 import urllib.request
+
+# Ensure the repo root is importable even when Python runs in isolated mode
+# (-I ignores cwd / PYTHONPATH). Harmless under PyInstaller (frozen) too.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import webview
 
