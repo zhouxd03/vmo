@@ -18,6 +18,18 @@ const CATEGORIES = [
   { key: 'image_host', label: '图床（可选）', desc: '图生视频的公网图床；留空则用内置 catbox/0x0 兜底', needsModel: false },
 ]
 
+const videoProviderOptions = [
+  { label: 'OpenAI 兼容 (/v1/videos)', value: '' },
+  { label: 'Seedance · doubao-seedance (multipart + token)', value: 'seedance' },
+]
+const SEEDANCE_MODELS = [
+  'doubao-seedance-2-0-fast-260128',
+  'doubao-seedance-2-0-260128',
+  'doubao-seedance-2-0-260128-1',
+  'doubao-seedance-2-0-260128-2',
+  'doubao-seedance-2-0-260128-3',
+].map((v) => ({ label: v, value: v }))
+
 const data = ref({ image: [], video: [], llm: [], image_host: [] })
 const loading = ref(false)
 
@@ -42,7 +54,7 @@ onMounted(reload)
 
 function openAdd(category) {
   editing.value = { category, isNew: true }
-  form.value = { alias: '', base_url: '', api_key: '', model: '', enabled: true, is_default: false, note: '' }
+  form.value = { alias: '', base_url: '', api_key: '', model: '', provider: '', enabled: true, is_default: false, note: '' }
   modelOptions.value = []
   showModal.value = true
 }
@@ -55,6 +67,7 @@ function openEdit(category, entry) {
     base_url: entry.base_url,
     api_key: entry.api_key_masked, // masked; only overwritten if user types new
     model: entry.model,
+    provider: entry.provider || '',
     enabled: entry.enabled,
     is_default: entry.is_default,
     note: entry.note,
@@ -64,6 +77,8 @@ function openEdit(category, entry) {
 }
 
 const currentCat = computed(() => CATEGORIES.find((c) => c.key === editing.value?.category) || {})
+const effectiveModelOptions = computed(() =>
+  form.value.provider === 'seedance' ? SEEDANCE_MODELS : modelOptions.value)
 
 async function fetchModels() {
   testing.value = true
@@ -84,9 +99,13 @@ async function testConn() {
     const resp = await api.testCredential(editing.value.category, {
       base_url: form.value.base_url,
       api_key: form.value.api_key,
+      provider: form.value.provider,
     })
     if (resp.ok) {
-      message.success('连接成功' + (resp.models?.length ? `，发现 ${resp.models.length} 个模型` : ''))
+      let extra = ''
+      if (resp.info) extra = `，余额 满血:${resp.info.Token ?? '-'} / 快速:${resp.info.FastToken ?? '-'} / 国际版:${resp.info.SdDuration ?? '-'}s`
+      else if (resp.models?.length) extra = `，发现 ${resp.models.length} 个模型`
+      message.success('连接成功' + extra)
       if (resp.models?.length) modelOptions.value = resp.models.map((m) => ({ label: m, value: m }))
     } else {
       message.error('连接失败: ' + (resp.error || '未知错误'))
@@ -199,8 +218,11 @@ async function makeDefault(category, id) {
         <n-form-item label="别名">
           <n-input v-model:value="form.alias" placeholder="便于识别，如：主力生图 / 备用Key" />
         </n-form-item>
+        <n-form-item v-if="editing?.category === 'video'" label="接口类型 (provider)">
+          <n-select v-model:value="form.provider" :options="videoProviderOptions" />
+        </n-form-item>
         <n-form-item v-if="editing?.category !== 'image_host'" label="API 地址 (base_url)">
-          <n-input v-model:value="form.base_url" placeholder="https://your-relay.example.com/v1" />
+          <n-input v-model:value="form.base_url" :placeholder="form.provider === 'seedance' ? 'http://119.45.252.34:8618' : 'https://your-relay.example.com/v1'" />
         </n-form-item>
         <n-form-item label="API Key">
           <n-input v-model:value="form.api_key" type="password" show-password-on="click" placeholder="留空则保留原值（编辑时）" />
@@ -211,7 +233,7 @@ async function makeDefault(category, id) {
               v-model:value="form.model"
               filterable
               tag
-              :options="modelOptions"
+              :options="effectiveModelOptions"
               placeholder="选择或手动输入模型名"
             />
             <n-button v-if="currentCat.fetchModels" size="small" :loading="testing" @click="fetchModels">

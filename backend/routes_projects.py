@@ -280,6 +280,21 @@ def register(app: Flask) -> None:
             return jsonify({"error": "项目不存在"}), 404
         return jsonify(batches.list_batches(pid))
 
+    @app.route("/api/projects/<pid>/shot_prompts", methods=["POST"])
+    def shot_prompts(pid):
+        """Preview editable image/video prompts for shots (no generation)."""
+        p = projects.get_project(pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        body = request.json or {}
+        _eid, ep = _resolve_episode(pid, body)
+        if not ep:
+            return jsonify({"error": "分集不存在"}), 404
+        ctx = {**ep, "assets": p.get("assets", []),
+               "story_bible": p.get("story_bible")}
+        prompts = batch_engine.build_shot_prompts(ctx, body.get("shot_nos"))
+        return jsonify({"prompts": prompts})
+
     @app.route("/api/projects/<pid>/batches", methods=["POST"])
     def create_batch(pid):
         p = projects.get_project(pid)

@@ -30,7 +30,7 @@ const tasks = useTasksStore()
 // batch list lives in the global tasks store so polling/progress survive tab
 // switches (§8.2). This view just reads it and derives per-episode materials.
 const batches = computed(() => tasks.batches)
-const rowState = reactive({})    // shot_no -> { promptDraft, chosen, running }
+const rowState = reactive({})    // shot_no -> { imagePrompt, videoPrompt, chosen, running, mode }
 const locks = ref(new Set())     // locked shot_no (skipped in batch)
 
 // live generation status (per shot) + overall progress of active batches
@@ -76,8 +76,12 @@ const shots = computed(() => episode.value?.shots || [])
 // ensure a row-state entry exists for every shot BEFORE render (avoid undefined access)
 function ensureRows(list) {
   ;(list || []).forEach((s) => {
-    if (!rowState[s.shot_no]) rowState[s.shot_no] = { promptDraft: '', chosen: null, running: false, mode: 'image' }
-    else if (!rowState[s.shot_no].mode) rowState[s.shot_no].mode = 'image'
+    if (!rowState[s.shot_no]) rowState[s.shot_no] = { imagePrompt: '', videoPrompt: '', chosen: null, running: false, mode: 'image' }
+    else {
+      if (!rowState[s.shot_no].mode) rowState[s.shot_no].mode = 'image'
+      if (rowState[s.shot_no].imagePrompt === undefined) rowState[s.shot_no].imagePrompt = ''
+      if (rowState[s.shot_no].videoPrompt === undefined) rowState[s.shot_no].videoPrompt = ''
+    }
   })
 }
 
@@ -86,18 +90,42 @@ const modeTabs = [
   { key: 'video', label: '视频' },
   { key: 'sync', label: '同步后续' },
 ]
-function autoPrompt(s) {
-  // local auto-generated prompt from shot fields (no LLM needed)
-  return [s.camera, resolvedText(s)].filter(Boolean).join('，')
-}
-function inferRow(no) {
-  const s = shots.value.find((x) => x.shot_no === no)
-  if (s) { rowState[no].promptDraft = autoPrompt(s); message.success(`已推理填充 ${no} 描述词`) }
-}
-function inferAll() {
+// current-mode prompt accessors (image vs video are stored separately so each
+// mode keeps its own editable text)
+function promptField(no) { return rowState[no]?.mode === 'video' ? 'videoPrompt' : 'imagePrompt' }
+function currentPrompt(no) { return rowState[no]?.[promptField(no)] || '' }
+function setPrompt(no, val) { if (rowState[no]) rowState[no][promptField(no)] = val }
+
+// Pull engine-grade image/video prompts from the backend (deterministic, no LLM
+// call, spends no credits) and drop them into the editable textboxes so the user
+// can see & adjust exactly what will be generated. `force` overwrites existing
+// text (explicit AI推理); otherwise only blanks are filled (default display).
+async function fillPrompts(shotNos, { force = false } = {}) {
+  if (!store.current || !shotNos.length) return 0
+  let res
+  try {
+    res = await api.previewShotPrompts(store.current.id, {
+      episode_id: store.currentEpisodeId, shot_nos: shotNos,
+    })
+  } catch (e) { message.error('提示词推理失败：' + e.message); return 0 }
+  const prompts = res?.prompts || {}
   let n = 0
-  shots.value.forEach((s) => { if (!locks.value.has(s.shot_no)) { rowState[s.shot_no].promptDraft = autoPrompt(s); n++ } })
-  message.success(`已批量推理填充 ${n} 镜描述词`)
+  shotNos.forEach((no) => {
+    const r = rowState[no]; const p = prompts[no]
+    if (!r || !p) return
+    if (force || !(r.imagePrompt || '').trim()) r.imagePrompt = p.image || ''
+    if (force || !(r.videoPrompt || '').trim()) r.videoPrompt = p.video || ''
+    n++
+  })
+  return n
+}
+async function inferRow(no) {
+  if (await fillPrompts([no], { force: true })) message.success(`已推理填充 ${no} 图片/视频提示词`)
+}
+async function inferAll() {
+  const targets = shots.value.map((s) => s.shot_no).filter((no) => !locks.value.has(no))
+  const n = await fillPrompts(targets, { force: true })
+  if (n) message.success(`已批量推理填充 ${n} 镜图片/视频提示词`)
 }
 watch(shots, (list) => ensureRows(list), { immediate: true })
 
@@ -127,6 +155,8 @@ async function reload() {
   tasks.setBatchProject(store.current.id)
   await tasks.refreshBatches()
   await rebuildMaterials()
+  // show prompts by default (fill only blanks; keep any user edits)
+  await fillPrompts(shots.value.map((s) => s.shot_no))
   // if a batch is already running (e.g. started before we navigated here), the
   // store keeps polling so its progress stays live.
   if (tasks.batchActive) tasks.ensureBatchPolling()
@@ -294,10 +324,11 @@ function buildParams(kind) {
   return p
 }
 
-function overridesFor(shotNos) {
+function overridesFor(shotNos, kind) {
+  const field = kind === 'video' ? 'videoPrompt' : 'imagePrompt'
   const o = {}
   shotNos.forEach((no) => {
-    const d = rowState[no]?.promptDraft
+    const d = rowState[no]?.[field]
     if (d && d.trim()) o[no] = d.trim()
   })
   return o
@@ -309,7 +340,7 @@ async function genRow(no, kind) {
     const b = await api.createBatch(store.current.id, {
       kind, source: 'shots', name: `${no}-${kind}`,
       episode_id: store.currentEpisodeId, shot_nos: [no],
-      prompt_overrides: overridesFor([no]),
+      prompt_overrides: overridesFor([no], kind),
       params: buildParams(kind), concurrency: 1,
     })
     await api.startBatch(store.current.id, b.id)
@@ -329,7 +360,7 @@ async function genBatch(kind) {
     const b = await api.createBatch(store.current.id, {
       kind, source: 'shots', name: `${episode.value.name}-批量${kind === 'video' ? '生视频' : '生图'}`,
       episode_id: store.currentEpisodeId, shot_nos: targets,
-      prompt_overrides: overridesFor(targets),
+      prompt_overrides: overridesFor(targets, kind),
       params: buildParams(kind), concurrency: kind === 'video' && tb.continuity ? 1 : 2,
     })
     await api.startBatch(store.current.id, b.id)
@@ -449,7 +480,8 @@ async function exportJianying() {
             </div>
             <textarea
               class="prompt-area"
-              v-model="rowState[s.shot_no].promptDraft"
+              :value="currentPrompt(s.shot_no)"
+              @input="setPrompt(s.shot_no, $event.target.value)"
               :placeholder="`${rowState[s.shot_no].mode === 'video' ? '视频' : '图片'}提示词，输入 @ 引用角色，# 引用场景，$ 引用物品…`"
             ></textarea>
             <div class="ctl">

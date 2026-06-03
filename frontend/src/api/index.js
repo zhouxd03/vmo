@@ -102,6 +102,7 @@ export const api = {
 
   // batches (Phase 4)
   listBatches: (pid) => req('GET', `/api/projects/${pid}/batches`),
+  previewShotPrompts: (pid, body) => req('POST', `/api/projects/${pid}/shot_prompts`, body),
   createBatch: (pid, body) => req('POST', `/api/projects/${pid}/batches`, body),
   getBatch: (pid, bid) => req('GET', `/api/projects/${pid}/batches/${bid}`),
   deleteBatch: (pid, bid) => req('DELETE', `/api/projects/${pid}/batches/${bid}`),

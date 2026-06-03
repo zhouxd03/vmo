@@ -90,6 +90,52 @@ def build_tasks_from_shots(project: dict, shot_nos: Optional[list] = None) -> li
     return tasks
 
 
+def _video_dynamics(task: dict) -> str:
+    """Motion/pacing directives that turn a static image prompt into a video
+    prompt: camera movement, subject action, emotional pacing + duration, and a
+    consistency guard. Deterministic (no LLM) so it works offline & spends no
+    credits, while staying editable by the user in the worktable."""
+    parts = []
+    cam = (task.get("camera") or "").strip()
+    if cam:
+        parts.append(f"运镜与景别：{cam}")
+    act = (task.get("action") or "").strip()
+    if act:
+        parts.append(f"主体动作：{act}")
+    emo = (task.get("emotion") or "").strip()
+    dur = task.get("duration")
+    pace = []
+    if emo:
+        pace.append(f"{emo}情绪")
+    try:
+        if dur:
+            pace.append(f"约{int(dur)}秒")
+    except (TypeError, ValueError):
+        pass
+    if pace:
+        parts.append("节奏：" + "，".join(pace))
+    parts.append("镜头运动自然流畅、画面无跳帧；保持人物外形、服装与道具形制和参考图一致")
+    return "；".join(parts)
+
+
+def build_shot_prompts(project: dict, shot_nos: Optional[list] = None) -> dict:
+    """Preview the per-shot generation prompts WITHOUT generating anything.
+
+    Returns ``{shot_no: {"image": str, "video": str}}`` using the same engine
+    logic as real generation (style + camera + resolved @/#/$ shot text), so the
+    worktable can show editable, what-you-see-is-what-gets-generated prompts. The
+    video variant augments the image scene with motion/pacing dynamics.
+    """
+    out: dict = {}
+    for t in build_tasks_from_shots(project, shot_nos):
+        img = t.get("prompt", "") or ""
+        dyn = _video_dynamics(t)
+        base = img.rstrip("。，、 ")
+        vid = f"{base}。【镜头动态】{dyn}" if base else dyn
+        out[t.get("shot_no", "")] = {"image": img, "video": vid}
+    return out
+
+
 def _shot_duration(task: dict, params: dict) -> int:
     """Per-shot duration (s): prefer the shot's pacing-derived value, else the
     batch default; always clamp to the 15s model ceiling."""
@@ -195,6 +241,8 @@ def _gen_video_task(pid, batch, task, params):
         ref_images_b64=refs,
         save_dir=_out_dir(pid, batch["id"]),
         filename_prefix=task.get("shot_no") or task["id"],
+        generate_audio=bool(params.get("generate_audio", False)),
+        watermark=bool(params.get("watermark", False)),
     )
     return {"filename": out["filename"], "filepath": out["filepath"]}
 
@@ -271,6 +319,8 @@ def _gen_video_task_continuity(pid, batch, task, params):
         ref_images_b64=refs,
         save_dir=_out_dir(pid, batch["id"]),
         filename_prefix=shot_no,
+        generate_audio=bool(params.get("generate_audio", False)),
+        watermark=bool(params.get("watermark", False)),
     )
 
     # commit this shot's state, extract its tail frame for the next shot
