@@ -138,7 +138,7 @@ export const useTasksStore = defineStore('tasks', {
     },
 
     // ───────────────────────── script decompose ─────────────────────────
-    async startDecompose(pid, eid) {
+    async startDecompose(pid, eid, opts = {}) {
       this.decomposeProjectId = pid
       this.decomposeEpisodeId = eid
       this.decomposeStatus = 'running'
@@ -147,7 +147,7 @@ export const useTasksStore = defineStore('tasks', {
       this.decomposeError = ''
       this.decomposeJobId = null
       try {
-        const { job_id } = await api.decomposeProject(pid, { episode_id: eid })
+        const { job_id } = await api.decomposeProject(pid, { episode_id: eid, ...opts })
         this.decomposeJobId = job_id
         this._startDecomposeTimer()
       } catch (e) {

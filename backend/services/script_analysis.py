@@ -11,6 +11,7 @@ blowup; each chunk can be retried independently (resume-from-checkpoint).
 
 import json
 import logging
+import re
 from typing import Any, Callable, Optional
 
 from ..core import prompt_templates as tpl
@@ -159,6 +160,54 @@ def _resolve_src_seq(raw, seq_set: set, chunk_seqs: list, shot_idx: int, n_shots
     return chunk_seqs[pos]
 
 
+_MATCH_PUNCT_RE = re.compile(r"[\s，。、；：！？“”‘’（）()\[\]【】…—\-·~,.!?;:\"'`*#@$]+")
+
+
+def _norm_match(s: str) -> str:
+    return _MATCH_PUNCT_RE.sub("", s or "")
+
+
+def _bigrams(s: str) -> set:
+    if len(s) >= 2:
+        return {s[i:i + 2] for i in range(len(s) - 1)}
+    return {s} if s else set()
+
+
+def _coverage(shot_t: str, seg_t: str) -> float:
+    """Fraction of the *shot* text's bigrams that appear in the segment.
+
+    Asymmetric on purpose: a short narrative shot fully contained in a longer
+    source paragraph should score ~1.0 even though the paragraph has extra
+    bigrams. This is what lets us pick the paragraph the shot actually derives
+    from instead of an unrelated scene-slug line.
+    """
+    a, b = _bigrams(shot_t), _bigrams(seg_t)
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a)
+
+
+def _match_source(shot: dict, chunk: list[dict]) -> tuple:
+    """Deterministically locate the source segment a shot derives from by
+    content overlap (narrative first, scene-slug only as a weak fallback).
+
+    Returns (seq, text) of the best-matching segment, or (None, None) when no
+    segment is a confident match (caller then falls back to positional seq).
+    """
+    core = (shot.get("action") or "") + (shot.get("dialogue") or "")
+    target = _norm_match(core) or _norm_match(shot.get("scene") or "")
+    if not target:
+        return None, None
+    best_seg, best = None, 0.0
+    for seg in chunk:
+        sc = _coverage(target, _norm_match(seg.get("text") or ""))
+        if sc > best:
+            best, best_seg = sc, seg
+    if best_seg is not None and best >= 0.18:
+        return best_seg.get("seq"), best_seg.get("text") or ""
+    return None, None
+
+
 def _bible_summary(bible: dict, chunk_text: str = "", prev_handoff: str = "") -> str:
     """Compact StoryBible for stage-2 context (keep tokens small).
 
@@ -198,16 +247,20 @@ def run_decompose(
     existing_shots: Optional[list] = None,
     episode_no: int = 1,
     prev_handoff_init: Optional[str] = None,
+    template_preset: Optional[str] = None,
 ) -> dict:
-    """Stage 2 -> {"shots": [...], "blocks": [...]}.
+    """Stage 2 (自动) -> {"shots": [...], "blocks": [...]}.
 
     Resumable: start_chunk + existing_shots let a failed run continue.
+    *template_preset* selects a 分镜模式 (batch_decompose preset) for this run.
+    Always LLM-driven: llm.chat_json raises a clear credential error when no
+    LLM 中转站 is configured (强制 LLM 介入, no silent deterministic fallback).
     """
     bible = project.get("story_bible") or {}
     segments = project.get("segments", [])
     chunks = _chunk_segments(segments, chunk_chars)
     total = len(chunks)
-    body = tpl.get_template_body("batch_decompose")
+    body = tpl.get_template_body("batch_decompose", template_preset)
     # 「单镜目标时长」(设置) → 单镜承载字数（纯画面≈8字/秒）。拆解时按此控制每镜体量；
     # 对白多的镜由模板按≈5字/秒折算降低字数（避免对话过载）。
     try:
@@ -250,7 +303,18 @@ def run_decompose(
         for si, sh in enumerate(chunk_shots):
             counter += 1
             sh["shot_no"] = f"S{episode_no:02d}-C{counter:03d}"
-            sh["seq"] = _resolve_src_seq(sh.get("seq"), seq_set, chunk_seqs, si, n_shots)
+            # 原文映射：先按内容确定性匹配源段（最稳，避开场景头行/LLM 乱给 seq），
+            # 匹配不到再退回信任 LLM seq / 位置分配；并把命中的源文落到 src_text 上，
+            # 让工作台「原文」始终对应本镜真正出处（修：拆解后原文与分镜不符）。
+            m_seq, m_text = _match_source(sh, chunk)
+            if m_text:
+                sh["seq"] = m_seq if m_seq is not None else _resolve_src_seq(
+                    sh.get("seq"), seq_set, chunk_seqs, si, n_shots)
+                sh["src_text"] = m_text
+            else:
+                sh["seq"] = _resolve_src_seq(sh.get("seq"), seq_set, chunk_seqs, si, n_shots)
+                sh["src_text"] = next(
+                    (s.get("text") or "" for s in chunk if s.get("seq") == sh["seq"]), "")
             # 按台词体量 + 情绪估算单镜时长（正常 5 字/秒，急/怒更快、悲/沉更慢），
             # 钳制到 [3,15] 秒（视频模型单条上限 15s）。LLM 已给时则尊重其值。
             if not sh.get("duration"):
@@ -265,4 +329,66 @@ def run_decompose(
         if on_progress:
             on_progress(ci + 1, total)
 
+    return {"shots": shots, "blocks": blocks, "chunk_total": total}
+
+
+def run_decompose_manual(
+    project: dict,
+    manual_segments: list[str],
+    *,
+    model: Optional[str] = None,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+    episode_no: int = 1,
+    prev_handoff_init: Optional[str] = None,
+) -> dict:
+    """Stage 2 (手动分镜) -> {"shots": [...], "blocks": [...]}.
+
+    The human has already decided every shot boundary (one entry of
+    *manual_segments* == one shot). The LLM is still in charge of the rest:
+    for each human segment it fills the structured fields (场景/角色/动作/机位/
+    对白/接口/时长) via the ``manual_shot_structure`` template, carrying the
+    previous shot's handoff forward for continuity. 强制 LLM — no fallback.
+    """
+    bible = project.get("story_bible") or {}
+    segs = [s for s in (t.strip() for t in (manual_segments or [])) if s]
+    total = len(segs)
+    body = tpl.get_template_body("manual_shot_structure")
+    try:
+        shot_target = int(settings_store.load_settings().get("shot_target_seconds", 10))
+    except (TypeError, ValueError):
+        shot_target = 10
+    shot_target = max(pacing.MIN_SEC, min(pacing.MAX_SEC, shot_target))
+
+    shots: list[dict] = []
+    block_shot_nos: list[str] = []
+    prev_handoff = prev_handoff_init or "（首镜，无上文）"
+
+    for i, text in enumerate(segs):
+        prompt = tpl.render(body, {
+            "story_bible": _bible_summary(bible, text, prev_handoff),
+            "prev_handoff": prev_handoff,
+            "shot_text": text,
+            "shot_target": shot_target,
+        })
+        logger.info(f"[Analysis] Stage2 手动分镜·结构化 {i+1}/{total}")
+        result = llm.chat_json(
+            [{"role": "user", "content": prompt}], model=model, temperature=0.4)
+        sh = result[0] if isinstance(result, list) and result else (
+            result if isinstance(result, dict) else {})
+        sh["shot_no"] = f"S{episode_no:02d}-C{i+1:03d}"
+        sh["seq"] = i + 1
+        # 人工划定的原文片段即本镜出处，直接落 src_text（保证原文与分镜一致）。
+        sh["src_text"] = text
+        if not sh.get("duration"):
+            sh["duration"] = pacing.estimate_shot_seconds(
+                sh.get("dialogue", ""), sh.get("action", ""),
+                sh.get("emotion") or sh.get("mood") or "",
+                target_seconds=shot_target)
+        shots.append(sh)
+        block_shot_nos.append(sh["shot_no"])
+        prev_handoff = sh.get("handoff") or prev_handoff
+        if on_progress:
+            on_progress(i + 1, total)
+
+    blocks = [{"index": 0, "chunk_seq": [s["seq"] for s in shots], "shot_nos": block_shot_nos}]
     return {"shots": shots, "blocks": blocks, "chunk_total": total}

@@ -305,6 +305,31 @@ def build_video_prompt(task: dict, image_prompt: str) -> str:
     return vid or (image_prompt or "")
 
 
+def _preview_definition_block(task: dict, kind: str = "video") -> str:
+    """工作台预览用【画面定义】块：按本镜已校验有参考图的资产元数据（角色/场景/道具）
+    预排编号，给用户可见的近似定义行。生成时由 compose_prompt 以权威定义（含运行期
+    尾帧/导演图/站位图）覆盖，且幂等不重复堆叠。"""
+    items = []
+    for m in task.get("materials", []) or []:
+        if not m.get("ref_image"):
+            continue
+        items.append({"role": reference_set.material_role(m), "name": m.get("name")})
+    if not items:
+        return ""
+    items.sort(key=lambda it: reference_set.ROLE_RANK.get(it.get("role"), 99))
+    items = items[:_max_refs()]
+    return reference_set.build_definition_block(items, kind, require_b64=False)
+
+
+def _with_preview_def(task: dict, video_prompt: str, kind: str = "video") -> str:
+    """Prepend the preview【画面定义】block to *video_prompt* (idempotent)."""
+    body = reference_set.strip_definition_block(video_prompt or "")
+    head = _preview_definition_block(task, kind)
+    if not head:
+        return body
+    return head + "\n\n" + body if body else head
+
+
 def build_shot_prompts(project: dict, shot_nos: Optional[list] = None) -> dict:
     """Preview the per-shot generation prompts WITHOUT generating anything.
 
@@ -323,7 +348,8 @@ def build_shot_prompts(project: dict, shot_nos: Optional[list] = None) -> dict:
             t["_prev_handoff"] = prev_ho
         if want is None or str(no) in want:
             img = t.get("prompt", "") or ""
-            out[no] = {"image": img, "video": build_video_prompt(t, img)}
+            out[no] = {"image": img,
+                       "video": _with_preview_def(t, build_video_prompt(t, img))}
         prev_ho = (t.get("handoff_ref") or t.get("handoff") or "").strip()
     return out
 
@@ -387,24 +413,27 @@ def infer_shot_prompt(project: dict, shot_no, *, model: Optional[str] = None) ->
     }
     try:
         body = prompt_templates.get_template_body("shot_prompt_infer")
+        # 留足额度给「推理型」LLM（reasoning_content 单独占用 max_tokens）：1400 会被
+        # 思维链吃光导致 content 截断成空串/坏 JSON（实测 deepseek 推理模型）。给 6000。
         data = llm.chat_json(
             [{"role": "user", "content": prompt_templates.render(body, variables)}],
-            model=model, temperature=0.5, max_tokens=1400,
+            model=model, temperature=0.5, max_tokens=6000,
         )
         image = (data.get("image") or "").strip() if isinstance(data, dict) else ""
         video = (data.get("video") or "").strip() if isinstance(data, dict) else ""
         if not (image or video):
             raise llm.LLMError("LLM 返回空结果")
+        vid = video or build_video_prompt(target, image or img_draft)
         return {
             "image": image or img_draft,
-            "video": video or build_video_prompt(target, image or img_draft),
+            "video": _with_preview_def(target, vid),
             "source": "llm",
         }
     except Exception as e:  # noqa: BLE001 — 任意异常都回落到确定性合成，保证可用
         logger.warning("infer_shot_prompt 回落确定性合成 (%s): %s", shot_no, e)
         return {
             "image": img_draft,
-            "video": build_video_prompt(target, img_draft),
+            "video": _with_preview_def(target, build_video_prompt(target, img_draft)),
             "source": "fallback",
             "error": str(e),
         }
@@ -430,13 +459,18 @@ def _max_refs() -> int:
 
 
 def _asset_ref_items(pid: str, task: dict) -> list:
-    """Reference items for a task's @/#/$ asset materials (those with a ref image)."""
+    """Reference items for a task's @/#/$ asset materials (those with a ref image).
+
+    场景资产若另有「鸟瞰图」(aerial_image)，紧随其主场景图一并作为参考喂入，用于
+    固定场景空间位置与机位布局（角色 scene_aerial，优先级紧随主场景图之后）。"""
+    asset_dir = PROJECTS_DIR / pid / "assets"
+    by_id = {a.get("id"): a for a in assets_core.list_assets(pid)}
     items = []
     for m in task.get("materials", []) or []:
         fn = m.get("ref_image")
         if not fn:
             continue
-        path = PROJECTS_DIR / pid / "assets" / fn
+        path = asset_dir / fn
         if not path.exists():
             continue
         items.append({
@@ -446,6 +480,17 @@ def _asset_ref_items(pid: str, task: dict) -> list:
             "asset_id": m.get("asset_id"),
             "old_ph": m.get("placeholder"),
         })
+        asset = by_id.get(m.get("asset_id")) or {}
+        aerial_fn = asset.get("aerial_image")
+        if aerial_fn:
+            aerial_path = asset_dir / aerial_fn
+            if aerial_path.exists():
+                items.append({
+                    "b64": base64.b64encode(aerial_path.read_bytes()).decode("utf-8"),
+                    "role": "scene_aerial",
+                    "name": m.get("name"),
+                    "asset_id": m.get("asset_id"),
+                })
     return items
 
 

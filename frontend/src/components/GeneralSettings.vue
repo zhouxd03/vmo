@@ -50,6 +50,13 @@ const SCHEMA = [
     ],
   },
   {
+    group: '资产库',
+    hint: '资产库「一键生成」并发数：同时生成多少张资产参考图。适度并发显著加速，过高会增大 API 压力/限流。场景资产会额外生成一张鸟瞰图用于固定空间位置。',
+    fields: [
+      { key: 'asset_gen_concurrency', label: '一键生成并发数', type: 'number', min: 1, max: 16 },
+    ],
+  },
+  {
     group: '存储',
     fields: [
       { key: 'output_dir', label: '输出目录', type: 'text' },

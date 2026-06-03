@@ -240,6 +240,11 @@ def register(app: Flask) -> None:
             return jsonify({"error": "分集不存在"}), 404
         model = body.get("model")
         ep_no = ep.get("idx", 1)
+        mode = (body.get("mode") or "auto").strip()
+        template_preset = body.get("template_preset")  # 分镜模式（batch_decompose 预设）
+        manual_segments = body.get("manual_segments") or []
+        if mode == "manual" and not [s for s in manual_segments if (s or "").strip()]:
+            return jsonify({"error": "手动分镜模式需提供至少一个分镜片段"}), 400
         # cross-episode handoff: seed with the previous episode's closing handoff
         prev_ep = projects.prev_episode(pid, eid)
         prev_handoff = None
@@ -249,11 +254,18 @@ def register(app: Flask) -> None:
 
         def worker(job_id):
             def on_progress(done, total):
+                label = "结构化分镜" if mode == "manual" else "拆解块"
                 jobs.update(job_id, progress=done, total=total,
-                            message=f"拆解块 {done}/{total}")
-            result = script_analysis.run_decompose(
-                ctx, model=model, on_progress=on_progress,
-                episode_no=ep_no, prev_handoff_init=prev_handoff)
+                            message=f"{label} {done}/{total}")
+            if mode == "manual":
+                result = script_analysis.run_decompose_manual(
+                    ctx, manual_segments, model=model, on_progress=on_progress,
+                    episode_no=ep_no, prev_handoff_init=prev_handoff)
+            else:
+                result = script_analysis.run_decompose(
+                    ctx, model=model, on_progress=on_progress,
+                    episode_no=ep_no, prev_handoff_init=prev_handoff,
+                    template_preset=template_preset)
             projects.update_episode(pid, eid, {
                 "shots": result["shots"],
                 "blocks": result["blocks"],
@@ -338,7 +350,8 @@ def register(app: Flask) -> None:
         body = request.json or {}
         try:
             out = asset_gen.generate_missing(
-                pid, model=body.get("model"), size=body.get("size", "1024x1024"))
+                pid, model=body.get("model"), size=body.get("size", "1024x1024"),
+                concurrency=body.get("concurrency"))
         except image_gen.GenerationError as e:
             return jsonify({"error": str(e)}), 502
         except Exception as e:  # noqa: BLE001

@@ -26,6 +26,9 @@ DEFAULTS = {
     # runs serially内部 (concurrency=1) so memory stays bounded; raising this
     # runs more episodes in parallel at the cost of more RAM / API pressure.
     "max_parallel_episodes": 2,
+    # 资产库「一键生成」并发数：同时生成多少张资产参考图。生图为 IO 密集（等中转
+    # 返回），适度并发能显著加速；过高会增大 API 压力/限流，默认取稳妥值 3。
+    "asset_gen_concurrency": 3,
     # reference images: hard cap on how many垫图 a single shot may feed the model.
     # When exceeded, lowest-priority images are dropped first, in the order
     # 导演图/首帧图 ＞ 角色图 ＞ 背景图 ＞ 配角图 ＞ 道具图.

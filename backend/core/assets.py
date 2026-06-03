@@ -10,11 +10,16 @@ Mirrors xingyao's real mechanism (verified from source):
 """
 
 import re
+import threading
 import time
 import uuid
 from typing import Any, Optional
 
 from . import projects
+
+# Serialize asset read-modify-write so concurrent一键生成 workers (ThreadPool)
+# don't clobber each other's project.json updates (lost-write race).
+_write_lock = threading.RLock()
 
 TRIGGERS = {"character": "@", "scene": "#", "prop": "$"}
 TYPE_BY_TRIGGER = {v: k for k, v in TRIGGERS.items()}
@@ -64,18 +69,20 @@ def add_asset(pid: str, asset_type: str, name: str, desc: str = "", appearance: 
 
 
 def update_asset(pid: str, asset_id: str, patch: dict[str, Any]) -> Optional[dict]:
-    assets = list_assets(pid)
-    found = None
-    for a in assets:
-        if a["id"] == asset_id:
-            for k in ("name", "desc", "appearance", "ref_image", "role"):
-                if k in patch:
-                    a[k] = patch[k]
-            found = a
-            break
-    if found:
-        _save_assets(pid, assets)
-    return found
+    with _write_lock:
+        assets = list_assets(pid)
+        found = None
+        for a in assets:
+            if a["id"] == asset_id:
+                for k in ("name", "desc", "appearance", "ref_image", "role",
+                          "aerial_image", "ref_source"):
+                    if k in patch:
+                        a[k] = patch[k]
+                found = a
+                break
+        if found:
+            _save_assets(pid, assets)
+        return found
 
 
 def delete_asset(pid: str, asset_id: str) -> None:

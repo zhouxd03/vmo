@@ -106,17 +106,24 @@ async function loadAssets() {
   catch { assetList.value = [] }
 }
 function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
-// ordered, de-duplicated @-refs (only assets that have a参考图) present in the prompt
+// ordered, de-duplicated refs present in the prompt. 严格映射：只渲染「资产库里确实
+// 存在、且已生成/导入参考图」的资产（a.ref_image 在 = 资产能被实际调用），否则回落
+// 纯文字、绝不臆造。匹配统一 @名，也兼容库分类符 #场景/$道具 与裸名，覆盖各类引用。
 function promptRefs(no) {
   const text = currentPrompt(no)
   if (!text || !assetList.value.length) return []
   const out = []
-  for (const a of assetList.value) {
+  // longest name first so 「@林夏」不会被「@林」抢先命中
+  const ordered = [...assetList.value].sort((a, b) => (b.name || '').length - (a.name || '').length)
+  for (const a of ordered) {
     if (!a.ref_image || !a.name) continue
-    const i = text.indexOf('@' + a.name)
-    if (i >= 0) out.push({
+    const name = escRe(a.name)
+    // @名（统一前缀）｜库分类符 #/$ + 名｜裸名
+    const re = new RegExp('(?:@|' + escRe(a.trigger || '') + ')?' + name)
+    const m = re.exec(text)
+    if (m) out.push({
       name: a.name, trigger: a.trigger, type: a.type,
-      url: api.assetImageUrl(store.current.id, a.ref_image), idx: i,
+      url: api.assetImageUrl(store.current.id, a.ref_image), idx: m.index,
     })
   }
   return out.sort((x, y) => x.idx - y.idx)
@@ -419,7 +426,9 @@ const segMap = computed(() => {
   for (const sg of segs) if (sg.seq != null) m[sg.seq] = sg.text || ''
   return m
 })
-function sourceText(s) { return (s.seq != null && segMap.value[s.seq]) || '' }
+// 优先用拆解时按内容确定性匹配落库的 src_text（保证与本镜真正出处一致）；
+// 旧数据无 src_text 时回退按 seq 关联源片段。
+function sourceText(s) { return (s.src_text && s.src_text.trim()) || (s.seq != null && segMap.value[s.seq]) || '' }
 const openSrc = reactive({})   // shot_no -> bool (展开原文)
 function toggleSrc(no) { openSrc[no] = !openSrc[no] }
 
@@ -632,14 +641,11 @@ async function exportJianying() {
                 @click="rowState[s.shot_no].mode = t.key"
               >{{ t.label }}</button>
             </div>
-            <textarea
-              class="prompt-area"
-              :value="currentPrompt(s.shot_no)"
-              @input="setPrompt(s.shot_no, $event.target.value)"
-              :placeholder="`${rowState[s.shot_no].mode === 'video' ? '视频' : '图片'}提示词，输入 @ 引用角色，# 引用场景，$ 引用物品…`"
-            ></textarea>
-            <!-- @引用参考图缩略图：单击放大（n-image 内置灯箱）/ 长按拖动重排 -->
+            <!-- @引用参考图缩略图：移到提示词框上方作「本镜引用」图例；仅渲染资产库里
+                 校验一致（确实能被调用、已有参考图）的资产，仅作附加显示不传输到生成端。
+                 单击放大（n-image 内置灯箱）/ 长按拖动重排。 -->
             <div v-if="promptRefs(s.shot_no).length" class="ref-strip">
+              <span class="ref-strip-cap" title="仅显示资产库中校验一致、可被调用的引用；缩略图不会传输到生成端">本镜引用</span>
               <div
                 v-for="(r, ri) in promptRefs(s.shot_no)"
                 :key="r.name"
@@ -663,6 +669,12 @@ async function exportJianying() {
                 <span class="ref-name">{{ r.trigger || '@' }}{{ r.name }}</span>
               </div>
             </div>
+            <textarea
+              class="prompt-area"
+              :value="currentPrompt(s.shot_no)"
+              @input="setPrompt(s.shot_no, $event.target.value)"
+              :placeholder="`${rowState[s.shot_no].mode === 'video' ? '视频' : '图片'}提示词，输入 @ 引用角色，# 引用场景，$ 引用物品…`"
+            ></textarea>
             <div class="ctl">
               <template v-if="rowState[s.shot_no].mode === 'image'">
                 <n-select size="tiny" v-model:value="tb.model" :options="imageModelOptions" style="width: 120px" />
@@ -928,7 +940,11 @@ async function exportJianying() {
 /* @引用缩略图条 */
 .ref-strip {
   display: flex; flex-wrap: wrap; gap: 8px;
-  padding: 6px 0 2px; align-items: flex-start;
+  padding: 2px 0 8px; align-items: center;
+}
+.ref-strip-cap {
+  font-size: 11px; color: var(--app-text-muted);
+  align-self: center; margin-right: 2px; white-space: nowrap;
 }
 .ref-thumb {
   display: flex; flex-direction: column; align-items: center; gap: 3px;
