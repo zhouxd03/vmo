@@ -77,6 +77,7 @@ export const api = {
   deleteProject: (pid) => req('DELETE', `/api/projects/${pid}`),
   importProject: (body) => req('POST', '/api/projects/import', body),
   analyzeProject: (pid, body) => req('POST', `/api/projects/${pid}/analyze`, body),
+  updateStoryBible: (pid, patch) => req('PATCH', `/api/projects/${pid}/story_bible`, patch),
   decomposeProject: (pid, body) => req('POST', `/api/projects/${pid}/decompose`, body),
   getJob: (jobId) => req('GET', `/api/jobs/${jobId}`),
 

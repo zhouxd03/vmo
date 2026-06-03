@@ -145,16 +145,34 @@ def get_project(pid: str) -> Optional[dict]:
     return project
 
 
-def create_project(name: str, source_type: str, raw_text: str, parsed: dict) -> dict:
+def create_project(name: str, source_type: str = "", raw_text: str = "",
+                   parsed: Optional[dict] = None, *,
+                   episodes: Optional[list[dict]] = None) -> dict:
+    """Create a project.
+
+    If ``episodes`` is given (list of {name, source_type, raw_text, parsed}),
+    the project is created with one 集 per entry (used by auto episode split on
+    import). Otherwise a single 第1集 is built from source_type/raw_text/parsed.
+    """
     pid = uuid.uuid4().hex[:12]
     now = time.time()
-    ep = _new_episode(1, source_type=source_type, raw_text=raw_text, parsed=parsed)
+    if episodes:
+        eps = [
+            _new_episode(i, name=e.get("name", ""),
+                         source_type=e.get("source_type", "txt"),
+                         raw_text=e.get("raw_text", ""),
+                         parsed=e.get("parsed"))
+            for i, e in enumerate(episodes, start=1)
+        ]
+    else:
+        eps = [_new_episode(1, source_type=source_type, raw_text=raw_text,
+                            parsed=parsed or {})]
     project = {
         "id": pid,
         "name": name or f"小说 {time.strftime('%m-%d %H:%M')}",
         "story_bible": None,      # novel-level, shared across episodes
         "assets": [],             # novel-level @/#/$ asset library
-        "episodes": [ep],
+        "episodes": eps,
         "created_at": now,
         "updated_at": now,
     }

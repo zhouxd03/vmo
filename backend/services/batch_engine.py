@@ -82,8 +82,23 @@ def build_tasks_from_shots(project: dict, shot_nos: Optional[list] = None) -> li
             "action": s.get("action", ""),
             "camera": s.get("camera", ""),
             "handoff": s.get("handoff", ""),
+            "dialogue": s.get("dialogue", ""),
+            "emotion": s.get("emotion") or s.get("mood") or "",
+            # per-shot duration from pacing (5字/秒，按情绪调)，供视频生成使用
+            "duration": s.get("duration"),
         })
     return tasks
+
+
+def _shot_duration(task: dict, params: dict) -> int:
+    """Per-shot duration (s): prefer the shot's pacing-derived value, else the
+    batch default; always clamp to the 15s model ceiling."""
+    d = task.get("duration") or params.get("duration", 10)
+    try:
+        d = int(d)
+    except (TypeError, ValueError):
+        d = 10
+    return max(1, min(15, d))
 
 
 # ── reference-image assembly (asset materials → priority-capped base64) ──────
@@ -174,7 +189,7 @@ def _gen_video_task(pid, batch, task, params):
     out = video_gen.generate_video(
         prompt,
         model=params.get("model"),
-        duration=int(params.get("duration", 10)),
+        duration=_shot_duration(task, params),
         aspect_ratio=aspect_ratio,
         resolution=params.get("resolution", "720p"),
         ref_images_b64=refs,
@@ -250,7 +265,7 @@ def _gen_video_task_continuity(pid, batch, task, params):
     out = video_gen.generate_video(
         prompt,
         model=params.get("model"),
-        duration=int(params.get("duration", 10)),
+        duration=_shot_duration(task, params),
         aspect_ratio=aspect_ratio,
         resolution=params.get("resolution", "720p"),
         ref_images_b64=refs,

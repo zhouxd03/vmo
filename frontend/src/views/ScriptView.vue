@@ -1,9 +1,9 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NSelect, NButton, NIcon, NCard, NTag, NEmpty, NSpace, NProgress, NSpin,
-  NCollapse, NCollapseItem, NDataTable, NAlert, useMessage,
+  NCollapse, NCollapseItem, NDataTable, NAlert, NInput, useMessage,
 } from 'naive-ui'
 import {
   SparklesOutline, GitBranchOutline, PersonOutline, LocationOutline, CubeOutline,
@@ -39,6 +39,27 @@ async function onSelect(pid) {
 
 const bible = computed(() => store.current?.story_bible)
 const shots = computed(() => store.currentEpisode?.shots || [])
+
+// 风格 {{style}} 可手动设定：草稿与圣经保持同步，失焦/回车保存。
+const styleDraft = ref('')
+const savingStyle = ref(false)
+watch(() => bible.value?.style, (v) => { styleDraft.value = v || '' }, { immediate: true })
+
+async function saveStyle() {
+  if (!store.current) return
+  const next = (styleDraft.value || '').trim()
+  if (next === (bible.value?.style || '')) return
+  savingStyle.value = true
+  try {
+    await api.updateStoryBible(store.current.id, { style: next })
+    await store.reloadCurrent()
+    message.success(next ? '风格已更新（全流程沿用此值）' : '已清空风格，将回退 AI 缺省')
+  } catch (e) {
+    message.error('风格保存失败: ' + e.message)
+  } finally {
+    savingStyle.value = false
+  }
+}
 
 async function runAnalyze() {
   if (!store.current) return
@@ -161,7 +182,19 @@ const progressPct = computed(() => {
         <div class="bible-head">
           <div><span class="bible-k">标题</span>{{ bible.title || '—' }}</div>
           <div><span class="bible-k">梗概</span>{{ bible.logline || '—' }}</div>
-          <div><span class="bible-k">风格</span>{{ bible.style || '—' }}</div>
+          <div class="bible-style">
+            <span class="bible-k">风格</span>
+            <n-input
+              v-model:value="styleDraft"
+              size="small"
+              placeholder="未设则用 AI 分析结果（可手动覆盖）"
+              :loading="savingStyle"
+              style="max-width: 420px"
+              @blur="saveStyle"
+              @keyup.enter="saveStyle"
+            />
+            <span class="bible-hint">全流程统一沿用此风格值；留空将回退 AI 分析缺省</span>
+          </div>
         </div>
         <div class="asset-cols">
           <div class="asset-col">
@@ -232,6 +265,8 @@ const progressPct = computed(() => {
   margin-bottom: 16px;
   font-size: 14px;
 }
+.bible-style { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.bible-hint { color: var(--app-text-muted); font-size: 11px; }
 .bible-k {
   color: var(--app-text-muted);
   margin-right: 8px;

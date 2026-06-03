@@ -14,7 +14,7 @@ import logging
 from typing import Any, Callable, Optional
 
 from ..core import prompt_templates as tpl
-from . import llm
+from . import llm, pacing
 
 logger = logging.getLogger("batch_studio")
 
@@ -57,6 +57,9 @@ def run_global_analysis(
     )
     if not isinstance(bible, dict):
         raise llm.LLMError("全局分析未返回 JSON 对象")
+    bible.setdefault("title", "")
+    bible.setdefault("logline", "")
+    bible.setdefault("style", "")
     bible.setdefault("characters", [])
     bible.setdefault("scenes", [])
     bible.setdefault("props", [])
@@ -87,8 +90,12 @@ def merge_bible(base: Optional[dict], add: dict) -> dict:
     for c in add.get("continuity_constraints", []) or []:
         if c not in cc:
             cc.append(c)
-    if add.get("summary") and not base.get("summary"):
-        base["summary"] = add["summary"]
+    # Novel-level scalar fields: keep the first non-empty value so they survive
+    # the per-episode merge (previously title/logline/style were dropped here,
+    # leaving the StoryBible header showing "—").
+    for scalar in ("title", "logline", "style", "summary"):
+        if add.get(scalar) and not base.get(scalar):
+            base[scalar] = add[scalar]
     return base
 
 
@@ -174,6 +181,12 @@ def run_decompose(
             counter += 1
             sh["shot_no"] = f"S{episode_no:02d}-C{counter:03d}"
             sh.setdefault("seq", chunk[0].get("seq"))
+            # 按台词体量 + 情绪估算单镜时长（正常 5 字/秒，急/怒更快、悲/沉更慢），
+            # 钳制到 [3,15] 秒（视频模型单条上限 15s）。LLM 已给时则尊重其值。
+            if not sh.get("duration"):
+                sh["duration"] = pacing.estimate_shot_seconds(
+                    sh.get("dialogue", ""), sh.get("action", ""),
+                    sh.get("emotion") or sh.get("mood") or "")
             shots.append(sh)
             block_shot_nos.append(sh["shot_no"])
             prev_handoff = sh.get("handoff") or prev_handoff

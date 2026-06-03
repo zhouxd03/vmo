@@ -10,12 +10,12 @@ function call(method) {
 
 <template>
   <header class="titlebar">
-    <div class="brand">
+    <div class="brand pywebview-drag-region">
       <span class="logo-dot" />
       <span class="brand-name">连续性批量创作</span>
       <span class="brand-sub">Batch Anime Studio</span>
     </div>
-    <div class="spacer" />
+    <div class="spacer pywebview-drag-region" />
     <div class="win-controls">
       <button class="win-btn" title="最小化" @click="call('minimize')">
         <n-icon :component="RemoveOutline" />
