@@ -6,13 +6,19 @@ titlebar with window controls wired to the pywebview API.
 """
 
 import ctypes
+import logging
 import os
+import re
 import socket
 import sys
 import threading
 import time
 import urllib.request
 from ctypes import wintypes
+
+# Reuse the app's root logger so window events land in the in-memory log buffer
+# surfaced by the「日志调试」tab.
+_wlog = logging.getLogger("batch_studio.window")
 
 # Win32 constants for native (OS-driven) title-bar dragging.
 _WM_NCLBUTTONDOWN = 0x00A1
@@ -102,6 +108,28 @@ class Api:
         if self._window:
             self._window.destroy()
 
+    def save_text_file(self, filename: str, text: str):
+        """Write *text* to the user's Downloads folder.
+
+        WebView2 silently drops blob/anchor downloads inside this frameless
+        shell, so the「日志调试」export routes through here instead of a browser
+        download. Writing straight to Downloads avoids a native modal dialog
+        (which can't be driven reliably) while still giving the user a file to
+        hand to a developer.
+        """
+        try:
+            downloads = os.path.join(os.path.expanduser("~"), "Downloads")
+            os.makedirs(downloads, exist_ok=True)
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", filename or "") or "export.log"
+            path = os.path.join(downloads, safe)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text or "")
+            _wlog.info("文件已导出: %s (%d 字符)", path, len(text or ""))
+            return {"ok": True, "path": path}
+        except Exception as e:  # noqa: BLE001
+            _wlog.warning("save_text_file 失败: %s", e)
+            return {"ok": False, "error": str(e)}
+
     def _native_hwnd(self):
         """Resolve the top-level HWND of the pywebview (winforms) window."""
         try:
@@ -171,9 +199,11 @@ class Api:
         """
         ht = _HT_EDGE.get(edge)
         if not ht or not self._window:
+            _wlog.info("start_resize(%s) ignored (ht=%s window=%s)", edge, ht, bool(self._window))
             return
         hwnd, form = self._native_hwnd()
         if not hwnd:
+            _wlog.warning("start_resize(%s): no native hwnd", edge)
             return
 
         def _do():
@@ -184,17 +214,21 @@ class Api:
             user32.ReleaseCapture()
             user32.SendMessageW(hwnd, _WM_NCLBUTTONDOWN, ht, 0)
 
+        invoked = "direct"
         try:
             if form is not None and bool(form.InvokeRequired):
                 from System import Action
                 form.Invoke(Action(_do))
+                invoked = "Invoke"
             else:
                 _do()
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            invoked = f"fallback({e})"
             try:
                 _do()
             except Exception:
                 pass
+        _wlog.info("start_resize(%s) ht=%d hwnd=%s via=%s", edge, ht, hwnd, invoked)
 
     def enable_resize(self):
         """Make the borderless form user-resizable without showing a frame.
@@ -218,9 +252,24 @@ class Api:
             style = user32.GetWindowLongW(hwnd, _GWL_STYLE)
             user32.SetWindowLongW(hwnd, _GWL_STYLE, style | _WS_THICKFRAME)
 
+            # Pointer-sized message types. The default ctypes int is 32-bit, but
+            # on 64-bit Windows lParam carries 64-bit pointers (e.g. the
+            # NCCALCSIZE_PARAMS* for WM_NCCALCSIZE, MINMAXINFO* for
+            # WM_GETMINMAXINFO). Passing those through CallWindowProcW without
+            # the right argtypes raised "int too long to convert" on every such
+            # message, so the subclassed proc crashed and the native resize loop
+            # could never recompute the window bounds — the root cause of the
+            # window not stretching.
+            LRESULT = ctypes.c_ssize_t      # LONG_PTR
+            WPARAM_T = ctypes.c_size_t      # UINT_PTR
+            LPARAM_T = ctypes.c_ssize_t     # LONG_PTR
+            user32.CallWindowProcW.restype = LRESULT
+            user32.CallWindowProcW.argtypes = [
+                ctypes.c_void_p, wintypes.HWND, wintypes.UINT, WPARAM_T, LPARAM_T,
+            ]
+
             WNDPROC = ctypes.WINFUNCTYPE(
-                ctypes.c_long, wintypes.HWND, wintypes.UINT,
-                wintypes.WPARAM, wintypes.LPARAM,
+                LRESULT, wintypes.HWND, wintypes.UINT, WPARAM_T, LPARAM_T,
             )
             old_proc = getp(hwnd, _GWLP_WNDPROC)
 
@@ -259,9 +308,9 @@ def main() -> None:
     window = webview.create_window(
         "连续性批量创作工具",
         f"http://127.0.0.1:{port}/",
-        width=1360,
-        height=860,
-        min_size=(1024, 700),
+        width=1280,
+        height=820,
+        min_size=(860, 600),
         frameless=True,
         easy_drag=False,
         background_color="#0c0d0f",

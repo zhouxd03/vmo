@@ -8,11 +8,11 @@ browser for development.
 
 import logging
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 from . import routes_projects
 from .core import credentials, settings
-from .core.logbus import get_logs, setup_logging
+from .core.logbus import clear_logs, export_text, get_logs, setup_logging
 from .core.paths import STATIC_DIR, ensure_dirs
 from .services import llm, video_gen
 
@@ -41,10 +41,27 @@ def create_app() -> Flask:
     def health():
         return jsonify({"ok": True, "service": "batch-studio", "version": "0.1.0"})
 
+    APP_VERSION = "0.1.0"
+
     @app.route("/api/logs")
     def logs():
         since = int(request.args.get("since_id", 0))
         return jsonify(get_logs(since))
+
+    @app.route("/api/logs/export")
+    def logs_export():
+        import time as _t
+        text = export_text(APP_VERSION)
+        fname = f"batch-studio-logs-{_t.strftime('%Y%m%d-%H%M%S')}.log"
+        resp = Response(text, mimetype="text/plain; charset=utf-8")
+        resp.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+        return resp
+
+    @app.route("/api/logs/clear", methods=["POST"])
+    def logs_clear():
+        n = clear_logs()
+        logger.info("日志已清空（移除 %d 条）", n)
+        return jsonify({"ok": True, "removed": n})
 
     # ── settings ──
     @app.route("/api/settings", methods=["GET"])

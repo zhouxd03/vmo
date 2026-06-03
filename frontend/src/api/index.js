@@ -70,6 +70,8 @@ export const api = {
 
   health: () => req('GET', '/api/health'),
   logs: (sinceId = 0) => req('GET', `/api/logs?since_id=${sinceId}`),
+  exportLogs: () => downloadBlob('GET', '/api/logs/export'),
+  clearLogs: () => req('POST', '/api/logs/clear'),
 
   getSettings: () => req('GET', '/api/settings'),
   saveSettings: (patch) => req('POST', '/api/settings', patch),
