@@ -12,6 +12,7 @@ pluggable so the engine mechanics can be tested without real API credentials.
 
 import base64
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,6 +25,7 @@ from ..core import settings as settings_store
 from ..core import story_state
 from ..core.paths import OUTPUT_DIR, PROJECTS_DIR
 from . import continuity, error_policy, ffmpeg_util, image_gen, reference_set, video_gen
+from . import llm
 
 logger = logging.getLogger("batch_studio")
 
@@ -71,6 +73,7 @@ def build_tasks_from_shots(project: dict, shot_nos: Optional[list] = None) -> li
         text = _shot_text(s)
         res = assets_core.resolve_mentions(text, asset_list)
         prompt_parts = [p for p in (style, s.get("camera", ""), res["text"]) if p]
+        chars = s.get("characters", []) or []
         tasks.append({
             "shot_no": s.get("shot_no", ""),
             "seq": s.get("seq"),
@@ -78,7 +81,7 @@ def build_tasks_from_shots(project: dict, shot_nos: Optional[list] = None) -> li
             "materials": res["materials"],
             # carry raw shot fields for the continuity engine (Phase 5)
             "scene": s.get("scene", ""),
-            "characters": s.get("characters", []),
+            "characters": chars,
             "props": s.get("props", []),
             "action": s.get("action", ""),
             "camera": s.get("camera", ""),
@@ -87,8 +90,26 @@ def build_tasks_from_shots(project: dict, shot_nos: Optional[list] = None) -> li
             "emotion": s.get("emotion") or s.get("mood") or "",
             # per-shot duration from pacing (5字/秒，按情绪调)，供视频生成使用
             "duration": s.get("duration"),
+            # 统一 @ 引用的展示字段（供视频【镜头动态】用，不影响 continuity 的原始字段）
+            "scene_ref": _norm_refs(s.get("scene", ""), asset_list),
+            "action_ref": _norm_refs(s.get("action", ""), asset_list),
+            "handoff_ref": _norm_refs(s.get("handoff", ""), asset_list),
+            "dialogue_ref": _norm_refs(s.get("dialogue", ""), asset_list),
+            "characters_ref": [_norm_refs(c, asset_list) for c in chars],
         })
     return tasks
+
+
+# 库内 #场景/$道具 仅作分类；喂给生成模型时所有引用统一 @。已注册资产由
+# resolve_mentions 映射为 @名，未注册的残留 #x/$x 也统一改写为 @x。
+_STRAY_TAG_RE = re.compile(r"[#$](?=[\w\u4e00-\u9fff])")
+
+
+def _norm_refs(text: str, asset_list: list) -> str:
+    if not text:
+        return ""
+    t = assets_core.resolve_mentions(text, asset_list).get("text", text)
+    return _STRAY_TAG_RE.sub("@", t)
 
 
 _CONSISTENCY_GUARD = (
@@ -98,6 +119,38 @@ _CONSISTENCY_GUARD = (
 )
 
 _LONG_TAKE_KW = ("长镜头", "一镜到底", "无缝", "不切", "连续运动")
+
+# 四段式节奏：分段标签 + 时间权重（占总时长比例），与「起势/核心/转折/收束」对应。
+_BEAT_LABELS = {
+    2: ("起势", "收束钩子"),
+    3: ("起势", "核心动作", "收束钩子"),
+    4: ("起势", "核心动作", "转折强化", "收束钩子"),
+}
+_BEAT_WEIGHTS = {
+    2: (0.5, 0.5),
+    3: (0.4, 0.35, 0.25),
+    4: (0.3, 0.3, 0.2, 0.2),
+}
+
+
+def _ff_scene(task: dict) -> str:
+    return (task.get("scene_ref") or task.get("scene") or "").strip()
+
+
+def _ff_action(task: dict) -> str:
+    return (task.get("action_ref") or task.get("action") or "").strip()
+
+
+def _ff_chars(task: dict) -> str:
+    cs = task.get("characters_ref") or task.get("characters") or []
+    return "、".join(c for c in cs if c)
+
+
+def _as_int(v) -> int:
+    try:
+        return int(v) if v else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 def _transition_of(task: dict) -> str:
@@ -109,77 +162,137 @@ def _transition_of(task: dict) -> str:
 
 
 def _first_frame_anchor(task: dict) -> str:
-    """首帧动作锚定（权重最高）：先写主体+姿态/动作，再写所在场景。"""
-    chars = "、".join(task.get("characters", []) or [])
-    scene = (task.get("scene") or "").strip()
-    act = (task.get("action") or "").strip()
+    """首帧锚定（权重最高）：只描述起幅静帧——主体 + 所在场景，不堆叠动作过程
+    （动作交给【动作过程·时间轴】，避免与首帧重复）。"""
+    chars = _ff_chars(task)
+    scene = _ff_scene(task)
     lead = chars or "主体"
-    bits = [b for b in (f"{lead}{('，' + act) if act else ''}", scene and f"位于{scene}") if b]
-    return "，".join(bits)
+    bits = [lead, scene and f"位于{scene}"]
+    return "，".join(b for b in bits if b)
+
+
+def _split_clauses(text: str) -> list[str]:
+    """把动作文本切成小句：先按句末标点，必要时再按逗号细分。"""
+    text = (text or "").strip()
+    if not text:
+        return []
+    parts = [p for p in re.split(r"[。．\.!！?？;；\n]+", text) if p.strip("，、 　")]
+    parts = [p.strip("，、 　") for p in parts]
+    # 句子太少而文本较长：进一步按逗号切，便于按时间轴分配
+    if len(parts) < 2 and len(text) > 24:
+        parts = [p.strip() for p in re.split(r"[，,、]+", text) if p.strip()]
+    return parts or [text]
+
+
+def _eff_dur(task: dict) -> int:
+    """本镜有效时长(秒)：取分镜估算值，缺失时回落到「单镜目标时长」设置，
+    统一钳制到 [3,15]。保证每条视频提示词的时间轴都有确定的总时长可分配，
+    消除「有的带时长、有的不带」的不一致。"""
+    d = _as_int(task.get("duration"))
+    if d <= 0:
+        try:
+            d = int(settings_store.load_settings().get("shot_target_seconds", 10))
+        except (TypeError, ValueError):
+            d = 10
+    return max(3, min(15, d))
+
+
+def _action_timeline(task: dict) -> str:
+    """按目标时长把动作分配到时间轴小节，避免长镜头动作分布不均/时间浪费。
+    规范化：任意时长都显式给出 0→总时长 的时间区间——短镜头(单段)写
+    「0–N秒（连贯动作）：…」，长镜头(≥6s 且动作≥2小句)按四段式拆分铺满时长。"""
+    action = _ff_action(task).rstrip("。．. ")
+    if not action:
+        return ""
+    dur = _eff_dur(task)
+    clauses = _split_clauses(action)
+    if dur >= 6 and len(clauses) >= 2:
+        n = 4 if dur >= 12 else (3 if dur >= 9 else 2)
+        n = min(n, len(clauses))
+    else:
+        n = 1
+    if n <= 1:
+        # 单段也显式标注时间区间，铺满整条时长，保证格式统一、时长被充分利用
+        return f"0–{dur}秒（连贯动作）：{action}"
+    # 把小句尽量均匀分配到 n 段（前面的段先多拿一句）
+    base, extra = divmod(len(clauses), n)
+    per = [base + (1 if i < extra else 0) for i in range(n)]
+    # 时间边界（按权重累加，末段对齐总时长）
+    bounds, acc = [0], 0.0
+    for w in _BEAT_WEIGHTS[n]:
+        acc += w * dur
+        bounds.append(int(round(acc)))
+    bounds[-1] = dur
+    for i in range(1, len(bounds)):  # 保证单调递增
+        if bounds[i] <= bounds[i - 1]:
+            bounds[i] = bounds[i - 1] + 1
+    labels = _BEAT_LABELS[n]
+    out, ci = [], 0
+    for k in range(n):
+        seg = clauses[ci:ci + per[k]]
+        ci += per[k]
+        out.append(f"{bounds[k]}–{bounds[k + 1]}秒（{labels[k]}）：{'，'.join(seg)}")
+    return "；".join(out)
 
 
 def _video_dynamics(task: dict) -> str:
-    """Turn a static image prompt into a rich video directive by weaving together
-    分镜信息 (景别/运镜/动作/情绪/时长/台词) 与 衔接信息 (handoff/转场)，组织成
-    「首帧锚定→运镜→动作过程→衔接→台词→节奏→防穿帮」的结构化镜头描述。
-    Deterministic (no LLM) so it works offline & spends no credits, while staying
-    fully editable by the user in the worktable / 模板 tab."""
-    parts = []
+    """确定性合成视频镜头动态（不调 LLM、零额度、可在模板/工作台编辑）。
+
+    结构（分行、空字段自动省略、引用统一 @）：
+      首帧锚定（静帧）→ 运镜 → 动作过程·时间轴 → 衔接/收尾 → 台词 → 节奏 → 防穿帮。
+    时间轴按目标时长把动作拆成「起势/核心/转折/收束」小节，长镜头不再浪费时长、
+    动作均匀分布。"""
+    lines = []
     anchor = _first_frame_anchor(task)
     if anchor:
-        parts.append(f"首帧锚定（最高权重）：{anchor}，作为视频起幅画面")
+        lines.append(f"【首帧锚定·最高权重】{anchor}，定格为视频起幅静帧")
     cam = (task.get("camera") or "").strip()
     if cam:
-        parts.append(f"运镜与景别：{cam}")
-    act = (task.get("action") or "").strip()
-    if act:
-        parts.append(f"动作过程：{act}")
-    parts.append(f"衔接：{_transition_of(task)}")
-    ho = (task.get("handoff") or "").strip()
+        lines.append(f"【运镜/景别】{cam}")
+    tl = _action_timeline(task)
+    if tl:
+        lines.append(f"【动作过程·时间轴】{tl}")
+    prev = (task.get("_prev_handoff") or "").strip()
+    head = f"承接上一镜（{prev}）；{_transition_of(task)}" if prev else _transition_of(task)
+    join = [f"【衔接】{head}"]
+    ho = (task.get("handoff_ref") or task.get("handoff") or "").strip()
     if ho:
-        parts.append(f"本镜收尾接口：{ho}")
-    dlg = (task.get("dialogue") or "").strip()
+        join.append(f"本镜收尾：{ho}")
+    lines.append("｜".join(join))
+    dlg = (task.get("dialogue_ref") or task.get("dialogue") or "").strip()
     if dlg:
-        parts.append(f"台词/旁白（声画同步，不出字幕）：{dlg}")
+        lines.append(f"【台词/旁白】{dlg}（声画同步，不出字幕）")
     emo = (task.get("emotion") or "").strip()
-    dur = task.get("duration")
-    pace = []
+    dur = _eff_dur(task)
+    pace = [f"总时长约{dur}秒"]
     if emo:
         pace.append(f"{emo}情绪")
-    try:
-        if dur:
-            pace.append(f"约{int(dur)}秒")
-    except (TypeError, ValueError):
-        pass
-    if pace:
-        parts.append("节奏：" + "，".join(pace))
-    parts.append("防穿帮/一致性：" + _CONSISTENCY_GUARD)
-    return "；".join(parts)
+    pace.append("零删减、动作均匀铺满整条时长")
+    lines.append("【节奏】" + "，".join(pace))
+    lines.append("【防穿帮/一致性】" + _CONSISTENCY_GUARD)
+    return "\n".join(lines)
 
 
 def _video_prompt_vars(task: dict, image_prompt: str) -> dict:
     """Variables exposed to the editable `video_prompt` template. `image_prompt`
     is the resolved picture description; `dynamics` is the engine-composed motion
     block (empty fields auto-omitted); the rest are granular fields for power
-    users who rewrite the template."""
-    dur = task.get("duration")
-    try:
-        dur = int(dur) if dur else ""
-    except (TypeError, ValueError):
-        dur = ""
+    users who rewrite the template. 引用字段统一 @。"""
+    dur = _eff_dur(task)
     return {
         "image_prompt": (image_prompt or "").rstrip("。，、 "),
         "dynamics": _video_dynamics(task),
         "first_frame": _first_frame_anchor(task),
+        "action_timeline": _action_timeline(task),
         "transition": _transition_of(task),
-        "handoff": (task.get("handoff") or "").strip(),
+        "handoff": (task.get("handoff_ref") or task.get("handoff") or "").strip(),
         "camera": (task.get("camera") or "").strip(),
-        "action": (task.get("action") or "").strip(),
+        "action": _ff_action(task),
         "emotion": (task.get("emotion") or "").strip(),
         "duration": dur,
-        "dialogue": (task.get("dialogue") or "").strip(),
-        "scene": (task.get("scene") or "").strip(),
-        "characters": "、".join(task.get("characters", []) or []),
+        "dialogue": (task.get("dialogue_ref") or task.get("dialogue") or "").strip(),
+        "scene": _ff_scene(task),
+        "characters": _ff_chars(task),
         "props": "、".join(task.get("props", []) or []),
         "consistency": _CONSISTENCY_GUARD,
     }
@@ -201,11 +314,100 @@ def build_shot_prompts(project: dict, shot_nos: Optional[list] = None) -> dict:
     video variant is rendered from the user-editable `video_prompt` template
     (default = image description + engine-composed 【镜头动态】).
     """
+    want = {str(n) for n in shot_nos} if shot_nos else None
     out: dict = {}
-    for t in build_tasks_from_shots(project, shot_nos):
-        img = t.get("prompt", "") or ""
-        out[t.get("shot_no", "")] = {"image": img, "video": build_video_prompt(t, img)}
+    prev_ho = ""  # 上一镜的收尾接口(handoff)，用于本镜首帧承接 → 整体联动
+    for t in build_tasks_from_shots(project):  # 全量按序，保证联动正确
+        no = t.get("shot_no", "")
+        if prev_ho:
+            t["_prev_handoff"] = prev_ho
+        if want is None or str(no) in want:
+            img = t.get("prompt", "") or ""
+            out[no] = {"image": img, "video": build_video_prompt(t, img)}
+        prev_ho = (t.get("handoff_ref") or t.get("handoff") or "").strip()
     return out
+
+
+_ASSET_TYPE_LABEL = {"character": "角色", "scene": "场景", "prop": "道具"}
+
+
+def _assets_desc_for_task(project: dict, task: dict) -> str:
+    """本镜关联资产说明（喂给逐镜 LLM 推理）：'@名（类型）：描述／外观' 多行。"""
+    by_id = {a.get("id"): a for a in (project.get("assets") or [])}
+    lines, seen = [], set()
+    for m in task.get("materials", []) or []:
+        aid = m.get("asset_id")
+        if aid in seen:
+            continue
+        seen.add(aid)
+        a = by_id.get(aid) or {}
+        name = m.get("name") or a.get("name") or ""
+        label = _ASSET_TYPE_LABEL.get(a.get("type") or m.get("type"), "资产")
+        desc = (a.get("desc") or "").strip()
+        appr = (a.get("appearance") or "").strip()
+        detail = "；".join(x for x in (desc, appr and f"外观:{appr}") if x)
+        lines.append(f"@{name}（{label}）：{detail or '（无说明）'}")
+    return "\n".join(lines) or "（本镜未关联已登记资产）"
+
+
+def infer_shot_prompt(project: dict, shot_no, *, model: Optional[str] = None) -> dict:
+    """点「AI推理」时调用：用文本 LLM 对单个分镜推理出干净规范的图片+视频提示词。
+
+    打通的上下文：①连续性——上一分镜的 handoff(收尾/站位/情绪) → 本镜承接；
+    ②本镜关联资产的说明文本（@角色/#场景/$道具 → 名称+描述+外观）；③本镜结构字段
+    与目标时长。剔除非画面元素（心理活动/旁白叙述等）。任何 LLM 异常回落到确定性合成。
+    """
+    target, prev_ho = None, ""
+    for t in build_tasks_from_shots(project):  # 全量按序，取得上一镜 handoff
+        if str(t.get("shot_no")) == str(shot_no):
+            target = t
+            break
+        prev_ho = (t.get("handoff_ref") or t.get("handoff") or "").strip()
+    if target is None:
+        raise ValueError(f"分镜 {shot_no} 不存在")
+    if prev_ho:
+        target["_prev_handoff"] = prev_ho
+    img_draft = target.get("prompt", "") or ""
+    bible = project.get("story_bible") or {}
+    variables = {
+        "style": bible.get("style") or "",
+        "shot_no": target.get("shot_no", ""),
+        "duration": _eff_dur(target),
+        "camera": target.get("camera", ""),
+        "scene": _ff_scene(target),
+        "characters": _ff_chars(target),
+        "props": "、".join(target.get("props", []) or []),
+        "action": _ff_action(target),
+        "emotion": (target.get("emotion") or "").strip(),
+        "dialogue": (target.get("dialogue_ref") or target.get("dialogue") or "").strip(),
+        "prev_handoff": prev_ho or "（本镜为首镜，无上文）",
+        "handoff": (target.get("handoff_ref") or target.get("handoff") or "").strip(),
+        "assets_desc": _assets_desc_for_task(project, target),
+        "consistency": _CONSISTENCY_GUARD,
+    }
+    try:
+        body = prompt_templates.get_template_body("shot_prompt_infer")
+        data = llm.chat_json(
+            [{"role": "user", "content": prompt_templates.render(body, variables)}],
+            model=model, temperature=0.5, max_tokens=1400,
+        )
+        image = (data.get("image") or "").strip() if isinstance(data, dict) else ""
+        video = (data.get("video") or "").strip() if isinstance(data, dict) else ""
+        if not (image or video):
+            raise llm.LLMError("LLM 返回空结果")
+        return {
+            "image": image or img_draft,
+            "video": video or build_video_prompt(target, image or img_draft),
+            "source": "llm",
+        }
+    except Exception as e:  # noqa: BLE001 — 任意异常都回落到确定性合成，保证可用
+        logger.warning("infer_shot_prompt 回落确定性合成 (%s): %s", shot_no, e)
+        return {
+            "image": img_draft,
+            "video": build_video_prompt(target, img_draft),
+            "source": "fallback",
+            "error": str(e),
+        }
 
 
 def _shot_duration(task: dict, params: dict) -> int:

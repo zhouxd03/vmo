@@ -76,6 +76,7 @@ export const api = {
   getProject: (pid) => req('GET', `/api/projects/${pid}`),
   getProjectOverview: (pid) => req('GET', `/api/projects/${pid}/overview`),
   deleteProject: (pid) => req('DELETE', `/api/projects/${pid}`),
+  renameProject: (pid, name) => req('PATCH', `/api/projects/${pid}`, { name }),
   importProject: (body) => req('POST', '/api/projects/import', body),
   analyzeProject: (pid, body) => req('POST', `/api/projects/${pid}/analyze`, body),
   updateStoryBible: (pid, patch) => req('PATCH', `/api/projects/${pid}/story_bible`, patch),
@@ -104,6 +105,7 @@ export const api = {
   // batches (Phase 4)
   listBatches: (pid) => req('GET', `/api/projects/${pid}/batches`),
   previewShotPrompts: (pid, body) => req('POST', `/api/projects/${pid}/shot_prompts`, body),
+  inferShotPrompt: (pid, body) => req('POST', `/api/projects/${pid}/infer_shot_prompt`, body),
   createBatch: (pid, body) => req('POST', `/api/projects/${pid}/batches`, body),
   createEpisodeBatches: (pid, body) => req('POST', `/api/projects/${pid}/episode_batches`, body),
   getBatch: (pid, bid) => req('GET', `/api/projects/${pid}/batches/${bid}`),

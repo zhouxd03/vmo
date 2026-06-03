@@ -74,6 +74,18 @@ def register(app: Flask) -> None:
             "episodes": eps,
         })
 
+    @app.route("/api/projects/<pid>", methods=["PATCH"])
+    def rename_project(pid):
+        """重命名项目（项目管理基础操作）。"""
+        if not projects.get_project(pid):
+            return jsonify({"error": "项目不存在"}), 404
+        body = request.json or {}
+        name = (body.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "项目名不能为空"}), 400
+        p = projects.update_project(pid, {"name": name})
+        return jsonify(p)
+
     @app.route("/api/projects/<pid>", methods=["DELETE"])
     def delete_project(pid):
         projects.delete_project(pid)
@@ -348,6 +360,27 @@ def register(app: Flask) -> None:
                "story_bible": p.get("story_bible")}
         prompts = batch_engine.build_shot_prompts(ctx, body.get("shot_nos"))
         return jsonify({"prompts": prompts})
+
+    @app.route("/api/projects/<pid>/infer_shot_prompt", methods=["POST"])
+    def infer_shot_prompt(pid):
+        """LLM 逐镜推理图片+视频提示词（点「AI推理」时调用，喂连续性+关联资产）。"""
+        p = projects.get_project(pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        body = request.json or {}
+        shot_no = body.get("shot_no")
+        if not shot_no:
+            return jsonify({"error": "缺少 shot_no"}), 400
+        _eid, ep = _resolve_episode(pid, body)
+        if not ep:
+            return jsonify({"error": "分集不存在"}), 404
+        ctx = {**ep, "assets": p.get("assets", []),
+               "story_bible": p.get("story_bible")}
+        try:
+            res = batch_engine.infer_shot_prompt(ctx, shot_no, model=body.get("model"))
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify(res)
 
     def _apply_prompts(tasks, kind, overrides):
         """Resolve each task's final generation prompt:

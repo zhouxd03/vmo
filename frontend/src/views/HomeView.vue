@@ -1,11 +1,12 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { onMounted, ref, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
-import { NIcon, NTag, NSpin, NEmpty, NProgress, useMessage } from 'naive-ui'
+import { NIcon, NTag, NSpin, NEmpty, NProgress, useMessage, useDialog } from 'naive-ui'
 import {
   CloudUploadOutline, DocumentTextOutline, CubeOutline,
   GridSharp, AlbumsOutline, ColorWandOutline, CheckmarkCircle, AlertCircle,
   ChevronForward, ChevronDown, FolderOpenOutline,
+  CreateOutline, TrashOutline, CheckmarkOutline, CloseOutline,
 } from '@vicons/ionicons5'
 import PageHeader from '../components/PageHeader.vue'
 import { api } from '../api'
@@ -14,6 +15,7 @@ import { useProjectStore } from '../stores/project'
 
 const router = useRouter()
 const message = useMessage()
+const dialog = useDialog()
 const themeStore = useThemeStore()
 const projectStore = useProjectStore()
 const health = ref(null)
@@ -75,6 +77,60 @@ function pct(p) {
   if (!p || !p.total) return 0
   return Math.round((p.done / p.total) * 100)
 }
+
+// ── project management: rename (inline) + delete (confirm) ──
+const renamingId = ref(null)
+const renameText = ref('')
+const renameInput = ref(null)
+
+function startRename(p) {
+  renamingId.value = p.id
+  renameText.value = p.name || ''
+  nextTick(() => {
+    let el = renameInput.value
+    if (Array.isArray(el)) el = el[0]
+    if (el && el.focus) { el.focus(); el.select && el.select() }
+  })
+}
+
+function cancelRename() {
+  renamingId.value = null
+  renameText.value = ''
+}
+
+async function submitRename(p) {
+  const name = (renameText.value || '').trim()
+  if (!name) { message.warning('项目名不能为空'); return }
+  if (name === p.name) { cancelRename(); return }
+  try {
+    await api.renameProject(p.id, name)
+    await projectStore.refreshList()
+    message.success('已重命名为「' + name + '」')
+  } catch (e) {
+    message.error('重命名失败: ' + e.message)
+  } finally {
+    cancelRename()
+  }
+}
+
+function removeProject(p) {
+  dialog.warning({
+    title: '删除项目',
+    content: `确定删除项目「${p.name}」吗？该项目下所有分集、批次与产物记录都会一并移除，且不可恢复。`,
+    positiveText: '删除',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      try {
+        await api.deleteProject(p.id)
+        if (expandedId.value === p.id) { expandedId.value = null; overview.value = null }
+        await projectStore.refreshList()
+        message.success('已删除项目')
+      } catch (e) {
+        message.error('删除失败: ' + e.message)
+      }
+    },
+  })
+}
 </script>
 
 <template>
@@ -126,16 +182,38 @@ function pct(p) {
 
     <div v-else class="proj-list">
       <div v-for="p in projectStore.projects" :key="p.id" class="proj glass">
-        <button class="proj-head" @click="toggleProject(p.id)">
-          <n-icon class="chev" :component="expandedId === p.id ? ChevronDown : ChevronForward" />
-          <n-icon class="folder" :component="FolderOpenOutline" />
-          <div class="proj-name">{{ p.name }}</div>
-          <div class="proj-meta">
-            <n-tag size="small" round :bordered="false" type="success">{{ p.episode_count || 1 }} 集</n-tag>
-            <span>{{ p.segment_count }} 片段</span>
-            <span v-if="p.shot_count">· {{ p.shot_count }} 分镜</span>
+        <div class="proj-head">
+          <button class="proj-toggle" @click="toggleProject(p.id)">
+            <n-icon class="chev" :component="expandedId === p.id ? ChevronDown : ChevronForward" />
+            <n-icon class="folder" :component="FolderOpenOutline" />
+            <template v-if="renamingId === p.id">
+              <input
+                ref="renameInput"
+                v-model="renameText"
+                class="rename-input"
+                @click.stop
+                @keyup.enter="submitRename(p)"
+                @keyup.esc="cancelRename"
+              />
+            </template>
+            <div v-else class="proj-name">{{ p.name }}</div>
+            <div class="proj-meta">
+              <n-tag size="small" round :bordered="false" type="success">{{ p.episode_count || 1 }} 集</n-tag>
+              <span>{{ p.segment_count }} 片段</span>
+              <span v-if="p.shot_count">· {{ p.shot_count }} 分镜</span>
+            </div>
+          </button>
+          <div class="proj-acts">
+            <template v-if="renamingId === p.id">
+              <button class="act ok" title="保存" @click.stop="submitRename(p)"><n-icon :component="CheckmarkOutline" /></button>
+              <button class="act" title="取消" @click.stop="cancelRename"><n-icon :component="CloseOutline" /></button>
+            </template>
+            <template v-else>
+              <button class="act" title="重命名" @click.stop="startRename(p)"><n-icon :component="CreateOutline" /></button>
+              <button class="act danger" title="删除项目" @click.stop="removeProject(p)"><n-icon :component="TrashOutline" /></button>
+            </template>
           </div>
-        </button>
+        </div>
 
         <div v-if="expandedId === p.id" class="proj-body">
           <n-spin v-if="loadingOverview" size="small" />
@@ -248,6 +326,14 @@ function pct(p) {
   width: 100%;
   display: flex;
   align-items: center;
+  padding-right: 12px;
+}
+.proj-head:hover { background: var(--app-accent-soft); }
+.proj-toggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
   gap: 12px;
   padding: 16px 18px;
   background: transparent;
@@ -256,7 +342,40 @@ function pct(p) {
   color: var(--app-text-primary);
   text-align: left;
 }
-.proj-head:hover { background: var(--app-accent-soft); }
+.proj-acts {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: var(--app-text-muted);
+  cursor: pointer;
+  transition: background .15s, color .15s;
+}
+.act:hover { background: var(--app-accent-soft); color: var(--app-accent); }
+.act.danger:hover { background: color-mix(in srgb, #e88 30%, transparent); color: #c33; }
+.act.ok { color: var(--app-accent); }
+.rename-input {
+  flex: 1;
+  min-width: 120px;
+  font-size: 15px;
+  font-weight: 700;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--app-accent);
+  background: var(--app-surface);
+  color: var(--app-text-primary);
+  outline: none;
+}
 .chev { color: var(--app-text-muted); }
 .folder { color: var(--app-accent); }
 .proj-name { font-weight: 700; font-size: 15px; }

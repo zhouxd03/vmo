@@ -11,7 +11,7 @@ import {
   ImageOutline, VideocamOutline, LockClosedOutline, LockOpenOutline,
   SparklesOutline, AlbumsOutline, CubeOutline, EyeOutline, PlayOutline,
   DownloadOutline, RefreshOutline, SettingsOutline, ColorWandOutline,
-  FilmOutline, AddOutline, FlashOutline, ChevronDownOutline, GitMergeOutline,
+  FilmOutline, AddOutline, FlashOutline, ChevronDownOutline, ChevronForwardOutline, GitMergeOutline,
   ExpandOutline, CheckmarkCircleOutline, AlertCircleOutline, TimeOutline,
   SyncOutline, HourglassOutline,
 } from '@vicons/ionicons5'
@@ -32,6 +32,7 @@ const tasks = useTasksStore()
 const batches = computed(() => tasks.batches)
 const rowState = reactive({})    // shot_no -> { imagePrompt, videoPrompt, chosen, running, mode }
 const locks = ref(new Set())     // locked shot_no (skipped in batch)
+const inferAllRunning = ref(false) // 批量 AI 推理进行中
 
 // live generation status (per shot) + overall progress of active batches
 const statusByShot = reactive({}) // shot_no -> { status, attempts, error, kind, decision, updated }
@@ -76,7 +77,7 @@ const shots = computed(() => episode.value?.shots || [])
 // ensure a row-state entry exists for every shot BEFORE render (avoid undefined access)
 function ensureRows(list) {
   ;(list || []).forEach((s) => {
-    if (!rowState[s.shot_no]) rowState[s.shot_no] = { imagePrompt: '', videoPrompt: '', chosen: null, running: false, mode: 'image' }
+    if (!rowState[s.shot_no]) rowState[s.shot_no] = { imagePrompt: '', videoPrompt: '', chosen: null, running: false, inferring: false, mode: 'image' }
     else {
       if (!rowState[s.shot_no].mode) rowState[s.shot_no].mode = 'image'
       if (rowState[s.shot_no].imagePrompt === undefined) rowState[s.shot_no].imagePrompt = ''
@@ -95,6 +96,58 @@ const modeTabs = [
 function promptField(no) { return rowState[no]?.mode === 'video' ? 'videoPrompt' : 'imagePrompt' }
 function currentPrompt(no) { return rowState[no]?.[promptField(no)] || '' }
 function setPrompt(no, val) { if (rowState[no]) rowState[no][promptField(no)] = val }
+
+// ── @ 引用缩略图：把当前提示词里的 @资产 解析为其参考图缩略图，支持单击放大
+// （n-image 内置灯箱）+ 长按拖动重排（重排会改写提示词里 @token 的先后顺序）──
+const assetList = ref([])
+async function loadAssets() {
+  if (!store.current) { assetList.value = []; return }
+  try { assetList.value = await api.listAssets(store.current.id) }
+  catch { assetList.value = [] }
+}
+function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
+// ordered, de-duplicated @-refs (only assets that have a参考图) present in the prompt
+function promptRefs(no) {
+  const text = currentPrompt(no)
+  if (!text || !assetList.value.length) return []
+  const out = []
+  for (const a of assetList.value) {
+    if (!a.ref_image || !a.name) continue
+    const i = text.indexOf('@' + a.name)
+    if (i >= 0) out.push({
+      name: a.name, trigger: a.trigger, type: a.type,
+      url: api.assetImageUrl(store.current.id, a.ref_image), idx: i,
+    })
+  }
+  return out.sort((x, y) => x.idx - y.idx)
+}
+// drag-reorder state (long-press / press-drag): {no, from}
+const dragRef = reactive({ no: null, from: -1, over: -1 })
+function onRefDragStart(no, idx, ev) {
+  dragRef.no = no; dragRef.from = idx; dragRef.over = idx
+  if (ev?.dataTransfer) { ev.dataTransfer.effectAllowed = 'move' }
+}
+function onRefDragOver(no, idx) { if (dragRef.no === no) dragRef.over = idx }
+function onRefDrop(no, idx) {
+  if (dragRef.no !== no || dragRef.from < 0 || dragRef.from === idx) { resetDragRef(); return }
+  reorderRefs(no, dragRef.from, idx)
+  resetDragRef()
+}
+function resetDragRef() { dragRef.no = null; dragRef.from = -1; dragRef.over = -1 }
+// rewrite the prompt so the @tokens appear in the new order (first occurrences only)
+function reorderRefs(no, from, to) {
+  const refs = promptRefs(no)
+  if (from < 0 || from >= refs.length || to < 0 || to >= refs.length) return
+  const tokens = refs.map((r) => '@' + r.name)
+  const next = tokens.slice()
+  const [moved] = next.splice(from, 1)
+  next.splice(to, 0, moved)
+  const alt = refs.map((r) => escRe(r.name)).sort((a, b) => b.length - a.length).join('|')
+  const re = new RegExp('@(' + alt + ')', 'g')
+  let k = 0
+  const text = currentPrompt(no).replace(re, (m) => (k < next.length ? next[k++] : m))
+  setPrompt(no, text)
+}
 
 // Pull engine-grade image/video prompts from the backend (deterministic, no LLM
 // call, spends no credits) and drop them into the editable textboxes so the user
@@ -119,13 +172,44 @@ async function fillPrompts(shotNos, { force = false } = {}) {
   })
   return n
 }
+// 真·LLM 逐镜推理：调用 /infer_shot_prompt，喂入连续性(上一镜 handoff)+本镜关联资产
+// 说明+结构字段，产出干净规范的图片/视频提示词并回填（覆盖）。失败自动后端兜底确定性合成。
+async function inferShot(no) {
+  const r = rowState[no]
+  if (!r || !store.current) return null
+  const res = await api.inferShotPrompt(store.current.id, {
+    episode_id: store.currentEpisodeId, shot_no: no,
+  })
+  if (res.image) r.imagePrompt = res.image
+  if (res.video) r.videoPrompt = res.video
+  return res
+}
 async function inferRow(no) {
-  if (await fillPrompts([no], { force: true })) message.success(`已推理填充 ${no} 图片/视频提示词`)
+  const r = rowState[no]
+  if (!r) return
+  r.inferring = true
+  try {
+    const res = await inferShot(no)
+    if (res?.source === 'fallback') message.warning(`${no}：LLM 推理失败，已用确定性合成兜底`)
+    else message.success(`已 AI 推理 ${no} 图片/视频提示词`)
+  } catch (e) { message.error('AI 推理失败：' + e.message) }
+  finally { r.inferring = false }
 }
 async function inferAll() {
   const targets = shots.value.map((s) => s.shot_no).filter((no) => !locks.value.has(no))
-  const n = await fillPrompts(targets, { force: true })
-  if (n) message.success(`已批量推理填充 ${n} 镜图片/视频提示词`)
+  if (!targets.length) return
+  inferAllRunning.value = true
+  let ok = 0, fb = 0
+  for (const no of targets) {                 // 串行，避免并发打爆中转站
+    const r = rowState[no]; if (!r) continue
+    r.inferring = true
+    try {
+      const res = await inferShot(no)
+      res?.source === 'fallback' ? fb++ : ok++
+    } catch { fb++ } finally { r.inferring = false }
+  }
+  inferAllRunning.value = false
+  message.success(`AI 推理完成：成功 ${ok}${fb ? `，兜底 ${fb}` : ''}（共 ${targets.length} 镜）`)
 }
 watch(shots, (list) => ensureRows(list), { immediate: true })
 
@@ -152,6 +236,7 @@ async function reload() {
   if (!store.current) return
   loadLocks()
   ensureRows(shots.value)
+  loadAssets()
   tasks.setBatchProject(store.current.id)
   await tasks.refreshBatches()
   await rebuildMaterials()
@@ -307,10 +392,36 @@ function optSlots(no) {
   return [...list, ...Array(pad).fill(null)]
 }
 
-function resolvedText(s) {
-  // human-readable subtitle/source for the shot
-  return s.action || s.dialogue || s.scene || ''
+// ── col1 序号/字幕 文本处理 ──
+// 分镜的 scene/characters/props 由拆解模板带 #/@/$ 前缀存储；展示时先去掉已有
+// 前缀再补一个，避免「##深山密林 / @@主角」这类双重符号。
+function stripMark(v) { return String(v == null ? '' : v).replace(/^[\s#@$＠＃＄]+/, '').trim() }
+function fmtScene(v) { const n = stripMark(v); return n ? '#' + n : '' }
+function fmtChar(v) { const n = stripMark(v); return n ? '@' + n : '' }
+function fmtProp(v) { const n = stripMark(v); return n ? '$' + n : '' }
+
+// 字幕：优先台词（真正的字幕），其次动作描述；去掉「画面展示/镜头展示」等冗余引导词。
+const _LEAD_FILLER = /^(画面|镜头|本镜|此镜|该镜)?(展示|呈现|显示|表现|描绘|描述|刻画|出现)[：:，,]?/
+function subtitleText(s) {
+  let t = (s.dialogue && s.dialogue.trim()) || (s.action || '').trim() || stripMark(s.scene)
+  return t.replace(_LEAD_FILLER, '').trim()
 }
+function actionText(s) {
+  // 当字幕取自台词时，额外显示动作行作为画面说明（去冗余引导词）
+  if (!(s.dialogue && s.dialogue.trim())) return ''
+  return (s.action || '').trim().replace(_LEAD_FILLER, '').trim()
+}
+
+// 原文：按 shot.seq 关联到本集解析后的源片段文本，供逐镜对照。
+const segMap = computed(() => {
+  const m = {}
+  const segs = episode.value?.segments || episode.value?.parsed?.segments || []
+  for (const sg of segs) if (sg.seq != null) m[sg.seq] = sg.text || ''
+  return m
+})
+function sourceText(s) { return (s.seq != null && segMap.value[s.seq]) || '' }
+const openSrc = reactive({})   // shot_no -> bool (展开原文)
+function toggleSrc(no) { openSrc[no] = !openSrc[no] }
 
 // ── generation ──
 function buildParams(kind) {
@@ -498,11 +609,18 @@ async function exportJianying() {
           <!-- col1 seq / subtitle -->
           <div class="c-seq">
             <div class="shot-no">{{ s.shot_no }}</div>
-            <div class="sub">{{ resolvedText(s) }}</div>
+            <div class="sub">{{ subtitleText(s) }}</div>
+            <div v-if="actionText(s)" class="sub-action">{{ actionText(s) }}</div>
             <div class="meta">
-              <n-tag v-if="s.scene" size="tiny" :bordered="false">#{{ s.scene }}</n-tag>
-              <n-tag v-for="c in (s.characters || [])" :key="c" size="tiny" :bordered="false" type="success">@{{ c }}</n-tag>
+              <n-tag v-if="fmtScene(s.scene)" size="tiny" :bordered="false">{{ fmtScene(s.scene) }}</n-tag>
+              <n-tag v-for="c in (s.characters || [])" :key="c" size="tiny" :bordered="false" type="success">{{ fmtChar(c) }}</n-tag>
+              <n-tag v-for="pp in (s.props || [])" :key="pp" size="tiny" :bordered="false" type="warning">{{ fmtProp(pp) }}</n-tag>
             </div>
+            <button v-if="sourceText(s)" class="src-toggle" @click="toggleSrc(s.shot_no)">
+              <n-icon :component="openSrc[s.shot_no] ? ChevronDownOutline : ChevronForwardOutline" />
+              原文
+            </button>
+            <div v-if="openSrc[s.shot_no] && sourceText(s)" class="src-text">{{ sourceText(s) }}</div>
           </div>
 
           <!-- col2 prompt + controls (xingyao-style borderless) -->
@@ -520,6 +638,31 @@ async function exportJianying() {
               @input="setPrompt(s.shot_no, $event.target.value)"
               :placeholder="`${rowState[s.shot_no].mode === 'video' ? '视频' : '图片'}提示词，输入 @ 引用角色，# 引用场景，$ 引用物品…`"
             ></textarea>
+            <!-- @引用参考图缩略图：单击放大（n-image 内置灯箱）/ 长按拖动重排 -->
+            <div v-if="promptRefs(s.shot_no).length" class="ref-strip">
+              <div
+                v-for="(r, ri) in promptRefs(s.shot_no)"
+                :key="r.name"
+                class="ref-thumb"
+                :class="{ dragging: dragRef.no === s.shot_no && dragRef.from === ri, dropover: dragRef.no === s.shot_no && dragRef.over === ri && dragRef.from !== ri }"
+                draggable="true"
+                :title="`${r.trigger || '@'}${r.name}（长按拖动可调整顺序 · 单击放大）`"
+                @dragstart="onRefDragStart(s.shot_no, ri, $event)"
+                @dragover.prevent="onRefDragOver(s.shot_no, ri)"
+                @drop.prevent="onRefDrop(s.shot_no, ri)"
+                @dragend="resetDragRef"
+              >
+                <n-image
+                  :src="r.url"
+                  :width="40"
+                  :height="40"
+                  object-fit="cover"
+                  class="ref-img"
+                  :draggable="false"
+                />
+                <span class="ref-name">{{ r.trigger || '@' }}{{ r.name }}</span>
+              </div>
+            </div>
             <div class="ctl">
               <template v-if="rowState[s.shot_no].mode === 'image'">
                 <n-select size="tiny" v-model:value="tb.model" :options="imageModelOptions" style="width: 120px" />
@@ -533,7 +676,7 @@ async function exportJianying() {
                 <n-button size="tiny" quaternary @click="notImpl('尾帧')"><template #icon><n-icon :component="AddOutline" /></template>尾帧</n-button>
               </template>
               <div class="ctl-right">
-                <n-button size="tiny" @click="inferRow(s.shot_no)">
+                <n-button size="tiny" :loading="rowState[s.shot_no].inferring" @click="inferRow(s.shot_no)">
                   <template #icon><n-icon :component="SparklesOutline" /></template>AI推理
                 </n-button>
                 <n-button v-if="rowState[s.shot_no].mode === 'image'" size="tiny" type="primary" :loading="rowState[s.shot_no].running" @click="genRow(s.shot_no, 'image')">
@@ -625,7 +768,7 @@ async function exportJianying() {
               <div class="pp-tip">开启连续性：视频批次串行执行，承接上一镜尾帧（跨集亦承接上一集末镜）。</div>
             </div>
           </n-popover>
-          <button class="pbtn" @click="inferAll"><n-icon :component="SparklesOutline" /><span>批量推理</span></button>
+          <button class="pbtn" :disabled="inferAllRunning" @click="inferAll"><n-icon :component="SparklesOutline" /><span>{{ inferAllRunning ? 'AI推理中…' : 'AI推理全部' }}</span></button>
           <n-dropdown trigger="click" placement="top" :options="batchMenuOptions" @select="onBatchMenu">
             <button class="pbtn accent"><n-icon :component="FlashOutline" /><span>批量生成</span><n-icon :component="ChevronDownOutline" size="12" /></button>
           </n-dropdown>
@@ -746,8 +889,22 @@ async function exportJianying() {
 .row.locked { box-shadow: 0 0 0 1px color-mix(in srgb, #ffb454 50%, transparent) inset; }
 .c-seq { display: flex; flex-direction: column; gap: 6px; }
 .shot-no { font-family: var(--font-mono, monospace); font-weight: 800; color: var(--app-accent); font-size: 13px; }
-.sub { font-size: 12.5px; line-height: 1.5; color: var(--app-text); flex: 1; min-height: 60px; max-height: 150px; overflow: auto; }
+.sub { font-size: 12.5px; line-height: 1.5; color: var(--app-text); max-height: 150px; overflow: auto; }
+.sub-action { font-size: 11.5px; line-height: 1.45; color: var(--app-text-muted); margin-top: -2px; }
 .meta { display: flex; flex-wrap: wrap; gap: 4px; }
+.src-toggle {
+  align-self: flex-start; display: inline-flex; align-items: center; gap: 3px;
+  border: none; background: transparent; cursor: pointer; padding: 0;
+  font-size: 11px; color: var(--app-text-muted);
+}
+.src-toggle:hover { color: var(--app-accent); }
+.src-toggle :deep(.n-icon) { font-size: 12px; }
+.src-text {
+  font-size: 11.5px; line-height: 1.55; color: var(--app-text-secondary);
+  white-space: pre-wrap; background: var(--app-fill-2, rgba(255,255,255,.04));
+  border-left: 2px solid var(--app-accent); border-radius: 4px;
+  padding: 6px 8px; max-height: 160px; overflow: auto;
+}
 
 /* ── col2 描述词: borderless, fills the cell ── */
 .c-prompt { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
@@ -768,6 +925,25 @@ async function exportJianying() {
   font-family: inherit; padding: 0;
 }
 .prompt-area::placeholder { color: var(--app-text-muted); }
+/* @引用缩略图条 */
+.ref-strip {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  padding: 6px 0 2px; align-items: flex-start;
+}
+.ref-thumb {
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  width: 48px; cursor: grab; user-select: none;
+  border-radius: 8px; padding: 3px; transition: background .15s, transform .12s, opacity .12s;
+}
+.ref-thumb:hover { background: var(--app-accent-soft); }
+.ref-thumb:active { cursor: grabbing; }
+.ref-thumb.dragging { opacity: .45; transform: scale(.94); }
+.ref-thumb.dropover { background: var(--app-accent-soft); box-shadow: inset 0 0 0 2px var(--app-accent); }
+.ref-img :deep(img) { border-radius: 6px; }
+.ref-name {
+  max-width: 46px; font-size: 10px; line-height: 1.1; text-align: center;
+  color: var(--app-text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .ctl { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .ctl-right { margin-left: auto; display: flex; align-items: center; gap: 6px; }
 

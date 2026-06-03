@@ -45,7 +45,12 @@ def _is_placeholder(value: str) -> bool:
 
 
 def _normalize(text: str) -> str:
-    return text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+    t = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+    # 行尾空白清理：使「只含空格/制表符/全角空格/不换行空格(\xa0)」的空行成为真正
+    # 的空行分隔，否则 "\n\xa0\n" 不会被 "\n\n" 段落切分识别（剧本常见此问题）。
+    # [^\S\n] = 除换行外的任意空白（含 \xa0、\u3000、\t 等）。
+    t = re.sub(r"[^\S\n]+\n", "\n", t)
+    return t
 
 
 # ── TXT ──────────────────────────────────────────────────────────────────
