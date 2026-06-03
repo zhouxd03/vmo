@@ -21,7 +21,29 @@ logger = logging.getLogger("batch_studio")
 
 
 class VideoError(Exception):
-    pass
+    def __init__(self, message, *, code="", status=None, err_type="", raw=None):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.err_type = err_type
+        self.raw = raw
+
+
+def _api_error(resp, where="API") -> "VideoError":
+    """Build a structured VideoError from an HTTP error response."""
+    code = err_type = ""
+    msg = resp.text[:300]
+    try:
+        body = resp.json()
+        err = body.get("error", body) if isinstance(body, dict) else {}
+        if isinstance(err, dict):
+            code = str(err.get("code") or "")
+            err_type = str(err.get("type") or "")
+            msg = str(err.get("message") or msg)
+    except Exception:  # noqa: BLE001
+        pass
+    return VideoError(f"{where} 错误 (HTTP {resp.status_code}): {msg}",
+                      code=code, status=resp.status_code, err_type=err_type, raw=resp.text[:500])
 
 
 def _resolve_creds(base_url: Optional[str], api_key: Optional[str]) -> tuple[str, str, str]:
@@ -89,6 +111,13 @@ def generate_video(
     model = model or default_model or "sora-v3-fast"
     ref_images_b64 = [b for b in (ref_images_b64 or []) if b]
 
+    def _to_url(b, idx, what):
+        try:
+            base64.b64decode(b)
+        except Exception as e:  # noqa: BLE001
+            raise VideoError(f"第 {idx+1} 张{what}数据无效") from e
+        return image_host.upload(b)
+
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     payload = {
         "model": model,
@@ -98,21 +127,21 @@ def generate_video(
         "resolution": resolution,
     }
 
+    # 多模态软参考生视频：上一镜尾帧 / 导演图 / 站位图 / 资产图均以参考图
+    # (reference_image_urls) 喂入，模型据此重渲染当前镜。注：本中转 seed-2.0fast
+    # 不支持「首帧钉死」图生视频（实测输入图被静默丢弃），故统一走软参考。
     if ref_images_b64:
-        urls = []
-        for i, b in enumerate(ref_images_b64):
-            try:
-                base64.b64decode(b)
-            except Exception as e:  # noqa: BLE001
-                raise VideoError(f"第 {i+1} 张参考图数据无效") from e
-            urls.append(image_host.upload(b))
-        payload["reference_image_urls"] = urls
+        payload["reference_image_urls"] = [_to_url(b, i, "参考图")
+                                           for i, b in enumerate(ref_images_b64)]
+        mode = "图生视频"
+    else:
+        mode = "文生视频"
 
     submit_url = f"{api_base}/v1/videos"
-    logger.info(f"[Video] 提交 {'图生视频' if ref_images_b64 else '文生视频'}: model={model} {duration}s")
+    logger.info(f"[Video] 提交 {mode}: model={model} {duration}s")
     resp = http.post(submit_url, json=payload, headers=headers, timeout=60)
     if resp.status_code >= 400:
-        raise VideoError(f"API 错误 (HTTP {resp.status_code}): {resp.text[:300]}")
+        raise _api_error(resp, "提交")
     result = resp.json()
 
     video_url = _extract_video_url(result)
@@ -156,7 +185,12 @@ def _poll(api_base, task_id, key, timeout, interval, on_progress) -> str:
                     return url
             elif status in ("failed", "error"):
                 msg = data.get("fail_reason") or data.get("error") or data.get("message") or "生成失败"
-                raise VideoError(str(msg))
+                code = err_type = ""
+                if isinstance(msg, dict):
+                    code = str(msg.get("code") or "")
+                    err_type = str(msg.get("type") or "")
+                    msg = str(msg.get("message") or msg)
+                raise VideoError(str(msg), code=code, err_type=err_type, raw=str(data)[:500])
         except VideoError:
             raise
         except Exception as e:  # noqa: BLE001

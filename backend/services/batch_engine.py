@@ -22,7 +22,7 @@ from ..core import batches
 from ..core import settings as settings_store
 from ..core import story_state
 from ..core.paths import OUTPUT_DIR, PROJECTS_DIR
-from . import continuity, image_gen, reference_set, video_gen
+from . import continuity, error_policy, ffmpeg_util, image_gen, reference_set, video_gen
 
 logger = logging.getLogger("batch_studio")
 
@@ -121,6 +121,32 @@ def _finalize_refs(task: dict, items: list) -> tuple[list, str]:
     return [it["b64"] for it in kept], prompt
 
 
+def _parse_aspect(aspect_ratio: str) -> tuple[int, int]:
+    try:
+        w, h = (aspect_ratio or "16:9").split(":")
+        return int(w), int(h)
+    except Exception:  # noqa: BLE001
+        return 16, 9
+
+
+def _normalize_refs_aspect(refs: list, aspect_ratio: str) -> list:
+    """Center-crop every reference image to the target video aspect ratio so the
+    model never stretches a mismatched-aspect reference (square/3:2/asset图) —
+    the root cause of scale jitter between continuity shots. The first-frame tail
+    already matches the video aspect, so it is returned untouched (no-op crop)."""
+    if not refs:
+        return refs
+    aw, ah = _parse_aspect(aspect_ratio)
+    out = []
+    for r in refs:
+        try:
+            out.append(ffmpeg_util.crop_b64_to_aspect(r, aw, ah))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Refs] 参考图比例归一化跳过: {e}")
+            out.append(r)
+    return out
+
+
 def _out_dir(pid: str, bid: str):
     d = OUTPUT_DIR / pid / bid
     d.mkdir(parents=True, exist_ok=True)
@@ -142,12 +168,14 @@ def _gen_image_task(pid, batch, task, params):
 
 
 def _gen_video_task(pid, batch, task, params):
+    aspect_ratio = params.get("aspect_ratio", "16:9")
     refs, prompt = _finalize_refs(task, _asset_ref_items(pid, task))
+    refs = _normalize_refs_aspect(refs, aspect_ratio)
     out = video_gen.generate_video(
         prompt,
         model=params.get("model"),
         duration=int(params.get("duration", 10)),
-        aspect_ratio=params.get("aspect_ratio", "16:9"),
+        aspect_ratio=aspect_ratio,
         resolution=params.get("resolution", "720p"),
         ref_images_b64=refs,
         save_dir=_out_dir(pid, batch["id"]),
@@ -178,12 +206,28 @@ def _gen_video_task_continuity(pid, batch, task, params):
     use_llm = bool(params.get("decision_llm"))
     decision = continuity.decide_handoff(shot, prev_state, use_llm=use_llm,
                                          model=params.get("llm_model"))
+
+    aspect_ratio = params.get("aspect_ratio", "16:9")
+
+    # 连续性承接走「多模态软参考」(reference_image_urls)：上一镜尾帧作为参考图喂入，
+    # 与导演图/站位图/资产图一并组装。本中转的 seed-2.0fast 不支持「首帧钉死」
+    # 图生视频（实测输入图被静默丢弃 → 退化成文生视频），故沿用软参考方案。
+    # 仍保留画幅居中裁剪（_normalize_refs_aspect），避免参考图比例不符被模型拉伸。
+    if decision.get("use_tail_frame"):
+        tail_b64 = continuity._read_b64(pid, prev_state.get("tail_frame"))
+        if not tail_b64:
+            # 中继种子缺失（上一镜失败 / 尾帧未抽出）→ 兜底切镜头直生，
+            # 不强行承接不存在的尾帧，避免连续性错乱。
+            decision = {
+                **decision, "use_tail_frame": False, "action": "scene_cut",
+                "fallback": "tail_missing",
+                "reason": f"上一镜无可用尾帧（失败/缺失）→ 兜底切镜头直生｜原判: {decision.get('reason', '')}",
+            }
+            logger.warning(f"[Continuity] {shot_no} 中继种子缺失，兜底切镜头直生")
+    # persist the (possibly downgraded) decision so the UI badge reflects the fallback
     story_state.set_decision(pid, shot_no, decision)
     batches.update_task(pid, batch["id"], task["id"], {"decision": decision})
 
-    # assemble references: continuity-generated images (尾帧→首帧 / 导演图 / 站位图)
-    # are referenced explicitly and labeled, then asset materials, then capped
-    # by priority so the total never exceeds settings.max_reference_images.
     items: list = []
     if decision.get("use_tail_frame"):
         tail_b64 = continuity._read_b64(pid, prev_state.get("tail_frame"))
@@ -198,12 +242,12 @@ def _gen_video_task_continuity(pid, batch, task, params):
         items.append({"b64": staging_b64, "role": "staging", "name": "本镜站位图"})
     items.extend(_asset_ref_items(pid, task))
     refs, prompt = _finalize_refs(task, items)
-
+    refs = _normalize_refs_aspect(refs, aspect_ratio)
     out = video_gen.generate_video(
         prompt,
         model=params.get("model"),
         duration=int(params.get("duration", 10)),
-        aspect_ratio=params.get("aspect_ratio", "16:9"),
+        aspect_ratio=aspect_ratio,
         resolution=params.get("resolution", "720p"),
         ref_images_b64=refs,
         save_dir=_out_dir(pid, batch["id"]),
@@ -242,13 +286,22 @@ _GENERATORS: dict[str, Callable] = {"image": _gen_image_task, "video": _gen_vide
 
 # ── runner ──────────────────────────────────────────────────────────────────
 def _run_one(pid, batch, task, gen, params, backoff):
+    """Run one task with error-type-aware retries.
+
+    Retries are gated by ``error_policy.classify``: transient errors (network /
+    5xx / rate-limit) are retried with progressive backoff up to max_attempts;
+    content/credential/param errors are NOT retried (retrying can't succeed and
+    only burns paid quota). A *fatal* error (bad key / no quota) additionally
+    pauses the batch so the remaining shots are skipped instead of all failing.
+    """
     bid = batch["id"]
+    label = task.get("shot_no") or task["id"]
     if is_paused(bid):
         return "paused"
     batches.update_task(pid, bid, task["id"], {"status": "running"})
     attempts = task.get("attempts", 0)
     max_attempts = max(1, task.get("max_attempts", 3))
-    last_err = "未执行"
+    err_info = {"category": "unknown", "message": "未执行", "retryable": False}
     while attempts < max_attempts:
         attempts += 1
         try:
@@ -257,12 +310,22 @@ def _run_one(pid, batch, task, gen, params, backoff):
                                 {"status": "done", "result": result, "attempts": attempts, "error": None})
             return "done"
         except Exception as e:  # noqa: BLE001
-            last_err = str(e)
-            logger.warning(f"[Batch {bid}] 任务 {task.get('shot_no') or task['id']} 第{attempts}次失败: {last_err}")
-            if attempts < max_attempts:
-                time.sleep(backoff)
+            err_info = error_policy.classify(e)
+            logger.warning(
+                f"[Batch {bid}] 任务 {label} 第{attempts}次失败 "
+                f"[{err_info['category']}{('/' + err_info['code']) if err_info['code'] else ''}]: {err_info['message']}")
+            if err_info["retryable"] and attempts < max_attempts:
+                time.sleep(backoff * attempts)  # progressive backoff
+                continue
+            break  # non-retryable → stop immediately (don't waste quota)
+    # record the structured error and the number of attempts actually spent
+    err_info = {**err_info, "attempts_used": attempts}
     batches.update_task(pid, bid, task["id"],
-                        {"status": "error", "error": last_err, "attempts": attempts})
+                        {"status": "error", "error": err_info, "attempts": attempts})
+    if err_info.get("abort_batch"):
+        pause(bid)  # skip the remaining shots instead of failing each the same way
+        logger.warning(f"[Batch {bid}] 致命错误，已中止后续生成: {err_info['message']}")
+        return "fatal"
     return "error"
 
 
@@ -294,17 +357,31 @@ def run_batch(pid: str, bid: str, *, on_progress: Optional[Callable[[int, int], 
             on_progress(done_count, total)
 
     report()
+    aborted = False
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {pool.submit(_run_one, pid, batch, t, gen, params, backoff): t for t in pending}
         for fut in as_completed(futures):
             outcome = fut.result()
-            if outcome in ("done", "error"):
+            if outcome in ("done", "error", "fatal"):
                 done_count += 1
                 report()
+            if outcome == "fatal":
+                aborted = True
 
     final = batches.get_batch(pid, bid)
+    # when aborted by a fatal error, mark the still-pending shots as skipped so
+    # the UI explains why they didn't run (rather than leaving them "pending")
+    if aborted:
+        for t in final["tasks"]:
+            if t["status"] == "pending":
+                batches.update_task(pid, bid, t["id"], {"status": "error", "error": {
+                    "category": "skipped", "message": "[已跳过]｜前序致命错误（凭据/额度）中止本批，未消耗调用",
+                    "retryable": False}})
+        final = batches.get_batch(pid, bid)
     statuses = [t["status"] for t in final["tasks"]]
-    if is_paused(bid) and any(s == "pending" for s in statuses):
+    if aborted:
+        status = "error"
+    elif is_paused(bid) and any(s == "pending" for s in statuses):
         status = "paused"
     elif any(s == "error" for s in statuses):
         status = "error"
