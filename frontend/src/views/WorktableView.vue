@@ -356,7 +356,12 @@ function statusMeta(no) { return STATUS_META[statusByShot[no]?.status] || null }
 function decisionLabel(no) {
   const d = statusByShot[no]?.decision
   if (!d) return ''
-  return d.use_tail_frame ? '承接上一镜尾帧' : '首镜直生'
+  const source = d.source === 'llm' ? 'LLM' : '规则'
+  const strategy = d.strategy ? `·${d.strategy}` : ''
+  if (d.use_tail_frame) return `${source}${strategy}｜承接上一镜尾帧`
+  if (d.use_staging) return `${source}${strategy}｜站位图`
+  if (d.use_director_board) return `${source}${strategy}｜导演图`
+  return `${source}${strategy}｜首镜直生`
 }
 const genPercent = computed(() => genProgress.total ? Math.round((genProgress.done / genProgress.total) * 100) : 0)
 const elapsedText = computed(() => {
@@ -554,7 +559,7 @@ async function exportJianying() {
     .map((s) => {
       const m = currentMaterial(s.shot_no)
       if (!m) return null
-      return { shot_no: s.shot_no, bid: m.bid, filename: m.filename, subtitle: resolvedText(s) }
+      return { shot_no: s.shot_no, bid: m.bid, filename: m.filename, subtitle: sourceText(s) || resolvedText(s) }
     })
     .filter(Boolean)
   if (!items.length) {

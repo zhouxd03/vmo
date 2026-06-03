@@ -208,6 +208,9 @@ function anyBusy(shotNo) { return !!busy.value[shotNo] }
                     <n-tag v-if="snap(s.shot_no).decision.use_director_board" size="small" type="info" :bordered="false">
                       <template #icon><n-icon :component="EaselOutline" /></template>导演图
                     </n-tag>
+                    <n-tag v-if="snap(s.shot_no).decision.strategy" size="small" type="success" :bordered="false">
+                      策略：{{ snap(s.shot_no).decision.strategy }}
+                    </n-tag>
                     <n-tag size="tiny" :bordered="false">{{ snap(s.shot_no).decision.source === 'llm' ? 'LLM' : '规则' }}</n-tag>
                   </div>
                   <div class="reason">{{ snap(s.shot_no).decision.reason }}</div>

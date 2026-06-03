@@ -77,6 +77,7 @@ def build_tasks_from_shots(project: dict, shot_nos: Optional[list] = None) -> li
         tasks.append({
             "shot_no": s.get("shot_no", ""),
             "seq": s.get("seq"),
+            "src_text": s.get("src_text", ""),
             "prompt": "，".join(prompt_parts),
             "materials": res["materials"],
             # carry raw shot fields for the continuity engine (Phase 5)
@@ -631,7 +632,12 @@ def _gen_video_task_continuity(pid, batch, task, params):
             logger.warning(f"[Continuity] {shot_no} 中继种子缺失，兜底切镜头直生")
     # persist the (possibly downgraded) decision so the UI badge reflects the fallback
     story_state.set_decision(pid, shot_no, decision)
-    batches.update_task(pid, batch["id"], task["id"], {"decision": decision})
+    batches.update_task(pid, batch["id"], task["id"], {
+        "decision": decision,
+        "continuity_strategy": decision.get("strategy"),
+        "continuity_source": decision.get("source"),
+        "src_text": task.get("src_text", ""),
+    })
 
     # 准确执行决策的连续性机制：若决策需要站位图/导演图且本镜尚未生成，则按需即时生成
     # （best-effort：无生图凭据/失败时记日志、不阻断本镜视频生成）。这样 LLM 升级判定
@@ -705,7 +711,23 @@ def _gen_video_task_continuity(pid, batch, task, params):
             review = {"pass": None, "error": str(e), "source": "unavailable"}
             story_state.set_review(pid, shot_no, review)
 
-    result = {"filename": out["filename"], "filepath": out["filepath"], "decision": decision}
+    snapshot = {
+        "src_text": task.get("src_text", ""),
+        "decision": decision,
+        "continuity_strategy": decision.get("strategy"),
+        "continuity_source": decision.get("source"),
+        "tail_frame": tail_info["tail_frame"] if tail_info else None,
+        "review": review,
+    }
+    result = {
+        "filename": out["filename"],
+        "filepath": out["filepath"],
+        "src_text": snapshot["src_text"],
+        "decision": snapshot["decision"],
+        "continuity_strategy": snapshot["continuity_strategy"],
+        "continuity_source": snapshot["continuity_source"],
+        "snapshot": snapshot,
+    }
     if tail_info:
         result["tail_frame"] = tail_info["tail_frame"]
     if review is not None:

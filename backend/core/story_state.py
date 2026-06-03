@@ -96,10 +96,19 @@ def _update_shot_field(pid: str, shot_no: str, key: str, value: Any) -> dict:
     shot = st["shots"].get(shot_no) or {"shot_no": shot_no}
     shot[key] = value
     st["shots"][shot_no] = shot
-    # mirror onto current when it is the active shot
+    # mirror onto current when it is the active shot so the live accumulator
+    # and per-shot archive stay in sync for the UI / resume logic.
     if st["current"].get("shot_no") == shot_no or st["current"].get("shot_no") is None:
         if key == "tail_frame":
             st["current"]["tail_frame"] = value
+        elif key == "staging_image":
+            st["current"]["staging_image"] = value
+        elif key == "director_board":
+            st["current"]["director_board"] = value
+        elif key == "decision":
+            st["current"]["decision"] = value
+        elif key == "review":
+            st["current"]["review"] = value
     return _save(pid, st)
 
 
