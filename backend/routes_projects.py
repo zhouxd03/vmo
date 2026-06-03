@@ -413,6 +413,7 @@ def register(app: Flask) -> None:
         try:
             out = continuity.generate_staging(
                 pid, shot, prev, style=bible.get("style", ""), model=body.get("model"),
+                size=ffmpeg_util.aspect_to_image_size(body.get("aspect_ratio")),
                 assets=(projects.get_project(pid) or {}).get("assets") or [])
         except image_gen.GenerationError as e:
             return jsonify({"error": str(e)}), 502
@@ -431,6 +432,7 @@ def register(app: Flask) -> None:
         try:
             out = continuity.generate_director_board(
                 pid, shot, prev, style=bible.get("style", ""), model=body.get("model"),
+                size=ffmpeg_util.aspect_to_image_size(body.get("aspect_ratio")),
                 assets=(projects.get_project(pid) or {}).get("assets") or [])
         except image_gen.GenerationError as e:
             return jsonify({"error": str(e)}), 502

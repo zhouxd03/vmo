@@ -1,7 +1,17 @@
 # ---- secrets & runtime user data (DO NOT COMMIT) ----
-data/                 # credentials.json (real API keys) + user projects/templates
-output/               # generated images/videos (large)
+# data/   = credentials.json (real API keys) + user projects/templates
+# output/ = generated images/videos (large)
+data/
+output/
 *.log
+
+# ---- session scratch / reports (not source) ----
+_*.py
+_*.png
+_*.json
+_*.txt
+*-report-*.md
+PHASE*-test-report.md
 
 # ---- python ----
 __pycache__/
@@ -21,3 +31,7 @@ frontend/.vite/
 build/
 dist/
 *.spec
+# keep the desktop packaging spec under version control
+!desktop.spec
+# intermediate; only app.ico is used by the build
+desktop_assets/app.png

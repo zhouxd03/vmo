@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import {
   NSelect, NButton, NIcon, NEmpty, NInput, NTag, NImage, NSwitch, NTooltip,
   NModal, NCard, NSpace, NInputNumber, NScrollbar, NBadge, NPopover, NDropdown,
-  NDrawer, NDrawerContent,
+  NDrawer, NDrawerContent, NProgress, NSpin,
   useMessage,
 } from 'naive-ui'
 import {
@@ -12,7 +12,8 @@ import {
   SparklesOutline, AlbumsOutline, CubeOutline, EyeOutline, PlayOutline,
   DownloadOutline, RefreshOutline, SettingsOutline, ColorWandOutline,
   FilmOutline, AddOutline, FlashOutline, ChevronDownOutline, GitMergeOutline,
-  ExpandOutline,
+  ExpandOutline, CheckmarkCircleOutline, AlertCircleOutline, TimeOutline,
+  SyncOutline, HourglassOutline,
 } from '@vicons/ionicons5'
 import PageHeader from '../components/PageHeader.vue'
 import EpisodeBar from '../components/EpisodeBar.vue'
@@ -28,6 +29,12 @@ const batches = ref([])          // all batches of the project
 const rowState = reactive({})    // shot_no -> { promptDraft, chosen, running }
 const locks = ref(new Set())     // locked shot_no (skipped in batch)
 let poll = null
+
+// live generation status (per shot) + overall progress of active batches
+const statusByShot = reactive({}) // shot_no -> { status, attempts, error, kind, decision, updated }
+const genProgress = reactive({ active: false, done: 0, total: 0, running: '', kind: '', name: '' })
+const genStart = ref(0)
+const nowTick = ref(Date.now())
 
 // toolbar batch params
 const tb = reactive({
@@ -56,7 +63,7 @@ onMounted(async () => {
   if (!store.current && store.projects.length) await store.select(store.projects[0].id)
   await reload()
 })
-onUnmounted(() => { if (poll) clearInterval(poll) })
+onUnmounted(() => stopPolling())
 
 const projectOptions = computed(() =>
   store.projects.map((p) => ({ label: `${p.name}（${p.episode_count || 1}集·${p.shot_count || 0}镜）`, value: p.id })))
@@ -117,6 +124,8 @@ async function reload() {
   ensureRows(shots.value)
   batches.value = await api.listBatches(store.current.id)
   await rebuildMaterials()
+  // if a batch is already running (e.g. started elsewhere), surface its progress live
+  if (batches.value.some((b) => ['running', 'pending'].includes(b.status))) startPolling()
 }
 
 // materials of the CURRENT episode only (batches tagged with episode_id, or shot_no prefix match)
@@ -130,22 +139,96 @@ function isEpisodeBatch(b) {
 
 const materialsByShot = reactive({})  // shot_no -> [{bid, filename, kind, status}]
 
+function taskError(t) {
+  const e = t.error
+  if (!e) return ''
+  if (typeof e === 'string') return e
+  // structured error from error_policy: friendly message + actionable hint
+  const msg = e.message || e.msg || ''
+  const hint = e.hint && e.hint !== msg ? `\n${e.hint}` : ''
+  return (msg + hint) || JSON.stringify(e)
+}
+
 async function rebuildMaterials() {
-  Object.keys(materialsByShot).forEach((k) => delete materialsByShot[k])
+  // Build into temp maps first, then commit ONLY changed shots — this avoids
+  // tearing down <video> elements (and interrupting playback/clicks) on every poll.
+  const mat = {}, st = {}
+  let pgDone = 0, pgTotal = 0, pgRunning = '', pgKind = '', pgName = '', pgActive = false
   for (const b of batches.value) {
     // list endpoint omits params/tasks → always fetch detail, then decide episode membership
     const full = (b.params && b.tasks && b.tasks.length) ? b : await api.getBatch(store.current.id, b.id)
     if (!isEpisodeBatch(full)) continue
+    const batchActive = ['running', 'pending'].includes(full.status)
     ;(full.tasks || []).forEach((t) => {
       const no = t.shot_no
       if (!no) return
-      if (!materialsByShot[no]) materialsByShot[no] = []
+      if (!mat[no]) mat[no] = []
       if (t.status === 'done' && t.result?.filename) {
-        materialsByShot[no].push({ bid: full.id, filename: t.result.filename, kind: full.kind, status: 'done' })
+        mat[no].push({ bid: full.id, filename: t.result.filename, kind: full.kind, status: 'done' })
+      }
+      // track latest task status per shot (newest wins) for the live status badge
+      const cand = {
+        status: t.status, attempts: t.attempts || 0, error: taskError(t),
+        kind: full.kind, decision: t.decision || null, updated: t.updated_at || 0,
+      }
+      if (!st[no] || cand.updated >= (st[no].updated || 0)) st[no] = cand
+      // overall progress: only count tasks belonging to currently-active batches
+      if (batchActive) {
+        pgActive = true; pgTotal++; pgKind = full.kind; pgName = full.name || ''
+        if (t.status === 'done' || t.status === 'error') pgDone++
+        if (t.status === 'running') pgRunning = no
       }
     })
   }
+  // commit materials incrementally (replace a shot's list only when it actually changed)
+  for (const no of Object.keys(materialsByShot)) { if (!(no in mat)) delete materialsByShot[no] }
+  for (const no of Object.keys(mat)) {
+    const cur = materialsByShot[no]
+    const changed = !cur || cur.length !== mat[no].length
+      || cur.some((m, i) => m.filename !== mat[no][i]?.filename || m.bid !== mat[no][i]?.bid)
+    if (changed) materialsByShot[no] = mat[no]
+  }
+  // commit status badges incrementally
+  for (const no of Object.keys(statusByShot)) { if (!(no in st)) delete statusByShot[no] }
+  for (const no of Object.keys(st)) {
+    const cur = statusByShot[no]
+    if (!cur || cur.status !== st[no].status || cur.error !== st[no].error
+        || (cur.decision?.use_tail_frame) !== (st[no].decision?.use_tail_frame)) {
+      statusByShot[no] = st[no]
+    }
+  }
+  genProgress.active = pgActive
+  genProgress.done = pgDone
+  genProgress.total = pgTotal
+  genProgress.running = pgRunning
+  genProgress.kind = pgKind
+  genProgress.name = pgName
 }
+
+// ── status badge helpers ──
+const STATUS_META = {
+  pending: { label: '排队中', type: 'default', icon: HourglassOutline },
+  running: { label: '生成中', type: 'info', icon: SyncOutline },
+  done: { label: '已完成', type: 'success', icon: CheckmarkCircleOutline },
+  error: { label: '失败', type: 'error', icon: AlertCircleOutline },
+}
+function statusMeta(no) { return STATUS_META[statusByShot[no]?.status] || null }
+function decisionLabel(no) {
+  const d = statusByShot[no]?.decision
+  if (!d) return ''
+  return d.use_tail_frame ? '承接上一镜尾帧' : '首镜直生'
+}
+const genPercent = computed(() => genProgress.total ? Math.round((genProgress.done / genProgress.total) * 100) : 0)
+const elapsedText = computed(() => {
+  if (!genStart.value) return '0秒'
+  const s = Math.max(0, Math.floor((nowTick.value - genStart.value) / 1000))
+  const m = Math.floor(s / 60)
+  return m ? `${m}分${s % 60}秒` : `${s}秒`
+})
+watch(() => genProgress.active, (a) => {
+  if (a && !genStart.value) genStart.value = Date.now()
+  if (!a) genStart.value = 0
+})
 
 function isVideoFile(fn) { return /\.(mp4|webm|mov)$/i.test(fn || '') }
 function matUrl(m) { return api.outputUrl(store.current.id, m.bid, m.filename) }
@@ -216,6 +299,7 @@ async function genRow(no, kind) {
     })
     await api.startBatch(store.current.id, b.id)
     message.success(`已提交 ${no} ${kind === 'video' ? '生视频' : '生图'}`)
+    await refreshNow()  // surface the progress bar immediately; heavy polling starts after 100s
     startPolling()
   } catch (e) {
     message.error(e.message)
@@ -235,22 +319,52 @@ async function genBatch(kind) {
     })
     await api.startBatch(store.current.id, b.id)
     message.success(`已提交批量${kind === 'video' ? '生视频' : '生图'}（${targets.length} 镜${locks.value.size ? `，跳过 ${locks.value.size} 锁定` : ''}）`)
+    await refreshNow()  // surface the progress bar immediately; heavy polling starts after 100s
     startPolling()
   } catch (e) { message.error(e.message) }
 }
 
+// Polling cadence: video generation is slow, so we DON'T hammer the server.
+// First status query fires 100s after generation starts, then every 20s.
+// A separate lightweight 1s clock only advances the elapsed timer (no network,
+// no material rebuild) so the running video can still be clicked/played.
+const POLL_INITIAL_DELAY = 100_000
+const POLL_INTERVAL = 20_000
+let clock = null
+
+async function pollOnce() {
+  nowTick.value = Date.now()
+  batches.value = await api.listBatches(store.current.id)
+  await rebuildMaterials()
+  const active = batches.value.some((b) => ['running', 'pending'].includes(b.status))
+  // clear per-row running flags for shots that now have done materials
+  shots.value.forEach((s) => {
+    if (rowState[s.shot_no]?.running && (materialsByShot[s.shot_no] || []).length) rowState[s.shot_no].running = false
+  })
+  if (!active) { stopPolling(); shots.value.forEach((s) => { if (rowState[s.shot_no]) rowState[s.shot_no].running = false }) }
+  else { poll = setTimeout(pollOnce, POLL_INTERVAL) }
+}
+
 function startPolling() {
-  if (poll) clearInterval(poll)
-  poll = setInterval(async () => {
-    batches.value = await api.listBatches(store.current.id)
-    await rebuildMaterials()
-    const active = batches.value.some((b) => ['running', 'pending'].includes(b.status))
-    // clear per-row running flags for shots that now have done materials
-    shots.value.forEach((s) => {
-      if (rowState[s.shot_no]?.running && (materialsByShot[s.shot_no] || []).length) rowState[s.shot_no].running = false
-    })
-    if (!active) { clearInterval(poll); poll = null; shots.value.forEach((s) => { if (rowState[s.shot_no]) rowState[s.shot_no].running = false }) }
-  }, 2000)
+  if (poll || clock) return  // already polling — don't reset the timer/clock
+  if (!genStart.value) genStart.value = Date.now()
+  // smooth elapsed-time clock (cheap; never rebuilds materials → no playback disruption)
+  clock = setInterval(() => { if (genProgress.active) nowTick.value = Date.now() }, 1000)
+  // first heavy status query only after the initial delay
+  poll = setTimeout(pollOnce, POLL_INITIAL_DELAY)
+}
+
+function stopPolling() {
+  if (poll) { clearTimeout(poll); poll = null }
+  if (clock) { clearInterval(clock); clock = null }
+}
+
+// one-shot fetch + rebuild (no scheduling) — for initial paint / right after a manual start
+async function refreshNow() {
+  if (!store.current) return
+  nowTick.value = Date.now()
+  batches.value = await api.listBatches(store.current.id)
+  await rebuildMaterials()
 }
 
 // preview (storyboard) modal
@@ -307,6 +421,22 @@ async function exportJianying() {
     </PageHeader>
 
     <EpisodeBar v-if="store.current" />
+
+    <!-- live generation progress bar (visible while a batch is running) -->
+    <div v-if="genProgress.active" class="gen-progress">
+      <div class="gp-top">
+        <span class="gp-title">
+          <n-icon :component="FlashOutline" /> {{ genProgress.kind === 'video' ? '批量生视频' : '批量生图' }}进行中
+        </span>
+        <span class="gp-stat">{{ genProgress.done }} / {{ genProgress.total }}</span>
+        <span v-if="genProgress.running" class="gp-run">
+          <n-spin :size="12" /> 正在生成 <b>{{ genProgress.running }}</b>
+          <em v-if="decisionLabel(genProgress.running)">· {{ decisionLabel(genProgress.running) }}</em>
+        </span>
+        <span class="gp-elapsed"><n-icon :component="TimeOutline" /> 已用 {{ elapsedText }}</span>
+      </div>
+      <n-progress type="line" :percentage="genPercent" :height="8" :border-radius="4" :show-indicator="false" processing />
+    </div>
 
     <n-empty v-if="!store.current" description="请先在「项目导入」导入一个小说项目" style="margin-top: 40px">
       <template #extra><n-button size="small" @click="router.push('/import')">去导入</n-button></template>
@@ -376,11 +506,31 @@ async function exportJianying() {
             </div>
           </div>
 
-          <!-- col3 current material (lock + preview placeholder) -->
+          <!-- col3 current material (status + lock + preview placeholder) -->
           <div class="c-cur">
-            <button class="lock-row" :class="{ on: locks.has(s.shot_no) }" @click="toggleLock(s.shot_no)">
-              <n-icon :component="locks.has(s.shot_no) ? LockClosedOutline : LockOpenOutline" /> 锁定
-            </button>
+            <div class="cur-top">
+              <template v-if="statusMeta(s.shot_no)">
+                <n-tooltip v-if="statusByShot[s.shot_no].status === 'error'" trigger="hover">
+                  <template #trigger>
+                    <span class="st-badge st-error">
+                      <n-icon :component="AlertCircleOutline" /> 失败
+                    </span>
+                  </template>
+                  {{ statusByShot[s.shot_no].error || '生成失败' }}
+                </n-tooltip>
+                <span v-else class="st-badge" :class="`st-${statusByShot[s.shot_no].status}`">
+                  <n-spin v-if="statusByShot[s.shot_no].status === 'running'" :size="11" />
+                  <n-icon v-else :component="statusMeta(s.shot_no).icon" />
+                  {{ statusMeta(s.shot_no).label }}
+                </span>
+                <span v-if="statusByShot[s.shot_no].kind === 'video' && decisionLabel(s.shot_no)" class="st-decision">
+                  {{ decisionLabel(s.shot_no) }}
+                </span>
+              </template>
+              <button class="lock-row" :class="{ on: locks.has(s.shot_no) }" @click="toggleLock(s.shot_no)">
+                <n-icon :component="locks.has(s.shot_no) ? LockClosedOutline : LockOpenOutline" /> 锁定
+              </button>
+            </div>
             <div class="preview-box" :class="{ empty: !currentMaterial(s.shot_no) }">
               <template v-if="currentMaterial(s.shot_no)">
                 <video v-if="isVideoFile(currentMaterial(s.shot_no).filename)" :src="matUrl(currentMaterial(s.shot_no))" muted controls class="cur-media" />
@@ -538,12 +688,42 @@ async function exportJianying() {
 
 /* ── col3 当前素材: lock + preview placeholder ── */
 .c-cur { display: flex; flex-direction: column; gap: 6px; }
+.cur-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.st-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-size: 11px; padding: 2px 7px; border-radius: 7px; font-weight: 600;
+  border: 1px solid transparent;
+}
+.st-badge :deep(.n-icon) { font-size: 12px; }
+.st-pending { color: var(--app-text-secondary); background: color-mix(in srgb, var(--app-text-secondary) 12%, transparent); }
+.st-running { color: #4098fc; background: color-mix(in srgb, #4098fc 14%, transparent); }
+.st-done { color: #46c98b; background: color-mix(in srgb, #46c98b 16%, transparent); }
+.st-error { color: #f56c6c; background: color-mix(in srgb, #f56c6c 15%, transparent); cursor: help; }
+.st-decision {
+  font-size: 10px; color: var(--app-accent, #46c98b);
+  padding: 1px 6px; border-radius: 6px;
+  border: 1px dashed color-mix(in srgb, var(--app-accent, #46c98b) 45%, transparent);
+}
 .lock-row {
-  align-self: flex-start; display: inline-flex; align-items: center; gap: 4px;
+  margin-left: auto; display: inline-flex; align-items: center; gap: 4px;
   font-size: 12px; padding: 2px 8px; border-radius: 7px; cursor: pointer;
   border: 1px solid var(--app-border); background: transparent; color: var(--app-text-secondary);
 }
 .lock-row.on { color: #ffb454; border-color: color-mix(in srgb, #ffb454 50%, transparent); }
+
+/* live generation progress bar */
+.gen-progress {
+  margin: 10px 0 4px; padding: 10px 14px; border-radius: 10px;
+  background: var(--app-surface-2, rgba(255,255,255,0.03));
+  border: 1px solid var(--app-border);
+}
+.gp-top { display: flex; align-items: center; gap: 14px; margin-bottom: 8px; flex-wrap: wrap; font-size: 13px; }
+.gp-title { display: inline-flex; align-items: center; gap: 5px; font-weight: 600; color: var(--app-accent, #46c98b); }
+.gp-stat { font-variant-numeric: tabular-nums; font-weight: 700; }
+.gp-run { display: inline-flex; align-items: center; gap: 5px; color: var(--app-text-secondary); }
+.gp-run b { color: var(--app-text); }
+.gp-run em { font-style: normal; color: var(--app-accent, #46c98b); }
+.gp-elapsed { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; color: var(--app-text-secondary); font-variant-numeric: tabular-nums; }
 .preview-box {
   position: relative;
   height: var(--wt-media-h); border-radius: 10px; overflow: hidden;

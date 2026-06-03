@@ -20,7 +20,29 @@ logger = logging.getLogger("batch_studio")
 
 
 class GenerationError(Exception):
-    pass
+    def __init__(self, message, *, code="", status=None, err_type="", raw=None):
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.err_type = err_type
+        self.raw = raw
+
+
+def _api_error(resp, where="API"):
+    """Build a structured GenerationError from an HTTP error response."""
+    code = err_type = ""
+    msg = resp.text[:300]
+    try:
+        body = resp.json()
+        err = body.get("error", body) if isinstance(body, dict) else {}
+        if isinstance(err, dict):
+            code = str(err.get("code") or "")
+            err_type = str(err.get("type") or "")
+            msg = str(err.get("message") or msg)
+    except Exception:  # noqa: BLE001
+        pass
+    return GenerationError(f"{where} 错误 (HTTP {resp.status_code}): {msg}",
+                           code=code, status=resp.status_code, err_type=err_type, raw=resp.text[:500])
 
 
 def _resolve_creds(base_url: Optional[str], api_key: Optional[str]) -> tuple[str, str, str]:
@@ -122,7 +144,7 @@ def generate_image(
             payload["image"] = decoded[0] if len(decoded) == 1 else decoded
             resp = http.post(url_gen, json=payload, headers=jh, timeout=timeout)
             if resp.status_code >= 400:
-                raise GenerationError(f"API 错误: {resp.text[:300]}")
+                raise _api_error(resp)
             result = resp.json()
     else:
         # ── 纯文生图 ──
@@ -133,7 +155,7 @@ def generate_image(
             payload["quality"] = quality
         resp = http.post(url, json=payload, headers=jh, timeout=timeout)
         if resp.status_code >= 400:
-            raise GenerationError(f"API 错误 (HTTP {resp.status_code}): {resp.text[:300]}")
+            raise _api_error(resp)
         result = resp.json()
 
     b64 = _parse_image_result(result, timeout)
