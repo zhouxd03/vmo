@@ -242,6 +242,10 @@ def _gen_video_task_continuity(pid, batch, task, params):
         items.append({"b64": staging_b64, "role": "staging", "name": "本镜站位图"})
     items.extend(_asset_ref_items(pid, task))
     refs, prompt = _finalize_refs(task, items)
+    # 把衔接决策的运镜/景别提示注入提示词：默认走切镜头/景别切换衔接（见 continuity）
+    hint = decision.get("camera_hint")
+    if hint:
+        prompt = f"【镜头衔接】{hint}\n{prompt}"
     refs = _normalize_refs_aspect(refs, aspect_ratio)
     out = video_gen.generate_video(
         prompt,
