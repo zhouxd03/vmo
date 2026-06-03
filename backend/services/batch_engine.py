@@ -601,9 +601,16 @@ def _gen_video_task_continuity(pid, batch, task, params):
     }
     prev_state = story_state.get_current(pid)
     style = params.get("style", "")
-    use_llm = bool(params.get("decision_llm"))
+    # 默认直接开启「LLM 升级决策」：除非显式传 decision_llm=false，否则衔接判定走真·LLM
+    # 升级（无凭据/失败时 decide_handoff 自动回退确定性规则，不阻断）。
+    use_llm = bool(params.get("decision_llm", True))
     decision = continuity.decide_handoff(shot, prev_state, use_llm=use_llm,
                                          model=params.get("llm_model"))
+    logger.info(
+        f"[Continuity] {shot_no} 衔接决策[{decision.get('source', 'rule')}]: "
+        f"切场={decision.get('scene_cut')} 尾帧={decision.get('use_tail_frame')} "
+        f"站位图={decision.get('use_staging')} 导演图={decision.get('use_director_board')} "
+        f"长镜头={decision.get('long_take')}｜{decision.get('reason', '')}")
 
     aspect_ratio = params.get("aspect_ratio", "16:9")
 
@@ -625,6 +632,27 @@ def _gen_video_task_continuity(pid, batch, task, params):
     # persist the (possibly downgraded) decision so the UI badge reflects the fallback
     story_state.set_decision(pid, shot_no, decision)
     batches.update_task(pid, batch["id"], task["id"], {"decision": decision})
+
+    # 准确执行决策的连续性机制：若决策需要站位图/导演图且本镜尚未生成，则按需即时生成
+    # （best-effort：无生图凭据/失败时记日志、不阻断本镜视频生成）。这样 LLM 升级判定
+    # 出的策略会真正落地，而非仅写进决策却无图可用。
+    if decision.get("use_staging") or decision.get("use_director_board"):
+        snap0 = story_state.get_shot_state(pid, shot_no) or {}
+        proj_assets = assets_core.list_assets(pid)
+        if decision.get("use_staging") and not snap0.get("staging_image"):
+            try:
+                continuity.generate_staging(pid, shot, prev_state, style=style,
+                                            assets=proj_assets)
+                logger.info(f"[Continuity] {shot_no} 按决策生成站位图（锁定人物站位/构图）")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[Continuity] {shot_no} 站位图生成失败（不阻断）: {e}")
+        if decision.get("use_director_board") and not snap0.get("director_board"):
+            try:
+                continuity.generate_director_board(pid, shot, prev_state, style=style,
+                                                   assets=proj_assets)
+                logger.info(f"[Continuity] {shot_no} 按决策生成导演图（构图蓝本）")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[Continuity] {shot_no} 导演图生成失败（不阻断）: {e}")
 
     items: list = []
     if decision.get("use_tail_frame"):

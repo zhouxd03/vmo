@@ -48,6 +48,7 @@ const tb = reactive({
   continuity: false,
   continuityMode: 'auto',
   aiReview: true,
+  decisionLlm: true,  // 默认直接开启 LLM 升级决策（无凭据时后端自动回退规则）
 })
 
 const sizeOptions = ['1024x1024', '1280x720', '720x1280'].map((v) => ({ label: v, value: v }))
@@ -439,7 +440,10 @@ function buildParams(kind) {
     : { size: tb.imageSize }
   if (tb.model) p.model = tb.model
   if (kind === 'video' && tb.continuity) {
-    Object.assign(p, { continuity: true, mode: tb.continuityMode, ai_review: tb.aiReview })
+    Object.assign(p, {
+      continuity: true, mode: tb.continuityMode, ai_review: tb.aiReview,
+      decision_llm: tb.decisionLlm,
+    })
   }
   return p
 }
@@ -777,7 +781,8 @@ async function exportJianying() {
               <div class="pp-row"><span class="pp-l">画幅</span><n-select size="small" v-model:value="tb.aspect" :options="aspectOptions" style="width: 150px" /></div>
               <div class="pp-row"><span class="pp-l">模型</span><n-input size="small" v-model:value="tb.model" placeholder="留空用默认" style="width: 150px" /></div>
               <div class="pp-row"><span class="pp-l">连续性</span><n-switch size="small" v-model:value="tb.continuity" /></div>
-              <div class="pp-tip">开启连续性：视频批次串行执行，承接上一镜尾帧（跨集亦承接上一集末镜）。</div>
+              <div class="pp-row" v-if="tb.continuity"><span class="pp-l">LLM升级决策</span><n-switch size="small" v-model:value="tb.decisionLlm" /></div>
+              <div class="pp-tip">开启连续性：视频批次串行执行，承接上一镜尾帧（跨集亦承接上一集末镜）。LLM升级决策默认开启：每镜由 LLM 判定衔接机制（切镜头/尾帧/站位图/导演图），无凭据时自动回退规则。</div>
             </div>
           </n-popover>
           <button class="pbtn" :disabled="inferAllRunning" @click="inferAll"><n-icon :component="SparklesOutline" /><span>{{ inferAllRunning ? 'AI推理中…' : 'AI推理全部' }}</span></button>

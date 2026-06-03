@@ -609,7 +609,7 @@ def register(app: Flask) -> None:
         if prev is None:
             prev = story_state.get_current(pid)
         decision = continuity.decide_handoff(
-            shot, prev, use_llm=bool(body.get("use_llm")), model=body.get("model"))
+            shot, prev, use_llm=bool(body.get("use_llm", True)), model=body.get("model"))
         if body.get("commit"):
             story_state.set_decision(pid, shot.get("shot_no", ""), decision)
         return jsonify(decision)
