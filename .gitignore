@@ -31,3 +31,7 @@ frontend/.vite/
 build/
 dist/
 *.spec
+# keep the desktop packaging spec under version control
+!desktop.spec
+# intermediate; only app.ico is used by the build
+desktop_assets/app.png
