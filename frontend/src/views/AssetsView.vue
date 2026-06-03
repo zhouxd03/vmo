@@ -50,6 +50,13 @@ async function loadAssets() {
 
 const byType = (t) => assets.value.filter((a) => a.type === t)
 
+// Stable per-type asset code (C01 / S01 / P01 …) shown on each card so users can
+// reference assets by number and keep numbering consistent across episodes.
+const CODE_PREFIX = { character: 'C', scene: 'S', prop: 'P' }
+function assetCode(col, idx) {
+  return `${CODE_PREFIX[col.type] || 'A'}${String(idx + 1).padStart(2, '0')}`
+}
+
 // ── add / edit modal ──
 const modal = ref(false)
 const editing = ref(null)
@@ -248,10 +255,11 @@ async function runResolve() {
 
             <n-empty v-if="!byType(col.type).length" description="暂无" size="small" style="margin: 24px 0" />
             <div v-else class="cards">
-              <div v-for="a in byType(col.type)" :key="a.id" class="asset">
+              <div v-for="(a, ai) in byType(col.type)" :key="a.id" class="asset">
                 <div class="thumb">
                   <n-image v-if="imgUrl(a)" :src="imgUrl(a)" object-fit="cover" width="100%" />
                   <div v-else class="thumb-empty"><n-icon :component="ImageOutline" size="22" /></div>
+                  <span class="code-badge">{{ assetCode(col, ai) }}</span>
                 </div>
                 <div class="asset-body">
                   <div class="asset-name"><span class="tg" :class="col.cls">{{ col.trigger }}</span>{{ a.name }}</div>
@@ -377,10 +385,17 @@ async function runResolve() {
   background: var(--app-bg-soft); border: 1px solid var(--app-border); border-radius: 12px;
 }
 .thumb {
+  position: relative;
   width: 72px; height: 72px; flex: 0 0 72px; border-radius: 8px; overflow: hidden;
   background: var(--app-bg); display: flex; align-items: center; justify-content: center;
 }
 .thumb-empty { color: var(--app-text-muted); }
+.code-badge {
+  position: absolute; left: 3px; top: 3px;
+  font-family: var(--font-mono, monospace); font-size: 10px; font-weight: 700;
+  line-height: 1; padding: 2px 4px; border-radius: 4px;
+  background: rgba(0, 0, 0, 0.6); color: #fff;
+}
 .asset-body { flex: 1; min-width: 0; }
 .asset-name { font-weight: 600; margin-bottom: 3px; }
 .asset-desc {
