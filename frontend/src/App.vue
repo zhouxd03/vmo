@@ -8,6 +8,7 @@ import { useThemeStore } from './stores/theme'
 import TitleBar from './layouts/TitleBar.vue'
 import SideBar from './layouts/SideBar.vue'
 import GenTabs from './layouts/GenTabs.vue'
+import ResizeHandles from './layouts/ResizeHandles.vue'
 
 const route = useRoute()
 const fullBleed = computed(() => !!route.meta.fullBleed)
@@ -24,6 +25,7 @@ onMounted(() => themeStore.init())
       <n-message-provider>
         <n-dialog-provider>
           <div class="app-glow" />
+          <ResizeHandles />
           <div class="app-root">
             <TitleBar />
             <div class="app-body">

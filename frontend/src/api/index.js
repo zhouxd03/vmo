@@ -53,6 +53,16 @@ async function downloadBlob(method, path, body) {
   return { ok: true, name }
 }
 
+// POST a multipart/form-data body (file upload). Returns parsed JSON.
+async function upload(path, formData) {
+  const resp = await fetch(path, { method: 'POST', body: formData })
+  const text = await resp.text()
+  let data
+  try { data = text ? JSON.parse(text) : {} } catch { data = { error: text } }
+  if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+  return data
+}
+
 export const api = {
   get: (p) => req('GET', p),
   post: (p, b) => req('POST', p, b),
@@ -99,6 +109,12 @@ export const api = {
   deleteAsset: (pid, aid) => req('DELETE', `/api/projects/${pid}/assets/${aid}`),
   seedAssets: (pid) => req('POST', `/api/projects/${pid}/assets/seed`),
   genAssetRefImage: (pid, aid, body) => req('POST', `/api/projects/${pid}/assets/${aid}/refimage`, body),
+  genMissingAssets: (pid, body) => req('POST', `/api/projects/${pid}/assets/generate-missing`, body || {}),
+  importAssetImage: (pid, aid, file) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return upload(`/api/projects/${pid}/assets/${aid}/import-image`, fd)
+  },
   assetImageUrl: (pid, filename) => `/api/projects/${pid}/asset-image/${filename}`,
   resolveMentions: (pid, text) => req('POST', `/api/projects/${pid}/resolve`, { text }),
 

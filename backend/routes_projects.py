@@ -1,6 +1,8 @@
 """Phase 2/3 routes: project import, two-stage LLM analysis, prompt templates,
 asset library (@/#/$) and reference-image generation."""
 
+import os
+
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
 from .core import assets as assets_core
@@ -326,6 +328,46 @@ def register(app: Flask) -> None:
             return jsonify({"error": str(e)}), 502
         except Exception as e:  # noqa: BLE001
             return jsonify({"error": str(e)}), 500
+        return jsonify(out)
+
+    @app.route("/api/projects/<pid>/assets/generate-missing", methods=["POST"])
+    def gen_missing_ref_images(pid):
+        p = projects.get_project(pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        body = request.json or {}
+        try:
+            out = asset_gen.generate_missing(
+                pid, model=body.get("model"), size=body.get("size", "1024x1024"))
+        except image_gen.GenerationError as e:
+            return jsonify({"error": str(e)}), 502
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": str(e)}), 500
+        return jsonify(out)
+
+    @app.route("/api/projects/<pid>/assets/<aid>/import-image", methods=["POST"])
+    def import_ref_image(pid, aid):
+        if not projects.get_project(pid):
+            return jsonify({"error": "项目不存在"}), 404
+        f = request.files.get("file")
+        if not f:
+            return jsonify({"error": "未收到图片文件"}), 400
+        import tempfile
+        suffix = "." + (f.filename.rsplit(".", 1)[-1] if "." in (f.filename or "") else "png")
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        try:
+            f.save(tmp.name)
+            tmp.close()
+            out = asset_gen.import_ref_image(pid, aid, tmp.name, orig_name=f.filename or "")
+        except image_gen.GenerationError as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": str(e)}), 500
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
         return jsonify(out)
 
     @app.route("/api/projects/<pid>/asset-image/<path:filename>", methods=["GET"])

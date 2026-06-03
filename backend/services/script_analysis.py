@@ -117,15 +117,70 @@ def _chunk_segments(segments: list[dict], chunk_chars: int) -> list[list[dict]]:
     return chunks
 
 
-def _bible_summary(bible: dict) -> str:
-    """Compact StoryBible for stage-2 context (keep tokens small)."""
+def _relevant(items: list[dict], chunk_text: str, prev_handoff: str) -> list[dict]:
+    """Keep only entities actually referenced in this chunk (or carried over via
+    the previous handoff). Prevents dumping the whole novel-level cast/scene/prop
+    list into every chunk — which on later episodes piles up and overloads the
+    model (信息过载/内容堆叠). Cross-episode sharing is preserved: an entity reused
+    in a later chunk still matches by name."""
+    hay = (chunk_text or "") + "\n" + (prev_handoff or "")
+    out = [e for e in items if e.get("name") and e["name"] in hay]
+    return out
+
+
+def _coerce_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        try:
+            return int(str(v).strip())
+        except (TypeError, ValueError):
+            return None
+
+
+def _resolve_src_seq(raw, seq_set: set, chunk_seqs: list, shot_idx: int, n_shots: int):
+    """Map a shot to the source segment it derives from.
+
+    Trusts the LLM's ``seq`` when it points at a real segment in this chunk;
+    otherwise distributes the shot evenly across the chunk's segments by its
+    ordinal position. This fixes the old behaviour where every shot in a chunk
+    defaulted to the *first* segment's seq, so the worktable「原文」showed an
+    unrelated/header paragraph for most shots (拆解后原文与分镜信息不符).
+    """
+    n = _coerce_int(raw)
+    if n is not None and n in seq_set:
+        return n
+    if not chunk_seqs:
+        return n
+    if n_shots <= 1:
+        return chunk_seqs[0]
+    pos = round(shot_idx / (n_shots - 1) * (len(chunk_seqs) - 1))
+    pos = max(0, min(len(chunk_seqs) - 1, pos))
+    return chunk_seqs[pos]
+
+
+def _bible_summary(bible: dict, chunk_text: str = "", prev_handoff: str = "") -> str:
+    """Compact StoryBible for stage-2 context (keep tokens small).
+
+    When *chunk_text* is given, the cast/scene/prop lists are filtered down to
+    the entities relevant to this chunk so multi-episode runs don't accumulate
+    an ever-growing, irrelevant entity dump (item: 剔除与本集无关元素、避免堆叠).
+    """
     def names(items, key="name"):
         return "、".join(i.get(key, "") for i in items if i.get(key))
+
+    chars = bible.get("characters", []) or []
+    scenes = bible.get("scenes", []) or []
+    props = bible.get("props", []) or []
+    if chunk_text:
+        chars = _relevant(chars, chunk_text, prev_handoff) or chars[:6]
+        scenes = _relevant(scenes, chunk_text, prev_handoff) or scenes[:4]
+        props = _relevant(props, chunk_text, prev_handoff)
     parts = [
         f"风格: {bible.get('style','')}",
-        f"人物: {names(bible.get('characters', []))}",
-        f"场景: {names(bible.get('scenes', []))}",
-        f"道具: {names(bible.get('props', []))}",
+        f"人物: {names(chars)}",
+        f"场景: {names(scenes)}",
+        f"道具: {names(props)}",
     ]
     cons = bible.get("continuity_constraints", [])
     if cons:
@@ -153,7 +208,6 @@ def run_decompose(
     chunks = _chunk_segments(segments, chunk_chars)
     total = len(chunks)
     body = tpl.get_template_body("batch_decompose")
-    bible_sum = _bible_summary(bible)
     # 「单镜目标时长」(设置) → 单镜承载字数（纯画面≈8字/秒）。拆解时按此控制每镜体量；
     # 对白多的镜由模板按≈5字/秒折算降低字数（避免对话过载）。
     try:
@@ -174,7 +228,7 @@ def run_decompose(
         chunk = chunks[ci]
         chunk_text = "\n".join(f"[{s.get('seq')}] {s.get('text','')}" for s in chunk)
         prompt = tpl.render(body, {
-            "story_bible": bible_sum,
+            "story_bible": _bible_summary(bible, chunk_text, prev_handoff),
             "prev_handoff": prev_handoff,
             "chunk": chunk_text,
             "shot_target": shot_target,
@@ -187,11 +241,16 @@ def run_decompose(
             temperature=0.5,
         )
         chunk_shots = result if isinstance(result, list) else result.get("shots", [])
+        # Valid source seqs for this chunk; used to repair bad/duplicate seq so the
+        # worktable「原文」maps each shot to the source paragraph it derives from.
+        chunk_seqs = [s.get("seq") for s in chunk if s.get("seq") is not None]
+        seq_set = set(chunk_seqs)
+        n_shots = len(chunk_shots)
         block_shot_nos = []
-        for sh in chunk_shots:
+        for si, sh in enumerate(chunk_shots):
             counter += 1
             sh["shot_no"] = f"S{episode_no:02d}-C{counter:03d}"
-            sh.setdefault("seq", chunk[0].get("seq"))
+            sh["seq"] = _resolve_src_seq(sh.get("seq"), seq_set, chunk_seqs, si, n_shots)
             # 按台词体量 + 情绪估算单镜时长（正常 5 字/秒，急/怒更快、悲/沉更慢），
             # 钳制到 [3,15] 秒（视频模型单条上限 15s）。LLM 已给时则尊重其值。
             if not sh.get("duration"):
