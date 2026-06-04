@@ -78,6 +78,11 @@ def create_batch(pid: str, kind: str, name: str, tasks: list,
         raise ValueError(f"未知批次类型: {kind}")
     if not tasks:
         raise ValueError("批次任务为空")
+    # Video calls are expensive and prompt-sensitive. A failed provider task may
+    # already have consumed quota, so never create video tasks with automatic
+    # re-submit attempts; users should inspect the error and manually retry.
+    if kind == "video":
+        max_attempts = 1
     bid = uuid.uuid4().hex[:12]
     now = time.time()
     norm_tasks = []

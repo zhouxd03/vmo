@@ -35,6 +35,8 @@ DEFAULTS = {
     "max_reference_images": 8,
     # storage / theme
     "output_dir": str(OUTPUT_DIR),
+    # 剪映/CapCut Windows 默认草稿目录。留空时只生成 zip，不自动写入剪映草稿库。
+    "jianying_draft_dir": "",
     "theme": "dark",
     "accent": "#21fe84",
 }

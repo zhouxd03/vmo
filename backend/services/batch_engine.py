@@ -754,7 +754,11 @@ def _run_one(pid, batch, task, gen, params, backoff):
         return "paused"
     batches.update_task(pid, bid, task["id"], {"status": "running"})
     attempts = task.get("attempts", 0)
-    max_attempts = max(1, task.get("max_attempts", 3))
+    # Video generation is paid and content-sensitive: do not auto-resubmit a
+    # failed video prompt, even when the provider/error classifier marks the
+    # failure as retryable. The UI will surface the error and let the user edit
+    # the prompt/settings before manually generating again.
+    max_attempts = 1 if batch.get("kind") == "video" else max(1, task.get("max_attempts", 3))
     err_info = {"category": "unknown", "message": "未执行", "retryable": False}
     while attempts < max_attempts:
         attempts += 1

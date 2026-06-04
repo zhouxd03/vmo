@@ -58,8 +58,10 @@ const SCHEMA = [
   },
   {
     group: '存储',
+    hint: '剪映草稿目录填写后，「导入剪映」会直接把草稿文件夹复制到该目录，同时仍保留 zip 备份。Windows 默认通常为：C:\\Users\\你的用户名\\AppData\\Local\\JianyingPro\\User Data\\Projects\\com.lveditor.draft',
     fields: [
       { key: 'output_dir', label: '输出目录', type: 'text' },
+      { key: 'jianying_draft_dir', label: '剪映草稿目录', type: 'text' },
     ],
   },
 ]

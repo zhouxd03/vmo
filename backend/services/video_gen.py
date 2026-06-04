@@ -101,6 +101,64 @@ def _extract_task_id(obj: dict) -> str:
     return ""
 
 
+def _stringify_upstream(value, limit: int = 1200) -> str:
+    """Return a compact, readable upstream error string without truncating to
+    useless fragments like ``{\\``. Providers often return nested error dicts,
+    escaped JSON strings, or only ``fail_reason``; keep enough context for the
+    user to fix credentials/params/prompt without opening raw logs."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+        # Some relays return JSON as an escaped string; decode once if possible.
+        if text.startswith("{") or text.startswith("["):
+            try:
+                import json
+                return _stringify_upstream(json.loads(text), limit)
+            except Exception:  # noqa: BLE001
+                pass
+        return text[:limit]
+    if isinstance(value, dict):
+        preferred = []
+        for k in ("message", "msg", "detail", "reason", "fail_reason", "code", "type"):
+            v = value.get(k)
+            if v not in (None, ""):
+                preferred.append(f"{k}={_stringify_upstream(v, limit)}")
+        if preferred:
+            return "；".join(preferred)[:limit]
+    try:
+        import json
+        return json.dumps(value, ensure_ascii=False)[:limit]
+    except Exception:  # noqa: BLE001
+        return str(value)[:limit]
+
+
+def _extract_error_fields(data: dict) -> tuple[str, str, str]:
+    """Extract (message, code, type) from common relay/provider error shapes."""
+    candidates = []
+    if isinstance(data, dict):
+        for k in ("fail_reason", "error", "message", "msg", "detail", "reason"):
+            if data.get(k) not in (None, ""):
+                candidates.append(data.get(k))
+        for k in ("data", "result"):
+            v = data.get(k)
+            if isinstance(v, dict):
+                for kk in ("fail_reason", "error", "message", "msg", "detail", "reason"):
+                    if v.get(kk) not in (None, ""):
+                        candidates.append(v.get(kk))
+    msg_src = candidates[0] if candidates else data
+    code = err_type = ""
+    if isinstance(msg_src, dict):
+        code = str(msg_src.get("code") or msg_src.get("error_code") or "")
+        err_type = str(msg_src.get("type") or msg_src.get("error_type") or "")
+    if not code and isinstance(data, dict):
+        code = str(data.get("code") or data.get("error_code") or "")
+    if not err_type and isinstance(data, dict):
+        err_type = str(data.get("type") or data.get("error_type") or "")
+    msg = _stringify_upstream(msg_src)
+    return msg or "生成失败", code, err_type
+
+
 def generate_video(
     prompt: str,
     *,
@@ -216,13 +274,8 @@ def _poll(api_base, task_id, key, timeout, interval, on_progress) -> str:
                 if url:
                     return url
             elif status in ("failed", "error"):
-                msg = data.get("fail_reason") or data.get("error") or data.get("message") or "生成失败"
-                code = err_type = ""
-                if isinstance(msg, dict):
-                    code = str(msg.get("code") or "")
-                    err_type = str(msg.get("type") or "")
-                    msg = str(msg.get("message") or msg)
-                raise VideoError(str(msg), code=code, err_type=err_type, raw=str(data)[:500])
+                msg, code, err_type = _extract_error_fields(data)
+                raise VideoError(msg, code=code, err_type=err_type, raw=_stringify_upstream(data))
         except VideoError:
             raise
         except Exception as e:  # noqa: BLE001

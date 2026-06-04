@@ -84,8 +84,12 @@ def commit_shot(pid: str, shot_no: str, state: dict[str, Any]) -> dict:
     merged["shot_no"] = shot_no
 
     snapshot = dict(merged)
-    snapshot.setdefault("decision", st["shots"].get(shot_no, {}).get("decision"))
-    snapshot.setdefault("review", st["shots"].get(shot_no, {}).get("review"))
+    prev_snap = st["shots"].get(shot_no, {})
+    snapshot.setdefault("decision", prev_snap.get("decision"))
+    snapshot.setdefault("review", prev_snap.get("review"))
+    snapshot.setdefault("decision_flushed", prev_snap.get("decision_flushed", False))
+    snapshot.setdefault("staging_flushed", prev_snap.get("staging_flushed", False))
+    snapshot.setdefault("director_flushed", prev_snap.get("director_flushed", False))
     st["shots"][shot_no] = snapshot
     st["current"] = merged
     return _save(pid, st)

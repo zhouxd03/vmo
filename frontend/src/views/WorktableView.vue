@@ -49,7 +49,61 @@ const tb = reactive({
   continuityMode: 'auto',
   aiReview: true,
   decisionLlm: true,  // 默认直接开启 LLM 升级决策（无凭据时后端自动回退规则）
+  batchPollMaxMinutes: 30,
 })
+const TB_STORAGE_PREFIX = 'wt:tb:'
+function tbStorageKey(pid = store.currentId) { return `${TB_STORAGE_PREFIX}${pid || 'none'}` }
+function saveTb() {
+  try {
+    if (!store.currentId) return
+    localStorage.setItem(tbStorageKey(), JSON.stringify({
+      imageSize: tb.imageSize,
+      duration: tb.duration,
+      resolution: tb.resolution,
+      aspect: tb.aspect,
+      model: tb.model,
+      continuity: tb.continuity,
+      continuityMode: tb.continuityMode,
+      aiReview: tb.aiReview,
+      decisionLlm: tb.decisionLlm,
+      batchPollMaxMinutes: tb.batchPollMaxMinutes,
+    }))
+  } catch { /* ignore */ }
+}
+function loadTb() {
+  try {
+    const raw = localStorage.getItem(tbStorageKey())
+    if (!raw) return
+    const data = JSON.parse(raw)
+    if (!data || typeof data !== 'object') return
+    Object.assign(tb, {
+      imageSize: data.imageSize || tb.imageSize,
+      duration: Number.isFinite(Number(data.duration)) ? Number(data.duration) : tb.duration,
+      resolution: data.resolution || tb.resolution,
+      aspect: data.aspect || tb.aspect,
+      model: typeof data.model === 'string' ? data.model : tb.model,
+      continuity: data.continuity !== undefined ? !!data.continuity : tb.continuity,
+      continuityMode: data.continuityMode || tb.continuityMode,
+      aiReview: data.aiReview !== undefined ? !!data.aiReview : tb.aiReview,
+      decisionLlm: data.decisionLlm !== undefined ? !!data.decisionLlm : tb.decisionLlm,
+      batchPollMaxMinutes: Number.isFinite(Number(data.batchPollMaxMinutes)) ? Number(data.batchPollMaxMinutes) : tb.batchPollMaxMinutes,
+    })
+  } catch { /* ignore */ }
+}
+function resetTb() {
+  Object.assign(tb, {
+    imageSize: '1024x1024',
+    duration: 10,
+    resolution: '720p',
+    aspect: '16:9',
+    model: '',
+    continuity: false,
+    continuityMode: 'auto',
+    aiReview: true,
+    decisionLlm: true,
+    batchPollMaxMinutes: 30,
+  })
+}
 
 const sizeOptions = ['1024x1024', '1280x720', '720x1280'].map((v) => ({ label: v, value: v }))
 const resOptions = ['720p', '1080p'].map((v) => ({ label: v, value: v }))
@@ -64,8 +118,12 @@ const videoModelOptions = [
 onMounted(async () => {
   await store.refreshList()
   if (!store.current && store.projects.length) await store.select(store.projects[0].id)
+  loadTb()
   await reload()
 })
+
+watch(() => store.currentId, () => { loadTb() })
+watch(tb, () => saveTb(), { deep: true })
 // NOTE: we intentionally do NOT stop polling on unmount — the tasks store keeps
 // polling across tab switches so an in-flight batch keeps updating (§8.2).
 
@@ -200,6 +258,7 @@ async function inferRow(no) {
     const res = await inferShot(no)
     if (res?.source === 'fallback') message.warning(`${no}：LLM 推理失败，已用确定性合成兜底`)
     else message.success(`已 AI 推理 ${no} 图片/视频提示词`)
+    await reload()
   } catch (e) { message.error('AI 推理失败：' + e.message) }
   finally { r.inferring = false }
 }
@@ -218,7 +277,9 @@ async function inferAll() {
   }
   inferAllRunning.value = false
   message.success(`AI 推理完成：成功 ${ok}${fb ? `，兜底 ${fb}` : ''}（共 ${targets.length} 镜）`)
+  await reload()
 }
+
 watch(shots, (list) => ensureRows(list), { immediate: true })
 
 watch(() => store.currentEpisodeId, () => { loadLocks(); reload() })
@@ -330,13 +391,17 @@ async function rebuildMaterials() {
   }
   // commit status badges incrementally
   for (const no of Object.keys(statusByShot)) { if (!(no in st)) delete statusByShot[no] }
+  let hasStatusChange = false
   for (const no of Object.keys(st)) {
     const cur = statusByShot[no]
     if (!cur || cur.status !== st[no].status || cur.error !== st[no].error
+        || cur.attempts !== st[no].attempts
         || (cur.decision?.use_tail_frame) !== (st[no].decision?.use_tail_frame)) {
       statusByShot[no] = st[no]
+      hasStatusChange = true
     }
   }
+  if (hasStatusChange) notifyNewErrors()
   genProgress.active = pgActive
   genProgress.done = pgDone
   genProgress.total = pgTotal
@@ -372,6 +437,32 @@ const elapsedText = computed(() => {
   const m = Math.floor(s / 60)
   return m ? `${m}分${s % 60}秒` : `${s}秒`
 })
+function shotProgressText(no) {
+  const st = statusByShot[no]
+  if (!st) return ''
+  const bits = []
+  if (genProgress.total) bits.push(`${genProgress.done}/${genProgress.total}`)
+  if (st.attempts) bits.push(`第${st.attempts}次`)
+  if (tasks.genStart && ['running', 'pending'].includes(st.status)) bits.push(elapsedText.value)
+  return bits.join(' · ')
+}
+function statusTitle(no) {
+  const st = statusByShot[no]
+  if (!st) return ''
+  if (st.status === 'error') return st.error || '生成失败，请检查提示词/参数后手动重新提交'
+  return `当前进度：${genProgress.done}/${genProgress.total || 0}，已用时：${elapsedText.value}`
+}
+const notifiedErrors = new Set()
+function notifyNewErrors() {
+  for (const [no, st] of Object.entries(statusByShot)) {
+    if (st?.status !== 'error' || !st.error) continue
+    const key = `${no}:${st.kind}:${st.updated}:${st.error}`
+    if (notifiedErrors.has(key)) continue
+    notifiedErrors.add(key)
+    const prefix = st.kind === 'video' ? '视频生成失败' : '生成失败'
+    message.error(`${prefix}：${no}。已停止自动重试，请修改提示词或参数后手动重新生成。${st.error}`)
+  }
+}
 
 function isVideoFile(fn) { return /\.(mp4|webm|mov)$/i.test(fn || '') }
 function matUrl(m) { return api.outputUrl(store.current.id, m.bid, m.filename) }
@@ -395,6 +486,53 @@ function openViewer(no) {
   viewerMat.value = m
   viewerShot.value = no
   showViewer.value = true
+}
+
+// ordered playlist viewer: one player, play all shots sequentially for continuity checks
+const showPlaylist = ref(false)
+const playlistIndex = ref(0)
+const playlistItems = computed(() =>
+  shots.value
+    .map((s) => ({ shot_no: s.shot_no, material: currentMaterial(s.shot_no) }))
+    .filter((it) => it.material))
+const playlistCurrent = computed(() => playlistItems.value[playlistIndex.value] || null)
+const PLAYLIST_IMAGE_SECONDS = 3.5
+let playlistTimer = null
+function clearPlaylistTimer() {
+  if (playlistTimer) { clearTimeout(playlistTimer); playlistTimer = null }
+}
+function schedulePlaylistAdvance() {
+  clearPlaylistTimer()
+  const cur = playlistCurrent.value
+  if (!showPlaylist.value || !cur?.material) return
+  if (isVideoFile(cur.material.filename)) return
+  playlistTimer = setTimeout(() => {
+    playlistNext()
+  }, Math.max(800, PLAYLIST_IMAGE_SECONDS * 1000))
+}
+function openPlaylist() {
+  if (!playlistItems.value.length) { message.warning('当前没有可播放的分镜素材'); return }
+  playlistIndex.value = 0
+  showPlaylist.value = true
+  schedulePlaylistAdvance()
+}
+function playlistPrev() {
+  if (!playlistItems.value.length) return
+  playlistIndex.value = (playlistIndex.value - 1 + playlistItems.value.length) % playlistItems.value.length
+  schedulePlaylistAdvance()
+}
+function playlistNext() {
+  if (!playlistItems.value.length) return
+  playlistIndex.value = (playlistIndex.value + 1) % playlistItems.value.length
+  schedulePlaylistAdvance()
+}
+function onPlaylistEnded() { playlistNext() }
+function jumpPlaylist(no) {
+  const idx = playlistItems.value.findIndex((it) => it.shot_no === no)
+  if (idx >= 0) {
+    playlistIndex.value = idx
+    schedulePlaylistAdvance()
+  }
 }
 
 // col4: existing materials padded with empty placeholder slots (min 6, scrollable multi-select)
@@ -475,9 +613,11 @@ async function genRow(no, kind) {
     await api.startBatch(store.current.id, b.id)
     message.success(`已提交 ${no} ${kind === 'video' ? '生视频' : '生图'}`)
     // surface the progress bar immediately; heavy polling (store) starts after 100s
-    await tasks.ensureBatchPolling({ immediate: true })
+    await tasks.ensureBatchPolling({ immediate: true, maxMinutes: tb.batchPollMaxMinutes })
+    await reload()
   } catch (e) {
     message.error(e.message)
+  } finally {
     rowState[no].running = false
   }
 }
@@ -496,6 +636,7 @@ async function genBatch(kind) {
     message.success(`已提交批量${kind === 'video' ? '生视频' : '生图'}（${targets.length} 镜${locks.value.size ? `，跳过 ${locks.value.size} 锁定` : ''}）`)
     // surface the progress bar immediately; heavy polling (store) starts after 100s
     await tasks.ensureBatchPolling({ immediate: true })
+    await reload()
   } catch (e) { message.error(e.message) }
 }
 
@@ -545,6 +686,7 @@ async function submitEpiGen() {
     const sk = r.skipped?.length ? `，跳过 ${r.skipped.length} 集` : ''
     message.success(`已启动 ${n} 集并发${epiGen.kind === 'video' ? '生视频' : '生图'}（最多 ${r.max_parallel} 集同时运行，单集串行）${sk}`)
     await tasks.ensureBatchPolling({ immediate: true })
+    await reload()
   } catch (e) { message.error(e.message) }
 }
 
@@ -714,19 +856,21 @@ async function exportJianying() {
           <div class="c-cur">
             <div class="cur-top">
               <template v-if="statusMeta(s.shot_no)">
-                <n-tooltip v-if="statusByShot[s.shot_no].status === 'error'" trigger="hover">
+                <n-tooltip trigger="hover">
                   <template #trigger>
-                    <span class="st-badge st-error">
-                      <n-icon :component="AlertCircleOutline" /> 失败
+                    <span class="st-badge" :class="`st-${statusByShot[s.shot_no].status}`">
+                      <n-spin v-if="statusByShot[s.shot_no].status === 'running'" :size="11" />
+                      <n-icon v-else :component="statusMeta(s.shot_no).icon" />
+                      <span>{{ statusMeta(s.shot_no).label }}</span>
+                      <small v-if="shotProgressText(s.shot_no)">{{ shotProgressText(s.shot_no) }}</small>
                     </span>
                   </template>
-                  {{ statusByShot[s.shot_no].error || '生成失败' }}
+                  <div class="st-tip">
+                    <div>{{ statusTitle(s.shot_no) }}</div>
+                    <div v-if="statusByShot[s.shot_no].kind">类型：{{ statusByShot[s.shot_no].kind === 'video' ? '视频' : '图片' }}</div>
+                    <div v-if="decisionLabel(s.shot_no)">{{ decisionLabel(s.shot_no) }}</div>
+                  </div>
                 </n-tooltip>
-                <span v-else class="st-badge" :class="`st-${statusByShot[s.shot_no].status}`">
-                  <n-spin v-if="statusByShot[s.shot_no].status === 'running'" :size="11" />
-                  <n-icon v-else :component="statusMeta(s.shot_no).icon" />
-                  {{ statusMeta(s.shot_no).label }}
-                </span>
                 <span v-if="statusByShot[s.shot_no].kind === 'video' && decisionLabel(s.shot_no)" class="st-decision">
                   {{ decisionLabel(s.shot_no) }}
                 </span>
@@ -739,9 +883,12 @@ async function exportJianying() {
               <template v-if="currentMaterial(s.shot_no)">
                 <video v-if="isVideoFile(currentMaterial(s.shot_no).filename)" :src="matUrl(currentMaterial(s.shot_no))" muted controls class="cur-media" />
                 <n-image v-else :src="matUrl(currentMaterial(s.shot_no))" class="cur-media" object-fit="cover" />
-                <button class="view-btn" :title="isVideoFile(currentMaterial(s.shot_no).filename) ? '查看视频' : '查看大图'" @click.stop="openViewer(s.shot_no)">
-                  <n-icon :component="isVideoFile(currentMaterial(s.shot_no).filename) ? PlayOutline : ExpandOutline" />
-                </button>
+                <div v-if="!isVideoFile(currentMaterial(s.shot_no).filename)" class="preview-actions">
+                  <button class="view-btn" title="查看大图" @click.stop="openViewer(s.shot_no)">
+                    <n-icon :component="ExpandOutline" />
+                    <span>预览</span>
+                  </button>
+                </div>
                 <span v-if="isVideoFile(currentMaterial(s.shot_no).filename)" class="vid-badge">视频</span>
               </template>
             </div>
@@ -772,7 +919,8 @@ async function exportJianying() {
       <div class="toolbar">
         <div class="pill">
           <button class="pbtn" @click="router.push('/assets')"><n-icon :component="CubeOutline" /><span>资产库</span></button>
-          <button class="pbtn" @click="showPreview = true"><n-icon :component="EyeOutline" /><span>预览</span></button>
+          <button class="pbtn" @click="showPreview = true"><n-icon :component="EyeOutline" /><span>分镜预览</span></button>
+          <button class="pbtn accent" :disabled="!playlistItems.length" @click="openPlaylist"><n-icon :component="PlayOutline" /><span>顺播检查</span></button>
           <button class="pbtn" @click="router.push('/templates')"><n-icon :component="ColorWandOutline" /><span>自定义指令</span></button>
           <button class="pbtn" @click="showPipeline = true"><n-icon :component="GitMergeOutline" /><span>连续性</span></button>
           <n-popover trigger="click" placement="top">
@@ -785,9 +933,13 @@ async function exportJianying() {
               <div class="pp-row"><span class="pp-l">分辨率</span><n-select size="small" v-model:value="tb.resolution" :options="resOptions" style="width: 150px" /></div>
               <div class="pp-row"><span class="pp-l">画幅</span><n-select size="small" v-model:value="tb.aspect" :options="aspectOptions" style="width: 150px" /></div>
               <div class="pp-row"><span class="pp-l">模型</span><n-input size="small" v-model:value="tb.model" placeholder="留空用默认" style="width: 150px" /></div>
+              <div class="pp-row"><span class="pp-l">轮询最长分钟数</span><n-input-number size="small" v-model:value="tb.batchPollMaxMinutes" :min="5" :max="180" style="width: 150px" /> </div>
               <div class="pp-row"><span class="pp-l">连续性</span><n-switch size="small" v-model:value="tb.continuity" /></div>
               <div class="pp-row" v-if="tb.continuity"><span class="pp-l">LLM升级决策</span><n-switch size="small" v-model:value="tb.decisionLlm" /></div>
-              <div class="pp-tip">开启连续性：视频批次串行执行，承接上一镜尾帧（跨集亦承接上一集末镜）。LLM升级决策默认开启：每镜由 LLM 判定衔接机制（切镜头/尾帧/站位图/导演图），无凭据时自动回退规则。</div>
+              <div class="pp-actions">
+                <n-button size="small" quaternary @click="resetTb">恢复默认</n-button>
+                <span class="pp-tip">开启连续性：视频批次串行执行。LLM升级决策默认开启：每镜由 LLM 在切镜头、尾帧、站位图、导演图等策略中平权判断，按剧情连续性选择最自然的衔接方式；无凭据时自动回退规则。</span>
+              </div>
             </div>
           </n-popover>
           <button class="pbtn" :disabled="inferAllRunning" @click="inferAll"><n-icon :component="SparklesOutline" /><span>{{ inferAllRunning ? 'AI推理中…' : 'AI推理全部' }}</span></button>
@@ -828,6 +980,48 @@ async function exportJianying() {
             <video v-if="isVideoFile(viewerMat.filename)" :src="matUrl(viewerMat)" controls autoplay class="viewer-media" />
             <img v-else :src="matUrl(viewerMat)" class="viewer-media" />
           </template>
+        </div>
+      </n-card>
+    </n-modal>
+
+    <!-- ordered playlist viewer (single-player sequential playback) -->
+    <n-modal v-model:show="showPlaylist">
+      <n-card style="width: min(96vw, 1280px)" :title="`顺播检查 · ${episode?.name || ''}（${playlistItems.length} 段）`" :bordered="false" role="dialog" closable @close="clearPlaylistTimer(); showPlaylist = false">
+        <div class="playlist-shell" v-if="playlistCurrent">
+          <div class="playlist-player">
+            <div class="playlist-stage">
+              <video
+                v-if="isVideoFile(playlistCurrent.material.filename)"
+                :src="matUrl(playlistCurrent.material)"
+                controls autoplay
+                class="playlist-media"
+                @ended="onPlaylistEnded"
+              />
+              <img v-else :src="matUrl(playlistCurrent.material)" class="playlist-media" />
+              <div class="playlist-overlay">
+                <span class="playlist-shot">{{ playlistCurrent.shot_no }}</span>
+                <span class="playlist-type">{{ isVideoFile(playlistCurrent.material.filename) ? '视频' : '图片' }}</span>
+              </div>
+            </div>
+            <div class="playlist-nav">
+              <button class="nav-btn" @click="playlistPrev">上一段</button>
+              <button class="nav-btn" @click="schedulePlaylistAdvance">继续自动播放</button>
+              <button class="nav-btn" @click="playlistNext">下一段</button>
+              <button class="nav-btn primary" @click="clearPlaylistTimer(); showPlaylist = false">关闭</button>
+            </div>
+          </div>
+          <div class="playlist-list">
+            <button
+              v-for="(it, idx) in playlistItems"
+              :key="it.shot_no"
+              class="plist-item"
+              :class="{ active: idx === playlistIndex }"
+              @click="jumpPlaylist(it.shot_no)"
+            >
+              <span class="plist-no">{{ it.shot_no }}</span>
+              <span class="plist-kind">{{ isVideoFile(it.material.filename) ? '视频' : '图片' }}</span>
+            </button>
+          </div>
         </div>
       </n-card>
     </n-modal>
@@ -982,6 +1176,11 @@ async function exportJianying() {
   border: 1px solid transparent;
 }
 .st-badge :deep(.n-icon) { font-size: 12px; }
+.st-badge small {
+  font-size: 10px; font-weight: 600; opacity: .82;
+  padding-left: 3px; font-variant-numeric: tabular-nums;
+}
+.st-tip { max-width: 360px; white-space: pre-wrap; line-height: 1.6; }
 .st-pending { color: var(--app-text-secondary); background: color-mix(in srgb, var(--app-text-secondary) 12%, transparent); }
 .st-running { color: #4098fc; background: color-mix(in srgb, #4098fc 14%, transparent); }
 .st-done { color: #46c98b; background: color-mix(in srgb, #46c98b 16%, transparent); }
@@ -1032,6 +1231,34 @@ async function exportJianying() {
 }
 .viewer-wrap { display: flex; align-items: center; justify-content: center; }
 .viewer-media { max-width: 86vw; max-height: 74vh; border-radius: 8px; display: block; }
+.playlist-shell {
+  display: grid; grid-template-columns: minmax(0, 1fr) 220px; gap: 12px;
+  align-items: stretch;
+}
+.playlist-player {
+  display: flex; flex-direction: column; gap: 10px;
+}
+.playlist-media {
+  width: 100%; max-height: 72vh; border-radius: 10px; object-fit: contain;
+  background: #000;
+}
+.playlist-nav { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+.nav-btn {
+  border: 1px solid var(--app-border); background: var(--app-bg-soft); color: var(--app-text);
+  padding: 6px 12px; border-radius: 999px; cursor: pointer;
+}
+.nav-btn.primary { background: var(--app-accent); color: #06210f; border-color: transparent; }
+.playlist-list {
+  max-height: 72vh; overflow: auto; padding-left: 4px; display: flex; flex-direction: column; gap: 6px;
+}
+.plist-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  width: 100%; border: 1px solid var(--app-border); background: var(--app-bg-soft);
+  color: var(--app-text); border-radius: 10px; padding: 8px 10px; cursor: pointer;
+}
+.plist-item.active { border-color: var(--app-accent); box-shadow: 0 0 0 1px var(--app-accent) inset; }
+.plist-no { font-weight: 700; font-family: var(--font-mono, monospace); }
+.plist-kind { font-size: 12px; color: var(--app-text-muted); }
 .pv-tag {
   margin-left: 6px; font-size: 10px; padding: 1px 5px; border-radius: 4px;
   background: rgba(33, 254, 132, 0.2); color: var(--app-accent); font-weight: 700;

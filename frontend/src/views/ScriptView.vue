@@ -97,6 +97,26 @@ async function onSelect(pid) {
 const bible = computed(() => store.current?.story_bible)
 const shots = computed(() => store.currentEpisode?.shots || [])
 
+const characterQuery = ref('')
+const showAllCharacters = ref(false)
+const visibleCharacters = computed(() => {
+  const list = bible.value?.characters || []
+  const q = characterQuery.value.trim().toLowerCase()
+  const filtered = q
+    ? list.filter((c) => [c.name, c.alias, c.bio, c.note, c.appearance, c.first_appearance].filter(Boolean).join(' ').toLowerCase().includes(q))
+    : list
+  return showAllCharacters.value ? filtered : filtered.slice(0, 8)
+})
+const hiddenCharacterCount = computed(() => Math.max(0, (bible.value?.characters?.length || 0) - visibleCharacters.value.length))
+const characterGroups = computed(() => {
+  const groups = {}
+  for (const c of visibleCharacters.value) {
+    const key = (c.first_appearance || '未标注首次出现').split('·')[0]
+    ;(groups[key] ||= []).push(c)
+  }
+  return Object.entries(groups).map(([k, items]) => ({ key: k, items }))
+})
+
 // 风格 {{style}} 可手动设定：草稿与圣经保持同步，失焦/回车保存。
 const styleDraft = ref('')
 const savingStyle = ref(false)
@@ -263,12 +283,31 @@ const shotColumns = [
             <span class="bible-hint">全流程统一沿用此风格值；留空将回退 AI 分析缺省</span>
           </div>
         </div>
+        <div class="asset-toolbar">
+          <n-input v-model:value="characterQuery" size="small" clearable placeholder="搜索人物（姓名/别名/小传/备注/外形）" style="max-width: 360px" />
+          <n-button size="small" quaternary @click="showAllCharacters = !showAllCharacters">
+            {{ showAllCharacters ? '收起人物' : `展开全部人物${hiddenCharacterCount ? `（+${hiddenCharacterCount}）` : ''}` }}
+          </n-button>
+        </div>
         <div class="asset-cols">
           <div class="asset-col">
             <div class="asset-h"><n-icon :component="PersonOutline" /> 人物 <span class="tg">@</span></div>
-            <div v-for="(c, i) in bible.characters" :key="i" class="asset-item">
-              <b>@{{ c.name }}</b><div class="asset-d">{{ c.appearance || c.note }}</div>
-            </div>
+            <n-collapse accordion>
+              <n-collapse-item v-for="g in characterGroups" :key="g.key" :title="`${g.key}（${g.items.length}）`">
+                <div v-for="(c, i) in g.items" :key="i" class="asset-item">
+                  <div class="asset-item-head">
+                    <b>@{{ c.name }}</b>
+                    <n-tag v-if="c.alias" size="tiny" :bordered="false">别名</n-tag>
+                  </div>
+                  <div class="asset-d" v-if="c.bio">{{ c.bio }}</div>
+                  <div class="asset-d" v-else>{{ c.appearance || c.note }}</div>
+                  <div class="asset-mini" v-if="c.alias">别名：{{ c.alias }}</div>
+                  <div class="asset-mini" v-if="c.first_appearance">首次出现：{{ c.first_appearance }}</div>
+                  <div class="asset-mini" v-if="c.appearance">外形：{{ c.appearance }}</div>
+                  <div class="asset-mini" v-if="c.note && c.note !== c.bio">备注：{{ c.note }}</div>
+                </div>
+              </n-collapse-item>
+            </n-collapse>
           </div>
           <div class="asset-col">
             <div class="asset-h"><n-icon :component="LocationOutline" /> 场景 <span class="tg sc">#</span></div>
@@ -351,6 +390,14 @@ const shotColumns = [
 .bible-k {
   color: var(--app-text-muted);
   margin-right: 8px;
+}
+.asset-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
 }
 .asset-cols {
   display: grid;

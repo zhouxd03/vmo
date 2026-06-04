@@ -26,6 +26,7 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
+from ..core import settings as settings_store
 from ..core.paths import OUTPUT_DIR, PROJECTS_DIR
 from . import ffmpeg_util
 
@@ -496,6 +497,18 @@ def build_draft(pid: str, draft_name: str, items: list) -> Path:
         json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
     (draft_dir / "draft_meta_info.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # If the user configured 剪映's draft directory, install the draft folder
+    # there directly so it appears in Jianying/CapCut without manual unzipping.
+    # A zip backup is still generated and returned to the browser as before.
+    draft_root = (settings_store.load_settings().get("jianying_draft_dir") or "").strip()
+    if draft_root:
+        target_root = Path(draft_root).expanduser()
+        target_root.mkdir(parents=True, exist_ok=True)
+        target_dir = target_root / safe_name
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        shutil.copytree(draft_dir, target_dir)
 
     zip_path = base / f"{safe_name}.zip"
     if zip_path.exists():

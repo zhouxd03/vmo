@@ -16,11 +16,13 @@ import { useProjectStore } from './project'
 let batchTimer = null
 let batchClock = null
 let decomposeTimer = null
+let batchPollStart = 0
 
-// Batch generation is slow (esp. video) so we don't hammer the server: the
-// first heavy status query fires after an initial delay, then on an interval.
-const BATCH_POLL_INITIAL_DELAY = 100_000
-const BATCH_POLL_INTERVAL = 20_000
+// Batch generation is slow (esp. video), but the UI must clear promptly when
+// a batch finishes. Poll quickly at first, then back off to avoid hammering.
+const BATCH_POLL_INITIAL_DELAY = 2_000
+const BATCH_POLL_INTERVAL = 15_000
+const BATCH_POLL_MAX_MINUTES_DEFAULT = 30
 const DECOMPOSE_POLL_INTERVAL = 1_000
 
 export const useTasksStore = defineStore('tasks', {
@@ -31,6 +33,8 @@ export const useTasksStore = defineStore('tasks', {
     batchActive: false,
     genStart: 0,        // ms timestamp when the current run began (0 = idle)
     nowTick: Date.now(), // advanced by a 1s clock so elapsed time stays live
+    batchPollMaxMinutes: BATCH_POLL_MAX_MINUTES_DEFAULT,
+    batchPollLastSetAt: 0,
 
     // ── script decompose (ScriptView) ──
     decomposeProjectId: null,
@@ -106,12 +110,17 @@ export const useTasksStore = defineStore('tasks', {
 
     // Start (or keep) the persistent batch polling loop. `immediate` forces a
     // one-shot refresh right away (used after the user starts a batch).
-    async ensureBatchPolling({ immediate = false } = {}) {
+    async ensureBatchPolling({ immediate = false, maxMinutes } = {}) {
+      if (Number.isFinite(Number(maxMinutes)) && Number(maxMinutes) > 0) {
+        this.batchPollMaxMinutes = Math.max(1, Number(maxMinutes))
+        this.batchPollLastSetAt = Date.now()
+      }
       if (immediate) await this.refreshBatches()
       this._startBatchTimers()
     },
 
     _startBatchTimers() {
+      if (!batchPollStart) batchPollStart = Date.now()
       if (!batchClock) {
         batchClock = setInterval(() => {
           if (this.batchActive) this.nowTick = Date.now()
@@ -124,6 +133,12 @@ export const useTasksStore = defineStore('tasks', {
 
     async _batchTick() {
       this.nowTick = Date.now()
+      const elapsedMs = batchPollStart ? (Date.now() - batchPollStart) : 0
+      const maxMs = Math.max(1, this.batchPollMaxMinutes || BATCH_POLL_MAX_MINUTES_DEFAULT) * 60 * 1000
+      if (elapsedMs > maxMs) {
+        this._stopBatchTimers()
+        return
+      }
       await this.refreshBatches()
       if (this.batchActive) {
         batchTimer = setTimeout(() => this._batchTick(), BATCH_POLL_INTERVAL)

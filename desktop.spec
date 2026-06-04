@@ -40,6 +40,7 @@ binaries = [
 
 hiddenimports = (
     collect_submodules("backend")
+    + ["webview"]
     + collect_submodules("webview")
     + ["clr_loader", "clr_loader.ffi"]
 )
@@ -54,7 +55,11 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=["tkinter", "PySide2", "PySide6", "PyQt5", "PyQt6", "matplotlib", "numpy.tests"],
-    noarchive=False,
+    # Keep Python modules as files instead of packing them only into PYZ.
+    # pywebview also ships a top-level "webview" resource directory; with PYZ-only
+    # packaging that data directory can shadow the real webview package at runtime,
+    # producing: module 'webview' has no attribute 'create_window'.
+    noarchive=True,
 )
 pyz = PYZ(a.pure)
 
