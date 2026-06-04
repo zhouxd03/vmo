@@ -17,7 +17,10 @@ import os
 from PyInstaller.utils.hooks import collect_submodules
 
 ROOT = os.path.abspath(os.getcwd())
-FFMPEG_BIN = r"C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin"
+FFMPEG_BIN = os.environ.get(
+    "FFMPEG_BIN",
+    r"C:\Users\ALO\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin",
+)
 ICON = os.path.join(ROOT, "desktop_assets", "app.ico")
 WEBVIEW2_SETUP = os.path.join(ROOT, "desktop_assets", "MicrosoftEdgeWebview2Setup.exe")
 

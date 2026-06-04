@@ -39,9 +39,9 @@ def create_app() -> Flask:
     # ── health / meta ──
     @app.route("/api/health")
     def health():
-        return jsonify({"ok": True, "service": "batch-studio", "version": "1.0.0"})
+        return jsonify({"ok": True, "service": "batch-studio", "version": "1.0.1"})
 
-    APP_VERSION = "1.0.0"
+    APP_VERSION = "1.0.1"
 
     @app.route("/api/logs")
     def logs():

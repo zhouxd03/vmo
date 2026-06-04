@@ -24,6 +24,12 @@ _STRUCTURED_SHOT_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 _SHOT_PREFIX_RE = re.compile(r"^(?:镜头|分镜|画面|场景|旁白|字幕|第\d+|\d+[.、)\]】）])")
+# Fixed explicit separators override paragraph blank lines when the source
+# text has its own empty-line formatting. The project uses only two canonical
+# markers:
+#   - <<<分镜标记>>>  (shot boundary)
+#   - <<<分集标记>>>  (episode boundary)
+_EXPLICIT_SPLIT_RE = re.compile(r"(?:^|\n)\s*(?:<<<\s*分镜标记\s*>>>|<<<\s*分集标记\s*>>>)\s*(?:\n|$)")
 
 
 def _strip_markup(line: str) -> str:
@@ -72,11 +78,24 @@ def _split_structured(text: str) -> list[str]:
     return [b for b in blocks if b]
 
 
+def _split_by_explicit_markers(text: str) -> list[str]:
+    """Split by explicit separators before falling back to blank lines.
+
+    This makes shot boundaries stable even when the source text itself contains
+    blank lines for prose formatting or dialogue spacing.
+    """
+    parts = _EXPLICIT_SPLIT_RE.split(text or "")
+    return [p.strip() for p in parts if p and p.strip()]
+
+
 def _parse_txt(text: str) -> list[str]:
     norm = _normalize(text)
     structured = _split_structured(norm)
     if len(structured) > 1:
         return structured
+    explicit = _split_by_explicit_markers(norm)
+    if len(explicit) > 1:
+        return explicit
     blocks = [b.strip() for b in norm.split("\n\n") if b.strip()]
     if len(blocks) > 1:
         return blocks
