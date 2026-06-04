@@ -42,7 +42,8 @@ _TRANSIENT_KEYS = (
     "timeout", "timed out", "temporarily", "temporary", "try again",
     "rate limit", "ratelimit", "too many requests", "overloaded", "busy",
     "connection", "reset by peer", "bad gateway", "service unavailable",
-    "gateway timeout", "超时", "稍后", "重试", "繁忙", "限流", "网络",
+    "gateway timeout", "upstream_unavailable", "fail_to_fetch_task",
+    "task not found", "任务查询", "任务获取", "超时", "稍后", "重试", "繁忙", "限流", "网络",
 )
 
 _META = {

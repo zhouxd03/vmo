@@ -4,14 +4,14 @@ import { useRouter } from 'vue-router'
 import {
   NSelect, NButton, NIcon, NEmpty, NInput, NTag, NImage, NSwitch, NTooltip,
   NModal, NCard, NSpace, NInputNumber, NScrollbar, NBadge, NPopover, NDropdown,
-  NDrawer, NDrawerContent, NProgress, NSpin,
+  NDrawer, NDrawerContent, NProgress, NSpin, NCheckbox, NCheckboxGroup,
   useMessage,
 } from 'naive-ui'
 import {
   ImageOutline, VideocamOutline, LockClosedOutline, LockOpenOutline,
   SparklesOutline, AlbumsOutline, CubeOutline, EyeOutline, PlayOutline,
   DownloadOutline, RefreshOutline, SettingsOutline, ColorWandOutline,
-  FilmOutline, AddOutline, FlashOutline, ChevronDownOutline, GitMergeOutline,
+  FilmOutline, AddOutline, FlashOutline, ChevronDownOutline, ChevronForwardOutline, GitMergeOutline,
   ExpandOutline, CheckmarkCircleOutline, AlertCircleOutline, TimeOutline,
   SyncOutline, HourglassOutline,
 } from '@vicons/ionicons5'
@@ -30,8 +30,9 @@ const tasks = useTasksStore()
 // batch list lives in the global tasks store so polling/progress survive tab
 // switches (§8.2). This view just reads it and derives per-episode materials.
 const batches = computed(() => tasks.batches)
-const rowState = reactive({})    // shot_no -> { promptDraft, chosen, running }
+const rowState = reactive({})    // shot_no -> { imagePrompt, videoPrompt, chosen, running, mode }
 const locks = ref(new Set())     // locked shot_no (skipped in batch)
+const inferAllRunning = ref(false) // 批量 AI 推理进行中
 
 // live generation status (per shot) + overall progress of active batches
 const statusByShot = reactive({}) // shot_no -> { status, attempts, error, kind, decision, updated }
@@ -47,7 +48,62 @@ const tb = reactive({
   continuity: false,
   continuityMode: 'auto',
   aiReview: true,
+  decisionLlm: true,  // 默认直接开启 LLM 升级决策（无凭据时后端自动回退规则）
+  batchPollMaxMinutes: 30,
 })
+const TB_STORAGE_PREFIX = 'wt:tb:'
+function tbStorageKey(pid = store.currentId) { return `${TB_STORAGE_PREFIX}${pid || 'none'}` }
+function saveTb() {
+  try {
+    if (!store.currentId) return
+    localStorage.setItem(tbStorageKey(), JSON.stringify({
+      imageSize: tb.imageSize,
+      duration: tb.duration,
+      resolution: tb.resolution,
+      aspect: tb.aspect,
+      model: tb.model,
+      continuity: tb.continuity,
+      continuityMode: tb.continuityMode,
+      aiReview: tb.aiReview,
+      decisionLlm: tb.decisionLlm,
+      batchPollMaxMinutes: tb.batchPollMaxMinutes,
+    }))
+  } catch { /* ignore */ }
+}
+function loadTb() {
+  try {
+    const raw = localStorage.getItem(tbStorageKey())
+    if (!raw) return
+    const data = JSON.parse(raw)
+    if (!data || typeof data !== 'object') return
+    Object.assign(tb, {
+      imageSize: data.imageSize || tb.imageSize,
+      duration: Number.isFinite(Number(data.duration)) ? Number(data.duration) : tb.duration,
+      resolution: data.resolution || tb.resolution,
+      aspect: data.aspect || tb.aspect,
+      model: typeof data.model === 'string' ? data.model : tb.model,
+      continuity: data.continuity !== undefined ? !!data.continuity : tb.continuity,
+      continuityMode: data.continuityMode || tb.continuityMode,
+      aiReview: data.aiReview !== undefined ? !!data.aiReview : tb.aiReview,
+      decisionLlm: data.decisionLlm !== undefined ? !!data.decisionLlm : tb.decisionLlm,
+      batchPollMaxMinutes: Number.isFinite(Number(data.batchPollMaxMinutes)) ? Number(data.batchPollMaxMinutes) : tb.batchPollMaxMinutes,
+    })
+  } catch { /* ignore */ }
+}
+function resetTb() {
+  Object.assign(tb, {
+    imageSize: '1024x1024',
+    duration: 10,
+    resolution: '720p',
+    aspect: '16:9',
+    model: '',
+    continuity: false,
+    continuityMode: 'auto',
+    aiReview: true,
+    decisionLlm: true,
+    batchPollMaxMinutes: 30,
+  })
+}
 
 const sizeOptions = ['1024x1024', '1280x720', '720x1280'].map((v) => ({ label: v, value: v }))
 const resOptions = ['720p', '1080p'].map((v) => ({ label: v, value: v }))
@@ -62,8 +118,12 @@ const videoModelOptions = [
 onMounted(async () => {
   await store.refreshList()
   if (!store.current && store.projects.length) await store.select(store.projects[0].id)
+  loadTb()
   await reload()
 })
+
+watch(() => store.currentId, () => { loadTb() })
+watch(tb, () => saveTb(), { deep: true })
 // NOTE: we intentionally do NOT stop polling on unmount — the tasks store keeps
 // polling across tab switches so an in-flight batch keeps updating (§8.2).
 
@@ -76,8 +136,12 @@ const shots = computed(() => episode.value?.shots || [])
 // ensure a row-state entry exists for every shot BEFORE render (avoid undefined access)
 function ensureRows(list) {
   ;(list || []).forEach((s) => {
-    if (!rowState[s.shot_no]) rowState[s.shot_no] = { promptDraft: '', chosen: null, running: false, mode: 'image' }
-    else if (!rowState[s.shot_no].mode) rowState[s.shot_no].mode = 'image'
+    if (!rowState[s.shot_no]) rowState[s.shot_no] = { imagePrompt: '', videoPrompt: '', chosen: null, running: false, inferring: false, mode: 'image' }
+    else {
+      if (!rowState[s.shot_no].mode) rowState[s.shot_no].mode = 'image'
+      if (rowState[s.shot_no].imagePrompt === undefined) rowState[s.shot_no].imagePrompt = ''
+      if (rowState[s.shot_no].videoPrompt === undefined) rowState[s.shot_no].videoPrompt = ''
+    }
   })
 }
 
@@ -86,19 +150,136 @@ const modeTabs = [
   { key: 'video', label: '视频' },
   { key: 'sync', label: '同步后续' },
 ]
-function autoPrompt(s) {
-  // local auto-generated prompt from shot fields (no LLM needed)
-  return [s.camera, resolvedText(s)].filter(Boolean).join('，')
+// current-mode prompt accessors (image vs video are stored separately so each
+// mode keeps its own editable text)
+function promptField(no) { return rowState[no]?.mode === 'video' ? 'videoPrompt' : 'imagePrompt' }
+function currentPrompt(no) { return rowState[no]?.[promptField(no)] || '' }
+function setPrompt(no, val) { if (rowState[no]) rowState[no][promptField(no)] = val }
+
+// ── @ 引用缩略图：把当前提示词里的 @资产 解析为其参考图缩略图，支持单击放大
+// （n-image 内置灯箱）+ 长按拖动重排（重排会改写提示词里 @token 的先后顺序）──
+const assetList = ref([])
+async function loadAssets() {
+  if (!store.current) { assetList.value = []; return }
+  try { assetList.value = await api.listAssets(store.current.id) }
+  catch { assetList.value = [] }
 }
-function inferRow(no) {
-  const s = shots.value.find((x) => x.shot_no === no)
-  if (s) { rowState[no].promptDraft = autoPrompt(s); message.success(`已推理填充 ${no} 描述词`) }
+function escRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
+// ordered, de-duplicated refs present in the prompt. 严格映射：只渲染「资产库里确实
+// 存在、且已生成/导入参考图」的资产（a.ref_image 在 = 资产能被实际调用），否则回落
+// 纯文字、绝不臆造。匹配统一 @名，也兼容库分类符 #场景/$道具 与裸名，覆盖各类引用。
+function promptRefs(no) {
+  const text = currentPrompt(no)
+  if (!text || !assetList.value.length) return []
+  const out = []
+  // longest name first so 「@林夏」不会被「@林」抢先命中
+  const ordered = [...assetList.value].sort((a, b) => (b.name || '').length - (a.name || '').length)
+  for (const a of ordered) {
+    if (!a.ref_image || !a.name) continue
+    const name = escRe(a.name)
+    // @名（统一前缀）｜库分类符 #/$ + 名｜裸名
+    const re = new RegExp('(?:@|' + escRe(a.trigger || '') + ')?' + name)
+    const m = re.exec(text)
+    if (m) out.push({
+      name: a.name, trigger: a.trigger, type: a.type,
+      url: api.assetImageUrl(store.current.id, a.ref_image), idx: m.index,
+    })
+  }
+  return out.sort((x, y) => x.idx - y.idx)
 }
-function inferAll() {
+// drag-reorder state (long-press / press-drag): {no, from}
+const dragRef = reactive({ no: null, from: -1, over: -1 })
+function onRefDragStart(no, idx, ev) {
+  dragRef.no = no; dragRef.from = idx; dragRef.over = idx
+  if (ev?.dataTransfer) { ev.dataTransfer.effectAllowed = 'move' }
+}
+function onRefDragOver(no, idx) { if (dragRef.no === no) dragRef.over = idx }
+function onRefDrop(no, idx) {
+  if (dragRef.no !== no || dragRef.from < 0 || dragRef.from === idx) { resetDragRef(); return }
+  reorderRefs(no, dragRef.from, idx)
+  resetDragRef()
+}
+function resetDragRef() { dragRef.no = null; dragRef.from = -1; dragRef.over = -1 }
+// rewrite the prompt so the @tokens appear in the new order (first occurrences only)
+function reorderRefs(no, from, to) {
+  const refs = promptRefs(no)
+  if (from < 0 || from >= refs.length || to < 0 || to >= refs.length) return
+  const tokens = refs.map((r) => '@' + r.name)
+  const next = tokens.slice()
+  const [moved] = next.splice(from, 1)
+  next.splice(to, 0, moved)
+  const alt = refs.map((r) => escRe(r.name)).sort((a, b) => b.length - a.length).join('|')
+  const re = new RegExp('@(' + alt + ')', 'g')
+  let k = 0
+  const text = currentPrompt(no).replace(re, (m) => (k < next.length ? next[k++] : m))
+  setPrompt(no, text)
+}
+
+// Pull engine-grade image/video prompts from the backend (deterministic, no LLM
+// call, spends no credits) and drop them into the editable textboxes so the user
+// can see & adjust exactly what will be generated. `force` overwrites existing
+// text (explicit AI推理); otherwise only blanks are filled (default display).
+async function fillPrompts(shotNos, { force = false } = {}) {
+  if (!store.current || !shotNos.length) return 0
+  let res
+  try {
+    res = await api.previewShotPrompts(store.current.id, {
+      episode_id: store.currentEpisodeId, shot_nos: shotNos,
+    })
+  } catch (e) { message.error('提示词推理失败：' + e.message); return 0 }
+  const prompts = res?.prompts || {}
   let n = 0
-  shots.value.forEach((s) => { if (!locks.value.has(s.shot_no)) { rowState[s.shot_no].promptDraft = autoPrompt(s); n++ } })
-  message.success(`已批量推理填充 ${n} 镜描述词`)
+  shotNos.forEach((no) => {
+    const r = rowState[no]; const p = prompts[no]
+    if (!r || !p) return
+    if (force || !(r.imagePrompt || '').trim()) r.imagePrompt = p.image || ''
+    if (force || !(r.videoPrompt || '').trim()) r.videoPrompt = p.video || ''
+    n++
+  })
+  return n
 }
+// 真·LLM 逐镜推理：调用 /infer_shot_prompt，喂入连续性(上一镜 handoff)+本镜关联资产
+// 说明+结构字段，产出干净规范的图片/视频提示词并回填（覆盖）。失败自动后端兜底确定性合成。
+async function inferShot(no) {
+  const r = rowState[no]
+  if (!r || !store.current) return null
+  const res = await api.inferShotPrompt(store.current.id, {
+    episode_id: store.currentEpisodeId, shot_no: no,
+  })
+  if (res.image) r.imagePrompt = res.image
+  if (res.video) r.videoPrompt = res.video
+  return res
+}
+async function inferRow(no) {
+  const r = rowState[no]
+  if (!r) return
+  r.inferring = true
+  try {
+    const res = await inferShot(no)
+    if (res?.source === 'fallback') message.warning(`${no}：LLM 推理失败，已用确定性合成兜底`)
+    else message.success(`已 AI 推理 ${no} 图片/视频提示词`)
+    await reload()
+  } catch (e) { message.error('AI 推理失败：' + e.message) }
+  finally { r.inferring = false }
+}
+async function inferAll() {
+  const targets = shots.value.map((s) => s.shot_no).filter((no) => !locks.value.has(no))
+  if (!targets.length) return
+  inferAllRunning.value = true
+  let ok = 0, fb = 0
+  for (const no of targets) {                 // 串行，避免并发打爆中转站
+    const r = rowState[no]; if (!r) continue
+    r.inferring = true
+    try {
+      const res = await inferShot(no)
+      res?.source === 'fallback' ? fb++ : ok++
+    } catch { fb++ } finally { r.inferring = false }
+  }
+  inferAllRunning.value = false
+  message.success(`AI 推理完成：成功 ${ok}${fb ? `，兜底 ${fb}` : ''}（共 ${targets.length} 镜）`)
+  await reload()
+}
+
 watch(shots, (list) => ensureRows(list), { immediate: true })
 
 watch(() => store.currentEpisodeId, () => { loadLocks(); reload() })
@@ -124,9 +305,12 @@ async function reload() {
   if (!store.current) return
   loadLocks()
   ensureRows(shots.value)
+  loadAssets()
   tasks.setBatchProject(store.current.id)
   await tasks.refreshBatches()
   await rebuildMaterials()
+  // show prompts by default (fill only blanks; keep any user edits)
+  await fillPrompts(shots.value.map((s) => s.shot_no))
   // if a batch is already running (e.g. started before we navigated here), the
   // store keeps polling so its progress stays live.
   if (tasks.batchActive) tasks.ensureBatchPolling()
@@ -207,13 +391,17 @@ async function rebuildMaterials() {
   }
   // commit status badges incrementally
   for (const no of Object.keys(statusByShot)) { if (!(no in st)) delete statusByShot[no] }
+  let hasStatusChange = false
   for (const no of Object.keys(st)) {
     const cur = statusByShot[no]
     if (!cur || cur.status !== st[no].status || cur.error !== st[no].error
+        || cur.attempts !== st[no].attempts
         || (cur.decision?.use_tail_frame) !== (st[no].decision?.use_tail_frame)) {
       statusByShot[no] = st[no]
+      hasStatusChange = true
     }
   }
+  if (hasStatusChange) notifyNewErrors()
   genProgress.active = pgActive
   genProgress.done = pgDone
   genProgress.total = pgTotal
@@ -233,7 +421,12 @@ function statusMeta(no) { return STATUS_META[statusByShot[no]?.status] || null }
 function decisionLabel(no) {
   const d = statusByShot[no]?.decision
   if (!d) return ''
-  return d.use_tail_frame ? '承接上一镜尾帧' : '首镜直生'
+  const source = d.source === 'llm' ? 'LLM' : '规则'
+  const strategy = d.strategy ? `·${d.strategy}` : ''
+  if (d.use_tail_frame) return `${source}${strategy}｜承接上一镜尾帧`
+  if (d.use_staging) return `${source}${strategy}｜站位图`
+  if (d.use_director_board) return `${source}${strategy}｜导演图`
+  return `${source}${strategy}｜首镜直生`
 }
 const genPercent = computed(() => genProgress.total ? Math.round((genProgress.done / genProgress.total) * 100) : 0)
 const elapsedText = computed(() => {
@@ -244,6 +437,32 @@ const elapsedText = computed(() => {
   const m = Math.floor(s / 60)
   return m ? `${m}分${s % 60}秒` : `${s}秒`
 })
+function shotProgressText(no) {
+  const st = statusByShot[no]
+  if (!st) return ''
+  const bits = []
+  if (genProgress.total) bits.push(`${genProgress.done}/${genProgress.total}`)
+  if (st.attempts) bits.push(`第${st.attempts}次`)
+  if (tasks.genStart && ['running', 'pending'].includes(st.status)) bits.push(elapsedText.value)
+  return bits.join(' · ')
+}
+function statusTitle(no) {
+  const st = statusByShot[no]
+  if (!st) return ''
+  if (st.status === 'error') return st.error || '生成失败，请检查提示词/参数后手动重新提交'
+  return `当前进度：${genProgress.done}/${genProgress.total || 0}，已用时：${elapsedText.value}`
+}
+const notifiedErrors = new Set()
+function notifyNewErrors() {
+  for (const [no, st] of Object.entries(statusByShot)) {
+    if (st?.status !== 'error' || !st.error) continue
+    const key = `${no}:${st.kind}:${st.updated}:${st.error}`
+    if (notifiedErrors.has(key)) continue
+    notifiedErrors.add(key)
+    const prefix = st.kind === 'video' ? '视频生成失败' : '生成失败'
+    message.error(`${prefix}：${no}。已停止自动重试，请修改提示词或参数后手动重新生成。${st.error}`)
+  }
+}
 
 function isVideoFile(fn) { return /\.(mp4|webm|mov)$/i.test(fn || '') }
 function matUrl(m) { return api.outputUrl(store.current.id, m.bid, m.filename) }
@@ -269,6 +488,53 @@ function openViewer(no) {
   showViewer.value = true
 }
 
+// ordered playlist viewer: one player, play all shots sequentially for continuity checks
+const showPlaylist = ref(false)
+const playlistIndex = ref(0)
+const playlistItems = computed(() =>
+  shots.value
+    .map((s) => ({ shot_no: s.shot_no, material: currentMaterial(s.shot_no) }))
+    .filter((it) => it.material))
+const playlistCurrent = computed(() => playlistItems.value[playlistIndex.value] || null)
+const PLAYLIST_IMAGE_SECONDS = 3.5
+let playlistTimer = null
+function clearPlaylistTimer() {
+  if (playlistTimer) { clearTimeout(playlistTimer); playlistTimer = null }
+}
+function schedulePlaylistAdvance() {
+  clearPlaylistTimer()
+  const cur = playlistCurrent.value
+  if (!showPlaylist.value || !cur?.material) return
+  if (isVideoFile(cur.material.filename)) return
+  playlistTimer = setTimeout(() => {
+    playlistNext()
+  }, Math.max(800, PLAYLIST_IMAGE_SECONDS * 1000))
+}
+function openPlaylist() {
+  if (!playlistItems.value.length) { message.warning('当前没有可播放的分镜素材'); return }
+  playlistIndex.value = 0
+  showPlaylist.value = true
+  schedulePlaylistAdvance()
+}
+function playlistPrev() {
+  if (!playlistItems.value.length) return
+  playlistIndex.value = (playlistIndex.value - 1 + playlistItems.value.length) % playlistItems.value.length
+  schedulePlaylistAdvance()
+}
+function playlistNext() {
+  if (!playlistItems.value.length) return
+  playlistIndex.value = (playlistIndex.value + 1) % playlistItems.value.length
+  schedulePlaylistAdvance()
+}
+function onPlaylistEnded() { playlistNext() }
+function jumpPlaylist(no) {
+  const idx = playlistItems.value.findIndex((it) => it.shot_no === no)
+  if (idx >= 0) {
+    playlistIndex.value = idx
+    schedulePlaylistAdvance()
+  }
+}
+
 // col4: existing materials padded with empty placeholder slots (min 6, scrollable multi-select)
 function optSlots(no) {
   const list = materialsByShot[no] || []
@@ -277,10 +543,38 @@ function optSlots(no) {
   return [...list, ...Array(pad).fill(null)]
 }
 
-function resolvedText(s) {
-  // human-readable subtitle/source for the shot
-  return s.action || s.dialogue || s.scene || ''
+// ── col1 序号/字幕 文本处理 ──
+// 分镜的 scene/characters/props 由拆解模板带 #/@/$ 前缀存储；展示时先去掉已有
+// 前缀再补一个，避免「##深山密林 / @@主角」这类双重符号。
+function stripMark(v) { return String(v == null ? '' : v).replace(/^[\s#@$＠＃＄]+/, '').trim() }
+function fmtScene(v) { const n = stripMark(v); return n ? '#' + n : '' }
+function fmtChar(v) { const n = stripMark(v); return n ? '@' + n : '' }
+function fmtProp(v) { const n = stripMark(v); return n ? '$' + n : '' }
+
+// 字幕：优先台词（真正的字幕），其次动作描述；去掉「画面展示/镜头展示」等冗余引导词。
+const _LEAD_FILLER = /^(画面|镜头|本镜|此镜|该镜)?(展示|呈现|显示|表现|描绘|描述|刻画|出现)[：:，,]?/
+function subtitleText(s) {
+  let t = (s.dialogue && s.dialogue.trim()) || (s.action || '').trim() || stripMark(s.scene)
+  return t.replace(_LEAD_FILLER, '').trim()
 }
+function actionText(s) {
+  // 当字幕取自台词时，额外显示动作行作为画面说明（去冗余引导词）
+  if (!(s.dialogue && s.dialogue.trim())) return ''
+  return (s.action || '').trim().replace(_LEAD_FILLER, '').trim()
+}
+
+// 原文：按 shot.seq 关联到本集解析后的源片段文本，供逐镜对照。
+const segMap = computed(() => {
+  const m = {}
+  const segs = episode.value?.segments || episode.value?.parsed?.segments || []
+  for (const sg of segs) if (sg.seq != null) m[sg.seq] = sg.text || ''
+  return m
+})
+// 优先用拆解时按内容确定性匹配落库的 src_text（保证与本镜真正出处一致）；
+// 旧数据无 src_text 时回退按 seq 关联源片段。
+function sourceText(s) { return (s.src_text && s.src_text.trim()) || (s.seq != null && segMap.value[s.seq]) || '' }
+const openSrc = reactive({})   // shot_no -> bool (展开原文)
+function toggleSrc(no) { openSrc[no] = !openSrc[no] }
 
 // ── generation ──
 function buildParams(kind) {
@@ -289,15 +583,19 @@ function buildParams(kind) {
     : { size: tb.imageSize }
   if (tb.model) p.model = tb.model
   if (kind === 'video' && tb.continuity) {
-    Object.assign(p, { continuity: true, mode: tb.continuityMode, ai_review: tb.aiReview })
+    Object.assign(p, {
+      continuity: true, mode: tb.continuityMode, ai_review: tb.aiReview,
+      decision_llm: tb.decisionLlm,
+    })
   }
   return p
 }
 
-function overridesFor(shotNos) {
+function overridesFor(shotNos, kind) {
+  const field = kind === 'video' ? 'videoPrompt' : 'imagePrompt'
   const o = {}
   shotNos.forEach((no) => {
-    const d = rowState[no]?.promptDraft
+    const d = rowState[no]?.[field]
     if (d && d.trim()) o[no] = d.trim()
   })
   return o
@@ -309,15 +607,17 @@ async function genRow(no, kind) {
     const b = await api.createBatch(store.current.id, {
       kind, source: 'shots', name: `${no}-${kind}`,
       episode_id: store.currentEpisodeId, shot_nos: [no],
-      prompt_overrides: overridesFor([no]),
+      prompt_overrides: overridesFor([no], kind),
       params: buildParams(kind), concurrency: 1,
     })
     await api.startBatch(store.current.id, b.id)
     message.success(`已提交 ${no} ${kind === 'video' ? '生视频' : '生图'}`)
     // surface the progress bar immediately; heavy polling (store) starts after 100s
-    await tasks.ensureBatchPolling({ immediate: true })
+    await tasks.ensureBatchPolling({ immediate: true, maxMinutes: tb.batchPollMaxMinutes })
+    await reload()
   } catch (e) {
     message.error(e.message)
+  } finally {
     rowState[no].running = false
   }
 }
@@ -329,13 +629,14 @@ async function genBatch(kind) {
     const b = await api.createBatch(store.current.id, {
       kind, source: 'shots', name: `${episode.value.name}-批量${kind === 'video' ? '生视频' : '生图'}`,
       episode_id: store.currentEpisodeId, shot_nos: targets,
-      prompt_overrides: overridesFor(targets),
+      prompt_overrides: overridesFor(targets, kind),
       params: buildParams(kind), concurrency: kind === 'video' && tb.continuity ? 1 : 2,
     })
     await api.startBatch(store.current.id, b.id)
     message.success(`已提交批量${kind === 'video' ? '生视频' : '生图'}（${targets.length} 镜${locks.value.size ? `，跳过 ${locks.value.size} 锁定` : ''}）`)
     // surface the progress bar immediately; heavy polling (store) starts after 100s
     await tasks.ensureBatchPolling({ immediate: true })
+    await reload()
   } catch (e) { message.error(e.message) }
 }
 
@@ -352,6 +653,43 @@ const batchMenuOptions = [
 function onBatchMenu(key) { genBatch(key) }
 function notImpl(name) { message.info(`「${name}」即将支持`) }
 
+// ── 多集并发生成：单集串行 · 多集并发（每集独立 tab + 进度徽标）──
+const showEpiGen = ref(false)
+const epiGen = reactive({ kind: 'image', maxParallel: 2, selected: [] })
+function epiShotCount(e) { return e.shot_count ?? (e.shots ? e.shots.length : 0) }
+const decomposedEpisodes = computed(() =>
+  (store.episodes || []).filter((e) => e.stage === 'decomposed' || epiShotCount(e) > 0))
+function openEpiGen() {
+  if (!decomposedEpisodes.value.length) { message.warning('没有已拆解的分集（请先在「剧本解析」拆解分镜）'); return }
+  epiGen.selected = decomposedEpisodes.value.map((e) => e.id)
+  showEpiGen.value = true
+}
+async function submitEpiGen() {
+  if (!epiGen.selected.length) { message.warning('请至少选择一个分集'); return }
+  // The worktable only holds edited prompts for the *current* episode; other
+  // episodes fall back to engine-default prompts (image desc / video template).
+  const episodes = epiGen.selected.map((eid) => {
+    const e = { episode_id: eid }
+    if (eid === store.currentEpisodeId) {
+      const targets = shots.value.map((s) => s.shot_no).filter((no) => !locks.value.has(no))
+      e.shot_nos = targets
+      e.prompt_overrides = overridesFor(targets, epiGen.kind)
+    }
+    return e
+  })
+  try {
+    const r = await api.createEpisodeBatches(store.current.id, {
+      kind: epiGen.kind, episodes, params: buildParams(epiGen.kind), max_parallel: epiGen.maxParallel,
+    })
+    showEpiGen.value = false
+    const n = r.created?.length || 0
+    const sk = r.skipped?.length ? `，跳过 ${r.skipped.length} 集` : ''
+    message.success(`已启动 ${n} 集并发${epiGen.kind === 'video' ? '生视频' : '生图'}（最多 ${r.max_parallel} 集同时运行，单集串行）${sk}`)
+    await tasks.ensureBatchPolling({ immediate: true })
+    await reload()
+  } catch (e) { message.error(e.message) }
+}
+
 // ── 导入剪映: export current episode's storyboard as a 剪映 draft (zip) ──
 const exportingJy = ref(false)
 async function exportJianying() {
@@ -363,7 +701,7 @@ async function exportJianying() {
     .map((s) => {
       const m = currentMaterial(s.shot_no)
       if (!m) return null
-      return { shot_no: s.shot_no, bid: m.bid, filename: m.filename, subtitle: resolvedText(s) }
+      return { shot_no: s.shot_no, bid: m.bid, filename: m.filename, subtitle: sourceText(s) || resolvedText(s) }
     })
     .filter(Boolean)
   if (!items.length) {
@@ -431,11 +769,18 @@ async function exportJianying() {
           <!-- col1 seq / subtitle -->
           <div class="c-seq">
             <div class="shot-no">{{ s.shot_no }}</div>
-            <div class="sub">{{ resolvedText(s) }}</div>
+            <div class="sub">{{ subtitleText(s) }}</div>
+            <div v-if="actionText(s)" class="sub-action">{{ actionText(s) }}</div>
             <div class="meta">
-              <n-tag v-if="s.scene" size="tiny" :bordered="false">#{{ s.scene }}</n-tag>
-              <n-tag v-for="c in (s.characters || [])" :key="c" size="tiny" :bordered="false" type="success">@{{ c }}</n-tag>
+              <n-tag v-if="fmtScene(s.scene)" size="tiny" :bordered="false">{{ fmtScene(s.scene) }}</n-tag>
+              <n-tag v-for="c in (s.characters || [])" :key="c" size="tiny" :bordered="false" type="success">{{ fmtChar(c) }}</n-tag>
+              <n-tag v-for="pp in (s.props || [])" :key="pp" size="tiny" :bordered="false" type="warning">{{ fmtProp(pp) }}</n-tag>
             </div>
+            <button v-if="sourceText(s)" class="src-toggle" @click="toggleSrc(s.shot_no)">
+              <n-icon :component="openSrc[s.shot_no] ? ChevronDownOutline : ChevronForwardOutline" />
+              原文
+            </button>
+            <div v-if="openSrc[s.shot_no] && sourceText(s)" class="src-text">{{ sourceText(s) }}</div>
           </div>
 
           <!-- col2 prompt + controls (xingyao-style borderless) -->
@@ -447,9 +792,38 @@ async function exportJianying() {
                 @click="rowState[s.shot_no].mode = t.key"
               >{{ t.label }}</button>
             </div>
+            <!-- @引用参考图缩略图：移到提示词框上方作「本镜引用」图例；仅渲染资产库里
+                 校验一致（确实能被调用、已有参考图）的资产，仅作附加显示不传输到生成端。
+                 单击放大（n-image 内置灯箱）/ 长按拖动重排。 -->
+            <div v-if="promptRefs(s.shot_no).length" class="ref-strip">
+              <span class="ref-strip-cap" title="仅显示资产库中校验一致、可被调用的引用；缩略图不会传输到生成端">本镜引用</span>
+              <div
+                v-for="(r, ri) in promptRefs(s.shot_no)"
+                :key="r.name"
+                class="ref-thumb"
+                :class="{ dragging: dragRef.no === s.shot_no && dragRef.from === ri, dropover: dragRef.no === s.shot_no && dragRef.over === ri && dragRef.from !== ri }"
+                draggable="true"
+                :title="`${r.trigger || '@'}${r.name}（长按拖动可调整顺序 · 单击放大）`"
+                @dragstart="onRefDragStart(s.shot_no, ri, $event)"
+                @dragover.prevent="onRefDragOver(s.shot_no, ri)"
+                @drop.prevent="onRefDrop(s.shot_no, ri)"
+                @dragend="resetDragRef"
+              >
+                <n-image
+                  :src="r.url"
+                  :width="40"
+                  :height="40"
+                  object-fit="cover"
+                  class="ref-img"
+                  :draggable="false"
+                />
+                <span class="ref-name">{{ r.trigger || '@' }}{{ r.name }}</span>
+              </div>
+            </div>
             <textarea
               class="prompt-area"
-              v-model="rowState[s.shot_no].promptDraft"
+              :value="currentPrompt(s.shot_no)"
+              @input="setPrompt(s.shot_no, $event.target.value)"
               :placeholder="`${rowState[s.shot_no].mode === 'video' ? '视频' : '图片'}提示词，输入 @ 引用角色，# 引用场景，$ 引用物品…`"
             ></textarea>
             <div class="ctl">
@@ -465,7 +839,7 @@ async function exportJianying() {
                 <n-button size="tiny" quaternary @click="notImpl('尾帧')"><template #icon><n-icon :component="AddOutline" /></template>尾帧</n-button>
               </template>
               <div class="ctl-right">
-                <n-button size="tiny" @click="inferRow(s.shot_no)">
+                <n-button size="tiny" :loading="rowState[s.shot_no].inferring" @click="inferRow(s.shot_no)">
                   <template #icon><n-icon :component="SparklesOutline" /></template>AI推理
                 </n-button>
                 <n-button v-if="rowState[s.shot_no].mode === 'image'" size="tiny" type="primary" :loading="rowState[s.shot_no].running" @click="genRow(s.shot_no, 'image')">
@@ -482,19 +856,21 @@ async function exportJianying() {
           <div class="c-cur">
             <div class="cur-top">
               <template v-if="statusMeta(s.shot_no)">
-                <n-tooltip v-if="statusByShot[s.shot_no].status === 'error'" trigger="hover">
+                <n-tooltip trigger="hover">
                   <template #trigger>
-                    <span class="st-badge st-error">
-                      <n-icon :component="AlertCircleOutline" /> 失败
+                    <span class="st-badge" :class="`st-${statusByShot[s.shot_no].status}`">
+                      <n-spin v-if="statusByShot[s.shot_no].status === 'running'" :size="11" />
+                      <n-icon v-else :component="statusMeta(s.shot_no).icon" />
+                      <span>{{ statusMeta(s.shot_no).label }}</span>
+                      <small v-if="shotProgressText(s.shot_no)">{{ shotProgressText(s.shot_no) }}</small>
                     </span>
                   </template>
-                  {{ statusByShot[s.shot_no].error || '生成失败' }}
+                  <div class="st-tip">
+                    <div>{{ statusTitle(s.shot_no) }}</div>
+                    <div v-if="statusByShot[s.shot_no].kind">类型：{{ statusByShot[s.shot_no].kind === 'video' ? '视频' : '图片' }}</div>
+                    <div v-if="decisionLabel(s.shot_no)">{{ decisionLabel(s.shot_no) }}</div>
+                  </div>
                 </n-tooltip>
-                <span v-else class="st-badge" :class="`st-${statusByShot[s.shot_no].status}`">
-                  <n-spin v-if="statusByShot[s.shot_no].status === 'running'" :size="11" />
-                  <n-icon v-else :component="statusMeta(s.shot_no).icon" />
-                  {{ statusMeta(s.shot_no).label }}
-                </span>
                 <span v-if="statusByShot[s.shot_no].kind === 'video' && decisionLabel(s.shot_no)" class="st-decision">
                   {{ decisionLabel(s.shot_no) }}
                 </span>
@@ -507,9 +883,12 @@ async function exportJianying() {
               <template v-if="currentMaterial(s.shot_no)">
                 <video v-if="isVideoFile(currentMaterial(s.shot_no).filename)" :src="matUrl(currentMaterial(s.shot_no))" muted controls class="cur-media" />
                 <n-image v-else :src="matUrl(currentMaterial(s.shot_no))" class="cur-media" object-fit="cover" />
-                <button class="view-btn" :title="isVideoFile(currentMaterial(s.shot_no).filename) ? '查看视频' : '查看大图'" @click.stop="openViewer(s.shot_no)">
-                  <n-icon :component="isVideoFile(currentMaterial(s.shot_no).filename) ? PlayOutline : ExpandOutline" />
-                </button>
+                <div v-if="!isVideoFile(currentMaterial(s.shot_no).filename)" class="preview-actions">
+                  <button class="view-btn" title="查看大图" @click.stop="openViewer(s.shot_no)">
+                    <n-icon :component="ExpandOutline" />
+                    <span>预览</span>
+                  </button>
+                </div>
                 <span v-if="isVideoFile(currentMaterial(s.shot_no).filename)" class="vid-badge">视频</span>
               </template>
             </div>
@@ -540,7 +919,8 @@ async function exportJianying() {
       <div class="toolbar">
         <div class="pill">
           <button class="pbtn" @click="router.push('/assets')"><n-icon :component="CubeOutline" /><span>资产库</span></button>
-          <button class="pbtn" @click="showPreview = true"><n-icon :component="EyeOutline" /><span>预览</span></button>
+          <button class="pbtn" @click="showPreview = true"><n-icon :component="EyeOutline" /><span>分镜预览</span></button>
+          <button class="pbtn accent" :disabled="!playlistItems.length" @click="openPlaylist"><n-icon :component="PlayOutline" /><span>顺播检查</span></button>
           <button class="pbtn" @click="router.push('/templates')"><n-icon :component="ColorWandOutline" /><span>自定义指令</span></button>
           <button class="pbtn" @click="showPipeline = true"><n-icon :component="GitMergeOutline" /><span>连续性</span></button>
           <n-popover trigger="click" placement="top">
@@ -553,14 +933,20 @@ async function exportJianying() {
               <div class="pp-row"><span class="pp-l">分辨率</span><n-select size="small" v-model:value="tb.resolution" :options="resOptions" style="width: 150px" /></div>
               <div class="pp-row"><span class="pp-l">画幅</span><n-select size="small" v-model:value="tb.aspect" :options="aspectOptions" style="width: 150px" /></div>
               <div class="pp-row"><span class="pp-l">模型</span><n-input size="small" v-model:value="tb.model" placeholder="留空用默认" style="width: 150px" /></div>
+              <div class="pp-row"><span class="pp-l">轮询最长分钟数</span><n-input-number size="small" v-model:value="tb.batchPollMaxMinutes" :min="5" :max="180" style="width: 150px" /> </div>
               <div class="pp-row"><span class="pp-l">连续性</span><n-switch size="small" v-model:value="tb.continuity" /></div>
-              <div class="pp-tip">开启连续性：视频批次串行执行，承接上一镜尾帧（跨集亦承接上一集末镜）。</div>
+              <div class="pp-row" v-if="tb.continuity"><span class="pp-l">LLM升级决策</span><n-switch size="small" v-model:value="tb.decisionLlm" /></div>
+              <div class="pp-actions">
+                <n-button size="small" quaternary @click="resetTb">恢复默认</n-button>
+                <span class="pp-tip">开启连续性：视频批次串行执行。LLM升级决策默认开启：每镜由 LLM 在切镜头、尾帧、站位图、导演图等策略中平权判断，按剧情连续性选择最自然的衔接方式；无凭据时自动回退规则。</span>
+              </div>
             </div>
           </n-popover>
-          <button class="pbtn" @click="inferAll"><n-icon :component="SparklesOutline" /><span>批量推理</span></button>
+          <button class="pbtn" :disabled="inferAllRunning" @click="inferAll"><n-icon :component="SparklesOutline" /><span>{{ inferAllRunning ? 'AI推理中…' : 'AI推理全部' }}</span></button>
           <n-dropdown trigger="click" placement="top" :options="batchMenuOptions" @select="onBatchMenu">
             <button class="pbtn accent"><n-icon :component="FlashOutline" /><span>批量生成</span><n-icon :component="ChevronDownOutline" size="12" /></button>
           </n-dropdown>
+          <button class="pbtn" @click="openEpiGen"><n-icon :component="AlbumsOutline" /><span>多集并发</span></button>
           <button class="pbtn" :disabled="exportingJy" @click="exportJianying"><n-icon :component="FilmOutline" /><span>{{ exportingJy ? '导出中…' : '导入剪映' }}</span></button>
           <span v-if="locks.size" class="lock-pill">🔒 {{ locks.size }}</span>
         </div>
@@ -598,17 +984,103 @@ async function exportJianying() {
       </n-card>
     </n-modal>
 
+    <!-- ordered playlist viewer (single-player sequential playback) -->
+    <n-modal v-model:show="showPlaylist">
+      <n-card style="width: min(96vw, 1280px)" :title="`顺播检查 · ${episode?.name || ''}（${playlistItems.length} 段）`" :bordered="false" role="dialog" closable @close="clearPlaylistTimer(); showPlaylist = false">
+        <div class="playlist-shell" v-if="playlistCurrent">
+          <div class="playlist-player">
+            <div class="playlist-stage">
+              <video
+                v-if="isVideoFile(playlistCurrent.material.filename)"
+                :src="matUrl(playlistCurrent.material)"
+                controls autoplay
+                class="playlist-media"
+                @ended="onPlaylistEnded"
+              />
+              <img v-else :src="matUrl(playlistCurrent.material)" class="playlist-media" />
+              <div class="playlist-overlay">
+                <span class="playlist-shot">{{ playlistCurrent.shot_no }}</span>
+                <span class="playlist-type">{{ isVideoFile(playlistCurrent.material.filename) ? '视频' : '图片' }}</span>
+              </div>
+            </div>
+            <div class="playlist-nav">
+              <button class="nav-btn" @click="playlistPrev">上一段</button>
+              <button class="nav-btn" @click="schedulePlaylistAdvance">继续自动播放</button>
+              <button class="nav-btn" @click="playlistNext">下一段</button>
+              <button class="nav-btn primary" @click="clearPlaylistTimer(); showPlaylist = false">关闭</button>
+            </div>
+          </div>
+          <div class="playlist-list">
+            <button
+              v-for="(it, idx) in playlistItems"
+              :key="it.shot_no"
+              class="plist-item"
+              :class="{ active: idx === playlistIndex }"
+              @click="jumpPlaylist(it.shot_no)"
+            >
+              <span class="plist-no">{{ it.shot_no }}</span>
+              <span class="plist-kind">{{ isVideoFile(it.material.filename) ? '视频' : '图片' }}</span>
+            </button>
+          </div>
+        </div>
+      </n-card>
+    </n-modal>
+
     <!-- continuity pipeline drawer -->
     <n-drawer v-model:show="showPipeline" :width="760" placement="right">
       <n-drawer-content title="分镜流水线 · 连续性引擎" closable :native-scrollbar="false">
         <PipelineView />
       </n-drawer-content>
     </n-drawer>
+
+    <!-- 多集并发生成 modal -->
+    <n-modal v-model:show="showEpiGen">
+      <n-card style="width: 560px; max-width: 94vw" title="多集并发生成" :bordered="false" role="dialog" closable @close="showEpiGen = false">
+        <div class="epi-gen">
+          <div class="eg-row">
+            <span class="eg-label">生成类型</span>
+            <n-select v-model:value="epiGen.kind" style="width: 160px"
+              :options="[{ label: '生成图片', value: 'image' }, { label: '生成视频', value: 'video' }]" />
+          </div>
+          <div class="eg-row">
+            <span class="eg-label">最大并发集数</span>
+            <n-input-number v-model:value="epiGen.maxParallel" :min="1" :max="8" style="width: 120px" />
+            <span class="eg-hint">单集内串行，多集并行（越大越占内存）</span>
+          </div>
+          <div class="eg-row eg-top">
+            <span class="eg-label">选择分集</span>
+            <n-checkbox-group v-model:value="epiGen.selected" class="eg-eps">
+              <n-checkbox v-for="e in decomposedEpisodes" :key="e.id" :value="e.id">
+                {{ e.name }} · {{ epiShotCount(e) }}镜
+              </n-checkbox>
+            </n-checkbox-group>
+          </div>
+          <div class="eg-note">
+            仅当前分集会带上工作台已编辑/锁定的提示词；其余分集使用引擎默认提示词（视频按「视频生成提示词」模板合成）。
+          </div>
+        </div>
+        <template #footer>
+          <n-space justify="end">
+            <n-button @click="showEpiGen = false">取消</n-button>
+            <n-button type="primary" :disabled="!epiGen.selected.length" @click="submitEpiGen">
+              启动并发（{{ epiGen.selected.length }} 集）
+            </n-button>
+          </n-space>
+        </template>
+      </n-card>
+    </n-modal>
   </div>
 </template>
 
 <style scoped>
 .wt { display: flex; flex-direction: column; --wt-media-h: 200px; }
+.epi-gen { display: flex; flex-direction: column; gap: 16px; }
+.eg-row { display: flex; align-items: center; gap: 12px; }
+.eg-row.eg-top { align-items: flex-start; }
+.eg-label { width: 88px; flex-shrink: 0; font-size: 13px; color: var(--app-text-muted); }
+.eg-hint, .eg-note { font-size: 12px; color: var(--app-text-muted); }
+.eg-eps { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.eg-note { line-height: 1.6; padding: 8px 10px; border-radius: 8px; background: var(--app-bg-soft); }
 .row {
   display: grid;
   grid-template-columns: 260px minmax(0, 1fr) 230px 250px;
@@ -633,8 +1105,22 @@ async function exportJianying() {
 .row.locked { box-shadow: 0 0 0 1px color-mix(in srgb, #ffb454 50%, transparent) inset; }
 .c-seq { display: flex; flex-direction: column; gap: 6px; }
 .shot-no { font-family: var(--font-mono, monospace); font-weight: 800; color: var(--app-accent); font-size: 13px; }
-.sub { font-size: 12.5px; line-height: 1.5; color: var(--app-text); flex: 1; min-height: 60px; max-height: 150px; overflow: auto; }
+.sub { font-size: 12.5px; line-height: 1.5; color: var(--app-text); max-height: 150px; overflow: auto; }
+.sub-action { font-size: 11.5px; line-height: 1.45; color: var(--app-text-muted); margin-top: -2px; }
 .meta { display: flex; flex-wrap: wrap; gap: 4px; }
+.src-toggle {
+  align-self: flex-start; display: inline-flex; align-items: center; gap: 3px;
+  border: none; background: transparent; cursor: pointer; padding: 0;
+  font-size: 11px; color: var(--app-text-muted);
+}
+.src-toggle:hover { color: var(--app-accent); }
+.src-toggle :deep(.n-icon) { font-size: 12px; }
+.src-text {
+  font-size: 11.5px; line-height: 1.55; color: var(--app-text-secondary);
+  white-space: pre-wrap; background: var(--app-fill-2, rgba(255,255,255,.04));
+  border-left: 2px solid var(--app-accent); border-radius: 4px;
+  padding: 6px 8px; max-height: 160px; overflow: auto;
+}
 
 /* ── col2 描述词: borderless, fills the cell ── */
 .c-prompt { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
@@ -655,6 +1141,29 @@ async function exportJianying() {
   font-family: inherit; padding: 0;
 }
 .prompt-area::placeholder { color: var(--app-text-muted); }
+/* @引用缩略图条 */
+.ref-strip {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  padding: 2px 0 8px; align-items: center;
+}
+.ref-strip-cap {
+  font-size: 11px; color: var(--app-text-muted);
+  align-self: center; margin-right: 2px; white-space: nowrap;
+}
+.ref-thumb {
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  width: 48px; cursor: grab; user-select: none;
+  border-radius: 8px; padding: 3px; transition: background .15s, transform .12s, opacity .12s;
+}
+.ref-thumb:hover { background: var(--app-accent-soft); }
+.ref-thumb:active { cursor: grabbing; }
+.ref-thumb.dragging { opacity: .45; transform: scale(.94); }
+.ref-thumb.dropover { background: var(--app-accent-soft); box-shadow: inset 0 0 0 2px var(--app-accent); }
+.ref-img :deep(img) { border-radius: 6px; }
+.ref-name {
+  max-width: 46px; font-size: 10px; line-height: 1.1; text-align: center;
+  color: var(--app-text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .ctl { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .ctl-right { margin-left: auto; display: flex; align-items: center; gap: 6px; }
 
@@ -667,6 +1176,11 @@ async function exportJianying() {
   border: 1px solid transparent;
 }
 .st-badge :deep(.n-icon) { font-size: 12px; }
+.st-badge small {
+  font-size: 10px; font-weight: 600; opacity: .82;
+  padding-left: 3px; font-variant-numeric: tabular-nums;
+}
+.st-tip { max-width: 360px; white-space: pre-wrap; line-height: 1.6; }
 .st-pending { color: var(--app-text-secondary); background: color-mix(in srgb, var(--app-text-secondary) 12%, transparent); }
 .st-running { color: #4098fc; background: color-mix(in srgb, #4098fc 14%, transparent); }
 .st-done { color: #46c98b; background: color-mix(in srgb, #46c98b 16%, transparent); }
@@ -717,6 +1231,34 @@ async function exportJianying() {
 }
 .viewer-wrap { display: flex; align-items: center; justify-content: center; }
 .viewer-media { max-width: 86vw; max-height: 74vh; border-radius: 8px; display: block; }
+.playlist-shell {
+  display: grid; grid-template-columns: minmax(0, 1fr) 220px; gap: 12px;
+  align-items: stretch;
+}
+.playlist-player {
+  display: flex; flex-direction: column; gap: 10px;
+}
+.playlist-media {
+  width: 100%; max-height: 72vh; border-radius: 10px; object-fit: contain;
+  background: #000;
+}
+.playlist-nav { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+.nav-btn {
+  border: 1px solid var(--app-border); background: var(--app-bg-soft); color: var(--app-text);
+  padding: 6px 12px; border-radius: 999px; cursor: pointer;
+}
+.nav-btn.primary { background: var(--app-accent); color: #06210f; border-color: transparent; }
+.playlist-list {
+  max-height: 72vh; overflow: auto; padding-left: 4px; display: flex; flex-direction: column; gap: 6px;
+}
+.plist-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  width: 100%; border: 1px solid var(--app-border); background: var(--app-bg-soft);
+  color: var(--app-text); border-radius: 10px; padding: 8px 10px; cursor: pointer;
+}
+.plist-item.active { border-color: var(--app-accent); box-shadow: 0 0 0 1px var(--app-accent) inset; }
+.plist-no { font-weight: 700; font-family: var(--font-mono, monospace); }
+.plist-kind { font-size: 12px; color: var(--app-text-muted); }
 .pv-tag {
   margin-left: 6px; font-size: 10px; padding: 1px 5px; border-radius: 4px;
   background: rgba(33, 254, 132, 0.2); color: var(--app-accent); font-weight: 700;

@@ -84,8 +84,12 @@ def commit_shot(pid: str, shot_no: str, state: dict[str, Any]) -> dict:
     merged["shot_no"] = shot_no
 
     snapshot = dict(merged)
-    snapshot.setdefault("decision", st["shots"].get(shot_no, {}).get("decision"))
-    snapshot.setdefault("review", st["shots"].get(shot_no, {}).get("review"))
+    prev_snap = st["shots"].get(shot_no, {})
+    snapshot.setdefault("decision", prev_snap.get("decision"))
+    snapshot.setdefault("review", prev_snap.get("review"))
+    snapshot.setdefault("decision_flushed", prev_snap.get("decision_flushed", False))
+    snapshot.setdefault("staging_flushed", prev_snap.get("staging_flushed", False))
+    snapshot.setdefault("director_flushed", prev_snap.get("director_flushed", False))
     st["shots"][shot_no] = snapshot
     st["current"] = merged
     return _save(pid, st)
@@ -96,10 +100,19 @@ def _update_shot_field(pid: str, shot_no: str, key: str, value: Any) -> dict:
     shot = st["shots"].get(shot_no) or {"shot_no": shot_no}
     shot[key] = value
     st["shots"][shot_no] = shot
-    # mirror onto current when it is the active shot
+    # mirror onto current when it is the active shot so the live accumulator
+    # and per-shot archive stay in sync for the UI / resume logic.
     if st["current"].get("shot_no") == shot_no or st["current"].get("shot_no") is None:
         if key == "tail_frame":
             st["current"]["tail_frame"] = value
+        elif key == "staging_image":
+            st["current"]["staging_image"] = value
+        elif key == "director_board":
+            st["current"]["director_board"] = value
+        elif key == "decision":
+            st["current"]["decision"] = value
+        elif key == "review":
+            st["current"]["review"] = value
     return _save(pid, st)
 
 

@@ -27,11 +27,19 @@ const SCHEMA = [
     ],
   },
   {
+    group: '分镜拆解',
+    hint: '拆解剧本生成分镜时按「单镜目标时长」折算每镜承载文字：纯画面/旁白≈8字/秒（如15秒≈120字），对白≈5字/秒；对白越多单镜字数越少，避免对话过载。单镜估算时长以此为中心，最终钳制到 3–15 秒。',
+    fields: [
+      { key: 'shot_target_seconds', label: '单镜目标时长(秒)', type: 'number', min: 3, max: 15 },
+    ],
+  },
+  {
     group: '批量引擎',
     fields: [
       { key: 'max_concurrency', label: '最大并发', type: 'number', min: 1, max: 16 },
       { key: 'max_retries', label: '失败重试次数', type: 'number', min: 0, max: 10 },
       { key: 'task_interval_ms', label: '任务间隔(ms)', type: 'number', min: 0, max: 10000 },
+      { key: 'max_parallel_episodes', label: '并发分集数', type: 'number', min: 1, max: 8 },
     ],
   },
   {
@@ -42,9 +50,18 @@ const SCHEMA = [
     ],
   },
   {
+    group: '资产库',
+    hint: '资产库「一键生成」并发数：同时生成多少张资产参考图。适度并发显著加速，过高会增大 API 压力/限流。场景资产会额外生成一张鸟瞰图用于固定空间位置。',
+    fields: [
+      { key: 'asset_gen_concurrency', label: '一键生成并发数', type: 'number', min: 1, max: 16 },
+    ],
+  },
+  {
     group: '存储',
+    hint: '剪映草稿目录填写后，「导入剪映」会直接把草稿文件夹复制到该目录，同时仍保留 zip 备份。Windows 默认通常为：C:\\Users\\你的用户名\\AppData\\Local\\JianyingPro\\User Data\\Projects\\com.lveditor.draft',
     fields: [
       { key: 'output_dir', label: '输出目录', type: 'text' },
+      { key: 'jianying_draft_dir', label: '剪映草稿目录', type: 'text' },
     ],
   },
 ]

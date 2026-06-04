@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NSelect, NButton, NIcon, NCard, NEmpty, NTag, NImage, NSpin, NSwitch,
@@ -22,11 +22,42 @@ const loading = ref(false)
 const busy = ref({})           // shot_no → action key currently running
 const opts = ref({ use_llm: false, ai_review: true, model: '' })
 
+const OPTS_STORAGE_PREFIX = 'pipeline:opts:'
+function optsStorageKey(pid = store.currentId) { return `${OPTS_STORAGE_PREFIX}${pid || 'none'}` }
+function loadOpts() {
+  try {
+    if (!store.currentId) return
+    const raw = localStorage.getItem(optsStorageKey())
+    if (!raw) return
+    const data = JSON.parse(raw)
+    if (!data || typeof data !== 'object') return
+    opts.value = {
+      use_llm: data.use_llm !== undefined ? !!data.use_llm : opts.value.use_llm,
+      ai_review: data.ai_review !== undefined ? !!data.ai_review : opts.value.ai_review,
+      model: typeof data.model === 'string' ? data.model : opts.value.model,
+    }
+  } catch { /* ignore */ }
+}
+function saveOpts() {
+  try {
+    if (!store.currentId) return
+    localStorage.setItem(optsStorageKey(), JSON.stringify({
+      use_llm: !!opts.value.use_llm,
+      ai_review: !!opts.value.ai_review,
+      model: opts.value.model || '',
+    }))
+  } catch { /* ignore */ }
+}
+
 onMounted(async () => {
   await store.refreshList()
   if (!store.current && store.projects.length) await store.select(store.projects[0].id)
+  loadOpts()
   if (store.current) await loadState()
 })
+
+watch(() => store.currentId, () => { loadOpts() })
+watch(opts, () => saveOpts(), { deep: true })
 
 const projectOptions = computed(() =>
   store.projects.map((p) => ({ label: `${p.name}（${p.episode_count || 1}集·${p.shot_count || 0}镜）`, value: p.id })))
@@ -207,6 +238,9 @@ function anyBusy(shotNo) { return !!busy.value[shotNo] }
                     </n-tag>
                     <n-tag v-if="snap(s.shot_no).decision.use_director_board" size="small" type="info" :bordered="false">
                       <template #icon><n-icon :component="EaselOutline" /></template>导演图
+                    </n-tag>
+                    <n-tag v-if="snap(s.shot_no).decision.strategy" size="small" type="success" :bordered="false">
+                      策略：{{ snap(s.shot_no).decision.strategy }}
                     </n-tag>
                     <n-tag size="tiny" :bordered="false">{{ snap(s.shot_no).decision.source === 'llm' ? 'LLM' : '规则' }}</n-tag>
                   </div>

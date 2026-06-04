@@ -10,14 +10,21 @@ import {
 } from '@vicons/ionicons5'
 import { api } from '../api'
 import { useProjectStore } from '../stores/project'
+import { useTasksStore } from '../stores/tasks'
 
 const store = useProjectStore()
+const tasks = useTasksStore()
 const message = useMessage()
 
 const episodes = computed(() => store.episodes || [])
 const activeId = computed(() => store.currentEpisodeId)
 
 const stageLabel = { imported: '已导入', analyzed: '已分析', decomposed: '已拆解' }
+
+// per-episode generation badge (concurrent multi-episode runs each show here)
+const genLabel = { running: '生成中', queued: '排队', error: '部分失败', done: '已完成' }
+function genStat(ep) { return tasks.episodeStat(ep.id) }
+function shotCount(ep) { return ep.shot_count ?? (ep.shots ? ep.shots.length : 0) }
 
 // ── add episode modal ──
 const showAdd = ref(false)
@@ -106,7 +113,11 @@ async function move(ep, dir) {
       >
         <span class="ep-name">{{ ep.name }}</span>
         <span class="ep-stage" :data-stage="ep.stage">{{ stageLabel[ep.stage] || ep.stage }}</span>
-        <span class="ep-meta">{{ ep.shot_count }}镜</span>
+        <span class="ep-meta">{{ shotCount(ep) }}镜</span>
+        <span v-if="genStat(ep)" class="ep-gen" :data-gen="genStat(ep).status">
+          <span v-if="genStat(ep).status === 'running'" class="dot" />
+          {{ genLabel[genStat(ep).status] }} {{ genStat(ep).done }}/{{ genStat(ep).total }}
+        </span>
         <span class="ep-ops" v-if="ep.id === activeId">
           <n-tooltip><template #trigger>
             <n-icon class="op" :component="ChevronBackOutline" @click.stop="move(ep, -1)" /></template>前移</n-tooltip>
@@ -210,6 +221,18 @@ async function move(ep, dir) {
 .ep-stage[data-stage="decomposed"] { background: color-mix(in srgb, var(--app-accent) 22%, transparent); color: var(--app-accent); }
 .ep-stage[data-stage="analyzed"] { background: color-mix(in srgb, var(--app-accent-alt) 22%, transparent); color: var(--app-accent-alt); }
 .ep-meta { font-size: 11px; color: var(--app-text-muted); }
+.ep-gen {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; padding: 1px 7px; border-radius: 6px;
+  background: color-mix(in srgb, var(--app-text-muted) 18%, transparent);
+  color: var(--app-text-muted);
+}
+.ep-gen[data-gen="running"] { background: color-mix(in srgb, var(--app-accent) 20%, transparent); color: var(--app-accent); }
+.ep-gen[data-gen="queued"] { background: color-mix(in srgb, var(--app-accent-alt) 18%, transparent); color: var(--app-accent-alt); }
+.ep-gen[data-gen="done"] { background: color-mix(in srgb, #22c55e 22%, transparent); color: #22c55e; }
+.ep-gen[data-gen="error"] { background: color-mix(in srgb, #ef4444 22%, transparent); color: #ef4444; }
+.ep-gen .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: epPulse 1s infinite; }
+@keyframes epPulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
 .ep-ops { display: flex; align-items: center; gap: 7px; margin-left: 4px; padding-left: 8px; border-left: 1px solid var(--app-border); }
 .op { font-size: 15px; color: var(--app-text-muted); cursor: pointer; }
 .op:hover { color: var(--app-accent); }

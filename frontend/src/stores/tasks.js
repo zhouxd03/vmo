@@ -16,11 +16,13 @@ import { useProjectStore } from './project'
 let batchTimer = null
 let batchClock = null
 let decomposeTimer = null
+let batchPollStart = 0
 
-// Batch generation is slow (esp. video) so we don't hammer the server: the
-// first heavy status query fires after an initial delay, then on an interval.
-const BATCH_POLL_INITIAL_DELAY = 100_000
-const BATCH_POLL_INTERVAL = 20_000
+// Batch generation is slow (esp. video), but the UI must clear promptly when
+// a batch finishes. Poll quickly at first, then back off to avoid hammering.
+const BATCH_POLL_INITIAL_DELAY = 2_000
+const BATCH_POLL_INTERVAL = 15_000
+const BATCH_POLL_MAX_MINUTES_DEFAULT = 30
 const DECOMPOSE_POLL_INTERVAL = 1_000
 
 export const useTasksStore = defineStore('tasks', {
@@ -31,6 +33,8 @@ export const useTasksStore = defineStore('tasks', {
     batchActive: false,
     genStart: 0,        // ms timestamp when the current run began (0 = idle)
     nowTick: Date.now(), // advanced by a 1s clock so elapsed time stays live
+    batchPollMaxMinutes: BATCH_POLL_MAX_MINUTES_DEFAULT,
+    batchPollLastSetAt: 0,
 
     // ── script decompose (ScriptView) ──
     decomposeProjectId: null,
@@ -55,6 +59,27 @@ export const useTasksStore = defineStore('tasks', {
       s.decomposeStatus === 'running' && s.decomposeProjectId === pid && s.decomposeEpisodeId === eid,
     isAnalyzing: (s) => (pid, eid) =>
       s.analyzeStatus === 'running' && s.analyzeProjectId === pid && s.analyzeEpisodeId === eid,
+
+    // Per-episode generation status aggregated from the (episode_id-tagged)
+    // batch summaries. Returns null when an episode has no batches. status:
+    // running | queued | error | done. Used by the episode tabs + worktable so
+    // multiple episodes generating concurrently each show their own progress.
+    episodeStat: (s) => (eid) => {
+      if (!eid) return null
+      const bs = s.batches.filter((b) => b.episode_id === eid)
+      if (!bs.length) return null
+      let total = 0, done = 0, error = 0
+      let running = false, queued = false
+      for (const b of bs) {
+        total += b.total || 0
+        done += b.done || 0
+        error += b.error || 0
+        if (b.status === 'running') running = true
+        else if (b.status === 'pending') queued = true
+      }
+      const status = running ? 'running' : queued ? 'queued' : error ? 'error' : 'done'
+      return { total, done, error, status, percent: total ? Math.round((done / total) * 100) : 0 }
+    },
   },
   actions: {
     // ───────────────────────── batch generation ─────────────────────────
@@ -85,12 +110,17 @@ export const useTasksStore = defineStore('tasks', {
 
     // Start (or keep) the persistent batch polling loop. `immediate` forces a
     // one-shot refresh right away (used after the user starts a batch).
-    async ensureBatchPolling({ immediate = false } = {}) {
+    async ensureBatchPolling({ immediate = false, maxMinutes } = {}) {
+      if (Number.isFinite(Number(maxMinutes)) && Number(maxMinutes) > 0) {
+        this.batchPollMaxMinutes = Math.max(1, Number(maxMinutes))
+        this.batchPollLastSetAt = Date.now()
+      }
       if (immediate) await this.refreshBatches()
       this._startBatchTimers()
     },
 
     _startBatchTimers() {
+      if (!batchPollStart) batchPollStart = Date.now()
       if (!batchClock) {
         batchClock = setInterval(() => {
           if (this.batchActive) this.nowTick = Date.now()
@@ -103,6 +133,12 @@ export const useTasksStore = defineStore('tasks', {
 
     async _batchTick() {
       this.nowTick = Date.now()
+      const elapsedMs = batchPollStart ? (Date.now() - batchPollStart) : 0
+      const maxMs = Math.max(1, this.batchPollMaxMinutes || BATCH_POLL_MAX_MINUTES_DEFAULT) * 60 * 1000
+      if (elapsedMs > maxMs) {
+        this._stopBatchTimers()
+        return
+      }
       await this.refreshBatches()
       if (this.batchActive) {
         batchTimer = setTimeout(() => this._batchTick(), BATCH_POLL_INTERVAL)
@@ -117,7 +153,7 @@ export const useTasksStore = defineStore('tasks', {
     },
 
     // ───────────────────────── script decompose ─────────────────────────
-    async startDecompose(pid, eid) {
+    async startDecompose(pid, eid, opts = {}) {
       this.decomposeProjectId = pid
       this.decomposeEpisodeId = eid
       this.decomposeStatus = 'running'
@@ -126,7 +162,7 @@ export const useTasksStore = defineStore('tasks', {
       this.decomposeError = ''
       this.decomposeJobId = null
       try {
-        const { job_id } = await api.decomposeProject(pid, { episode_id: eid })
+        const { job_id } = await api.decomposeProject(pid, { episode_id: eid, ...opts })
         this.decomposeJobId = job_id
         this._startDecomposeTimer()
       } catch (e) {

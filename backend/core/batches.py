@@ -55,6 +55,9 @@ def _summarize(b: dict) -> dict:
         "done": done,
         "error": err,
         "concurrency": b.get("concurrency", 2),
+        # surface episode membership in the lightweight index so the worktable /
+        # episode bar can group batches per-episode without fetching every detail
+        "episode_id": (b.get("params") or {}).get("episode_id"),
         "created_at": b.get("created_at"),
         "updated_at": b.get("updated_at"),
     }
@@ -75,6 +78,11 @@ def create_batch(pid: str, kind: str, name: str, tasks: list,
         raise ValueError(f"未知批次类型: {kind}")
     if not tasks:
         raise ValueError("批次任务为空")
+    # Video calls are expensive and prompt-sensitive. A failed provider task may
+    # already have consumed quota, so never create video tasks with automatic
+    # re-submit attempts; users should inspect the error and manually retry.
+    if kind == "video":
+        max_attempts = 1
     bid = uuid.uuid4().hex[:12]
     now = time.time()
     norm_tasks = []
@@ -84,21 +92,31 @@ def create_batch(pid: str, kind: str, name: str, tasks: list,
             "index": i,
             "shot_no": t.get("shot_no", ""),
             "seq": t.get("seq"),
+            "src_text": t.get("src_text", ""),
             "prompt": t.get("prompt", ""),
             "materials": t.get("materials", []),
             "params": t.get("params", {}),
             # continuity fields (Phase 5) — preserved for the continuity engine
             "scene": t.get("scene", ""),
+            "scene_ref": t.get("scene_ref", ""),
             "characters": t.get("characters", []),
+            "characters_ref": t.get("characters_ref", []),
             "props": t.get("props", []),
             "action": t.get("action", ""),
+            "action_ref": t.get("action_ref", ""),
             "camera": t.get("camera", ""),
             "handoff": t.get("handoff", ""),
+            "handoff_ref": t.get("handoff_ref", ""),
+            "dialogue": t.get("dialogue", ""),
+            "dialogue_ref": t.get("dialogue_ref", ""),
+            "emotion": t.get("emotion", ""),
+            "duration": t.get("duration"),
             "status": "pending",
             "attempts": 0,
             "max_attempts": max_attempts,
             "result": None,
             "error": None,
+            "src_text": t.get("src_text", ""),
             "updated_at": now,
         })
     batch = {

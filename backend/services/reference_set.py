@@ -24,9 +24,6 @@ A "reference item" is a plain dict:
 """
 
 import re
-from typing import Optional
-
-_PH_RE = re.compile(r"@image\d+")
 
 # lower rank = higher priority (kept first when capping)
 ROLE_RANK = {
@@ -35,6 +32,7 @@ ROLE_RANK = {
     "staging": 0,       # 站位图
     "character": 1,     # 角色图（主角）
     "scene": 2,         # 背景 / 场景图
+    "scene_aerial": 2,  # 场景鸟瞰图（紧随主场景图，稳定排序保证主图在前）
     "support": 3,       # 配角图
     "prop": 4,          # 道具图
 }
@@ -45,6 +43,7 @@ ROLE_LABEL = {
     "staging": "站位图（作为参考）",
     "character": "角色参考",
     "scene": "场景参考",
+    "scene_aerial": "场景鸟瞰图（固定空间位置）",
     "support": "配角参考",
     "prop": "道具参考",
 }
@@ -63,9 +62,16 @@ def material_role(material: dict) -> str:
     return "support" if (material.get("role") == "support") else "character"
 
 
-def cap(items: list, max_n: int) -> list:
-    """Return the highest-priority *max_n* items (stable within a priority tier)."""
-    items = [it for it in (items or []) if it.get("b64")]
+def cap(items: list, max_n: int, require_b64: bool = True) -> list:
+    """Return the highest-priority *max_n* items (stable within a priority tier).
+
+    require_b64=True（生成时）：只保留真正随附了 b64 的图，与最终发送的图片数组一一
+    对应。False（工作台预览）：按相同优先级排序/裁剪资产元数据（不读 b64），使预览
+    的【画面定义】@图N 编号与实际发送数组逐位一致。"""
+    if require_b64:
+        items = [it for it in (items or []) if it.get("b64")]
+    else:
+        items = list(items or [])
     if max_n is None or max_n <= 0:
         return items
     # Python's sort is stable, so equal-rank items keep their insertion order.
@@ -77,53 +83,143 @@ def has_first_frame(kept: list) -> bool:
     return any(it.get("role") in _FIRST_FRAME_ROLES for it in (kept or []))
 
 
-def build_legend(kept: list) -> str:
-    """Human + model-readable legend mapping @imageN → role/usage."""
-    parts = []
-    for i, it in enumerate(kept or [], 1):
-        label = ROLE_LABEL.get(it.get("role"), "参考")
-        name = it.get("name")
-        parts.append(f"@image{i}={label}" + (f"：{name}" if name else ""))
-    return "；".join(parts)
+def token_for(it: dict) -> str:
+    """Unified @ token for a reference item. 连续性图用固定别名，资产用 @名。"""
+    role = it.get("role")
+    if role == "first_frame":
+        return "@首帧"
+    if role == "director":
+        return "@导演图"
+    if role == "staging":
+        return "@站位图"
+    if role == "scene_aerial":
+        return "@场景鸟瞰图"
+    name = (it.get("name") or "").strip()
+    return ("@" + name) if name else "@参考"
 
 
-def compose_prompt(base_text: str, materials: list, kept: list) -> str:
-    """Prepend a reference legend to *base_text* and renumber its placeholders.
+def _sentence_for(role: str, token: str, kind: str) -> str:
+    """Reference explanation phrasing per role (放在提示词前方的引用说明)。"""
+    is_video = (kind == "video")
+    if role == "character":
+        return f"{token} 是主要角色"
+    if role == "support":
+        return f"{token} 是配角"
+    if role == "scene":
+        return f"{token} 是背景/场景"
+    if role == "scene_aerial":
+        return f"{token} 是场景鸟瞰俯视图，用于固定场景空间位置与机位布局"
+    if role == "prop":
+        return f"{token} 是道具"
+    if role == "director":
+        return (f"参考 {token} 生成视频，遵循其构图、分镜与镜头语言"
+                if is_video else f"参考 {token} 确定画面构图与分镜")
+    if role == "staging":
+        return (f"生成视频时参考 {token} 确定角色站位"
+                if is_video else f"参考 {token} 确定角色站位关系")
+    if role == "first_frame":
+        return f"{token} 作为视频首帧画面，从该画面自然运动起势"
+    return f"{token} 作为参考"
 
-    *materials* are the asset materials originally produced by resolve_mentions
-    (each may carry an ``@imageN`` placeholder baked into *base_text*). For the
-    final *kept* set we:
-      - remap surviving asset placeholders to their new @imageN position,
-      - replace dropped asset placeholders with the asset name (so the prompt
-        text stays readable instead of dangling a stale @imageN),
-      - prepend a legend describing every kept image's role / usage.
-    """
-    text = base_text or ""
 
-    # new placeholder per kept item (by asset_id when present)
-    new_ph_by_asset = {}
-    for i, it in enumerate(kept or [], 1):
-        if it.get("asset_id"):
-            new_ph_by_asset[it["asset_id"]] = f"@image{i}"
-
-    # build a single old-placeholder → replacement map (survivors remap to their
-    # new @imageN; dropped ones fall back to the asset name) so the rewrite is a
-    # single pass and old/new tokens can't collide with each other.
-    repl = {}
-    for m in (materials or []):
-        old_ph = m.get("placeholder")
-        if not old_ph:
-            continue
-        new_ph = new_ph_by_asset.get(m.get("asset_id"))
-        repl[old_ph] = new_ph if new_ph else (m.get("name") or "")
-    if repl:
-        text = _PH_RE.sub(lambda mo: repl.get(mo.group(0), mo.group(0)), text)
-
-    legend = build_legend(kept)
-    if not legend:
-        return text
-    head = (
-        "【参考图说明】以下 @imageN 依次对应随附的参考图，请严格保持其形象/场景一致；"
-        "标注「作为首帧」的请用作视频首帧画面，其余仅作参考：" + legend
+def build_legend(kept: list, kind: str = "video") -> tuple[list, str]:
+    """Return (ordered tokens, joined reference-explanation sentences)."""
+    tokens = [token_for(it) for it in (kept or [])]
+    sentences = "；".join(
+        _sentence_for(it.get("role"), tok, kind)
+        for it, tok in zip(kept or [], tokens)
     )
-    return head + "\n" + text if text else head
+    return tokens, sentences
+
+
+def _definition_desc(it: dict, kind: str) -> str:
+    """「@图N 是 …」定义行里 `是` 之后的说明文本（按角色/资产名）。"""
+    role = it.get("role")
+    name = (it.get("name") or "").strip()
+    is_video = (kind == "video")
+    if role == "director":
+        return ("是导演图，请参考该图中的构图、分镜与镜头语言生成剧情视频"
+                if is_video else "是导演图，请参考该图确定画面构图与分镜")
+    if role == "staging":
+        return "是站位图，请参考该图确定各角色的站位与相对位置关系"
+    if role == "first_frame":
+        return "是上一镜尾帧，作为本镜视频首帧画面，从该画面自然运动起势"
+    if role == "scene":
+        return f"是 {name}" if name else "是 背景/场景"
+    if role == "scene_aerial":
+        base = f"是 {name} 的鸟瞰俯视图" if name else "是场景鸟瞰俯视图"
+        return base + "，用于固定场景空间位置与机位布局，请保持与场景一致"
+    if role == "prop":
+        return f"是 {name}" if name else "是 道具"
+    if role == "support":
+        return f"是 {name}" if name else "是 配角"
+    # character (@主角)
+    return f"是 {name}" if name else "是 主要角色"
+
+
+_DEF_HEAD = "【画面定义】（仅说明随附参考图的对应关系，不作为画面内容/文字输出）"
+_DEF_TAIL = "务必严格保持各 @图 对象的形象/服装/场景/道具与参考图一致。"
+# 用于幂等：识别并剥离已存在于文本开头的【画面定义】块（含其后的空行）。
+_DEF_BLOCK_RE = re.compile(
+    r"^\s*" + re.escape(_DEF_HEAD) + r".*?" + re.escape(_DEF_TAIL) + r"\s*",
+    re.DOTALL,
+)
+
+
+def strip_definition_block(text: str) -> str:
+    """移除文本开头已有的【画面定义】块（若有），保证 compose_prompt 幂等——
+    无论可编辑/预览提示词里是否已带定义行，生成时都重新生成权威定义、不重复堆叠。"""
+    if not text:
+        return text or ""
+    return _DEF_BLOCK_RE.sub("", text, count=1)
+
+
+def build_definition_block(kept: list, kind: str = "video",
+                           require_b64: bool = True) -> str:
+    """开头【画面定义】块：把随附参考图按附带顺序编号为 @图1、@图2…，逐行声明各图
+    指代的角色/场景/道具/导演图/站位图（空模块不输出）。仅作 @ 引用的对应说明，不
+    会作为画面文字出现。导演图/站位图等仅在确实调用时才写对应行（如无则忽略）。
+
+    require_b64=True（生成时）：仅对真正随附的图（含 b64）编号；False（工作台预览）：
+    按已校验有参考图的资产元数据预排，给用户可见的近似定义（生成时会以权威定义覆盖）。
+    """
+    if require_b64:
+        kept = [it for it in (kept or []) if it.get("b64")]
+    else:
+        kept = list(kept or [])
+    if not kept:
+        return ""
+    lines = [f"@图{i + 1} {_definition_desc(it, kind)}" for i, it in enumerate(kept)]
+    return _DEF_HEAD + "\n" + "\n".join(lines) + "\n" + _DEF_TAIL
+
+
+def compose_prompt(base_text: str, materials: list, kept: list,
+                   kind: str = "video") -> str:
+    """Prepend a unified @ reference legend to *base_text*.
+
+    生成提示词里所有引用统一 @：资产 @名、连续性图 @导演图/@站位图/@首帧。
+    *base_text* 已由 resolve_mentions 把提及替换成 @名（即各 material 的
+    placeholder）。对最终 *kept* 集：
+      - 留存的资产 @名 原样保留（已在文中）；
+      - 被裁掉的资产把 @名 还原为纯名字（去掉 @，避免悬空引用无配图）；
+      - 在最前面注入「随附参考图依次为 …」+ 逐条引用说明文本。
+    """
+    # 幂等：先剥离可能已混入文本开头的旧【画面定义】块（来自工作台预览/手工编辑），
+    # 生成时统一以权威定义重建，避免重复堆叠。
+    text = strip_definition_block(base_text or "")
+
+    # dropped assets → strip their @名 back to bare name (longest token first so
+    # @林夏 is handled before @林).
+    kept_ids = {it.get("asset_id") for it in (kept or []) if it.get("asset_id")}
+    drop_repl = {}
+    for m in (materials or []):
+        ph = m.get("placeholder")
+        if ph and m.get("asset_id") not in kept_ids:
+            drop_repl[ph] = m.get("name") or ph.lstrip("@")
+    for ph in sorted(drop_repl, key=len, reverse=True):
+        text = text.replace(ph, drop_repl[ph])
+
+    head = build_definition_block(kept, kind)
+    if not head:
+        return text
+    return head + "\n\n" + text if text else head

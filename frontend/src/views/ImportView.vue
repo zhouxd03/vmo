@@ -53,7 +53,10 @@ async function doImport() {
     })
     const eps = project.episodes || []
     const segCount = eps.reduce((n, e) => n + ((e.segments && e.segments.length) || 0), 0)
-    message.success(`已导入「${project.name}」：自动分为 ${eps.length} 集，共 ${segCount} 个片段`)
+    const methodLabel = { markers: '识别分集标记', llm: 'LLM 自适应切分', volume: '按体量切分' }
+    const m = (project.split && project.split.method) || ''
+    const how = methodLabel[m] ? `（${methodLabel[m]}）` : ''
+    message.success(`已导入「${project.name}」：自动分为 ${eps.length} 集${how}，共 ${segCount} 个片段`)
     router.push('/script')
   } catch (e) {
     message.error('导入失败: ' + e.message)

@@ -17,7 +17,10 @@ import os
 from PyInstaller.utils.hooks import collect_submodules
 
 ROOT = os.path.abspath(os.getcwd())
-FFMPEG_BIN = r"C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin"
+FFMPEG_BIN = os.environ.get(
+    "FFMPEG_BIN",
+    r"C:\Users\ALO\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin",
+)
 ICON = os.path.join(ROOT, "desktop_assets", "app.ico")
 WEBVIEW2_SETUP = os.path.join(ROOT, "desktop_assets", "MicrosoftEdgeWebview2Setup.exe")
 
@@ -37,6 +40,7 @@ binaries = [
 
 hiddenimports = (
     collect_submodules("backend")
+    + ["webview"]
     + collect_submodules("webview")
     + ["clr_loader", "clr_loader.ffi"]
 )
@@ -51,7 +55,11 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=["tkinter", "PySide2", "PySide6", "PyQt5", "PyQt6", "matplotlib", "numpy.tests"],
-    noarchive=False,
+    # Keep Python modules as files instead of packing them only into PYZ.
+    # pywebview also ships a top-level "webview" resource directory; with PYZ-only
+    # packaging that data directory can shadow the real webview package at runtime,
+    # producing: module 'webview' has no attribute 'create_window'.
+    noarchive=True,
 )
 pyz = PYZ(a.pure)
 

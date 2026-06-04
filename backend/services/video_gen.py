@@ -46,13 +46,27 @@ def _api_error(resp, where="API") -> "VideoError":
                       code=code, status=resp.status_code, err_type=err_type, raw=resp.text[:500])
 
 
-def _resolve_creds(base_url: Optional[str], api_key: Optional[str]) -> tuple[str, str, str]:
+def _resolve_creds(base_url: Optional[str], api_key: Optional[str]) -> tuple[str, str, str, str]:
+    """Return (base_url, api_key, default_model, provider)."""
     if base_url and api_key:
-        return base_url.strip().rstrip("/"), api_key.strip(), ""
+        return base_url.strip().rstrip("/"), api_key.strip(), "", _detect_provider(base_url, "")
     cred = credentials.get_default("video")
     if not cred or not cred.get("base_url") or not cred.get("api_key"):
         raise VideoError("请先在设置→凭据库添加并启用一个【生视频】API（地址+Key 手动填写）")
-    return cred["base_url"].strip().rstrip("/"), cred["api_key"].strip(), cred.get("model", "")
+    base = cred["base_url"].strip().rstrip("/")
+    return base, cred["api_key"].strip(), cred.get("model", ""), _detect_provider(base, cred.get("provider", ""))
+
+
+def _detect_provider(base_url: str, provider: str) -> str:
+    """Pick the request-construction dialect. Explicit credential `provider`
+    wins; otherwise sniff the base_url (Seedance hosts its API under
+    /seedanceapi). Defaults to the OpenAI-compatible /v1/videos shape."""
+    p = (provider or "").strip().lower()
+    if p in ("seedance", "openai"):
+        return p
+    if "seedance" in (base_url or "").lower():
+        return "seedance"
+    return "openai"
 
 
 def _extract_video_url(obj: dict) -> str:
@@ -87,6 +101,64 @@ def _extract_task_id(obj: dict) -> str:
     return ""
 
 
+def _stringify_upstream(value, limit: int = 1200) -> str:
+    """Return a compact, readable upstream error string without truncating to
+    useless fragments like ``{\\``. Providers often return nested error dicts,
+    escaped JSON strings, or only ``fail_reason``; keep enough context for the
+    user to fix credentials/params/prompt without opening raw logs."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+        # Some relays return JSON as an escaped string; decode once if possible.
+        if text.startswith("{") or text.startswith("["):
+            try:
+                import json
+                return _stringify_upstream(json.loads(text), limit)
+            except Exception:  # noqa: BLE001
+                pass
+        return text[:limit]
+    if isinstance(value, dict):
+        preferred = []
+        for k in ("message", "msg", "detail", "reason", "fail_reason", "code", "type"):
+            v = value.get(k)
+            if v not in (None, ""):
+                preferred.append(f"{k}={_stringify_upstream(v, limit)}")
+        if preferred:
+            return "；".join(preferred)[:limit]
+    try:
+        import json
+        return json.dumps(value, ensure_ascii=False)[:limit]
+    except Exception:  # noqa: BLE001
+        return str(value)[:limit]
+
+
+def _extract_error_fields(data: dict) -> tuple[str, str, str]:
+    """Extract (message, code, type) from common relay/provider error shapes."""
+    candidates = []
+    if isinstance(data, dict):
+        for k in ("fail_reason", "error", "message", "msg", "detail", "reason"):
+            if data.get(k) not in (None, ""):
+                candidates.append(data.get(k))
+        for k in ("data", "result"):
+            v = data.get(k)
+            if isinstance(v, dict):
+                for kk in ("fail_reason", "error", "message", "msg", "detail", "reason"):
+                    if v.get(kk) not in (None, ""):
+                        candidates.append(v.get(kk))
+    msg_src = candidates[0] if candidates else data
+    code = err_type = ""
+    if isinstance(msg_src, dict):
+        code = str(msg_src.get("code") or msg_src.get("error_code") or "")
+        err_type = str(msg_src.get("type") or msg_src.get("error_type") or "")
+    if not code and isinstance(data, dict):
+        code = str(data.get("code") or data.get("error_code") or "")
+    if not err_type and isinstance(data, dict):
+        err_type = str(data.get("type") or data.get("error_type") or "")
+    msg = _stringify_upstream(msg_src)
+    return msg or "生成失败", code, err_type
+
+
 def generate_video(
     prompt: str,
     *,
@@ -102,14 +174,32 @@ def generate_video(
     on_progress: Optional[Callable[[int], None]] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    generate_audio: bool = False,
+    watermark: bool = False,
 ) -> dict:
     prompt = (prompt or "").strip()
     if not prompt:
         raise VideoError("请输入视频描述提示词")
 
-    api_base, key, default_model = _resolve_creds(base_url, api_key)
-    model = model or default_model or "sora-v3-fast"
+    api_base, key, default_model, provider = _resolve_creds(base_url, api_key)
     ref_images_b64 = [b for b in (ref_images_b64 or []) if b]
+
+    # safety net: a doubao-seedance model implies the Seedance dialect even if
+    # the credential's provider field was left blank.
+    if provider != "seedance" and (model or default_model or "").lower().startswith("doubao-seedance"):
+        provider = "seedance"
+
+    if provider == "seedance":
+        return _generate_seedance(
+            prompt, api_base=api_base, key=key, model=model or default_model,
+            duration=duration, aspect_ratio=aspect_ratio, resolution=resolution,
+            ref_images_b64=ref_images_b64, save_dir=save_dir,
+            filename_prefix=filename_prefix, timeout=timeout,
+            poll_interval=poll_interval, on_progress=on_progress,
+            generate_audio=generate_audio, watermark=watermark,
+        )
+
+    model = model or default_model or "sora-v3-fast"
 
     def _to_url(b, idx, what):
         try:
@@ -184,19 +274,143 @@ def _poll(api_base, task_id, key, timeout, interval, on_progress) -> str:
                 if url:
                     return url
             elif status in ("failed", "error"):
-                msg = data.get("fail_reason") or data.get("error") or data.get("message") or "生成失败"
-                code = err_type = ""
-                if isinstance(msg, dict):
-                    code = str(msg.get("code") or "")
-                    err_type = str(msg.get("type") or "")
-                    msg = str(msg.get("message") or msg)
-                raise VideoError(str(msg), code=code, err_type=err_type, raw=str(data)[:500])
+                msg, code, err_type = _extract_error_fields(data)
+                raise VideoError(msg, code=code, err_type=err_type, raw=_stringify_upstream(data))
         except VideoError:
             raise
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[Video] 轮询异常: {e}")
             continue
     raise VideoError(f"生成超时（{timeout}秒）")
+
+
+# ── Seedance (doubao-seedance) provider ─────────────────────────────────────
+# A different dialect from the OpenAI-style path above:
+#   submit : POST {root}/seedanceapi/common/File/All  (multipart/form-data)
+#            header `token`; reference images are uploaded as real `files` parts
+#            (no image-host round-trip). Returns {code,data:{Id},success}.
+#   query  : POST {root}/seedanceapi/user/DataIndex   (application/json)
+#            {Id} -> {data:{Status,VideoUrl,Message,...}} (Status 0/1/2/3).
+_SEEDANCE_ASPECTS = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
+_SEEDANCE_RES = {"480p", "720p", "1080p"}
+_SEEDANCE_DEFAULT_MODEL = "doubao-seedance-2-0-fast-260128"
+
+
+def _seedance_root(api_base: str) -> str:
+    """Host root for Seedance, tolerant of a base_url that already includes the
+    /seedanceapi prefix."""
+    base = (api_base or "").rstrip("/")
+    return base.split("/seedanceapi")[0].rstrip("/")
+
+
+def _generate_seedance(
+    prompt, *, api_base, key, model, duration, aspect_ratio, resolution,
+    ref_images_b64, save_dir, filename_prefix, timeout, poll_interval,
+    on_progress, generate_audio, watermark,
+) -> dict:
+    root = _seedance_root(api_base)
+    model = model or _SEEDANCE_DEFAULT_MODEL
+    dur = max(4, min(15, int(duration or 5)))          # Seedance allows 4-15s
+    aspect = aspect_ratio if aspect_ratio in _SEEDANCE_ASPECTS else "16:9"
+    res = resolution if resolution in _SEEDANCE_RES else "720p"
+
+    form = {
+        "model": model,
+        "prompt": prompt,
+        "duration": str(dur),
+        "aspect_ratio": aspect,
+        "resolution": res,
+        "generate_audio": "true" if generate_audio else "false",
+        "watermark": "true" if watermark else "false",
+    }
+    files = []
+    for i, b in enumerate(ref_images_b64 or []):
+        try:
+            raw = base64.b64decode(b)
+        except Exception as e:  # noqa: BLE001
+            raise VideoError(f"第 {i+1} 张参考图数据无效") from e
+        files.append(("files", (f"ref{i+1}.png", raw, "image/png")))
+
+    mode = "图生视频" if files else "文生视频"
+    submit_url = f"{root}/seedanceapi/common/File/All"
+    logger.info(f"[Video][Seedance] 提交 {mode}: model={model} {dur}s {aspect} {res} refs={len(files)}")
+    try:
+        resp = http.post(submit_url, data=form, files=files or None,
+                         headers={"token": key}, timeout=120)
+    except Exception as e:  # noqa: BLE001
+        raise VideoError(f"Seedance 提交请求失败: {e}") from e
+    if resp.status_code >= 400:
+        raise _api_error(resp, "Seedance 提交")
+    body = _seedance_json(resp, "提交")
+    task_id = ((body.get("data") or {}).get("Id"))
+    if task_id in (None, "", 0):
+        raise VideoError(f"Seedance 未返回任务ID: {str(body)[:300]}")
+
+    if on_progress:
+        on_progress(5)
+    video_url = _poll_seedance(root, task_id, key, timeout, poll_interval, on_progress)
+    if on_progress:
+        on_progress(100)
+    return _download(video_url, model, dur, save_dir, filename_prefix)
+
+
+def _seedance_json(resp, where: str) -> dict:
+    """Parse a Seedance JSON envelope and raise on business-level failure
+    (code != 0 / success false), surfacing the server's message."""
+    try:
+        body = resp.json()
+    except Exception as e:  # noqa: BLE001
+        raise VideoError(f"Seedance {where} 返回非 JSON: {resp.text[:200]}") from e
+    if not isinstance(body, dict):
+        raise VideoError(f"Seedance {where} 返回格式异常: {str(body)[:200]}")
+    if body.get("code") not in (0, None) or body.get("success") is False:
+        msg = body.get("message") or "请求失败"
+        raise VideoError(f"Seedance {where}失败: {msg}", code=str(body.get("code") or ""), raw=str(body)[:500])
+    return body
+
+
+def seedance_user_info(base_url: str, api_key: str) -> dict:
+    """Query Seedance account balances (token / fast token / int'l seconds).
+    Credit-free — used as the connectivity/auth test for a Seedance credential."""
+    root = _seedance_root((base_url or "").strip().rstrip("/"))
+    headers = {"token": (api_key or "").strip(), "Content-Type": "application/json"}
+    resp = http.post(f"{root}/seedanceapi/user/UserIndex", json={"Id": 0},
+                     headers=headers, timeout=30)
+    if resp.status_code >= 400:
+        raise _api_error(resp, "Seedance 鉴权")
+    return (_seedance_json(resp, "鉴权").get("data") or {})
+
+
+def _poll_seedance(root, task_id, key, timeout, interval, on_progress) -> str:
+    query_url = f"{root}/seedanceapi/user/DataIndex"
+    headers = {"token": key, "Content-Type": "application/json"}
+    elapsed = 0
+    interval = max(3, interval)
+    while elapsed < timeout:
+        time.sleep(interval)
+        elapsed += interval
+        try:
+            r = http.post(query_url, json={"Id": task_id}, headers=headers, timeout=30)
+            if r.status_code >= 400:
+                continue
+            data = (r.json() or {}).get("data") or {}
+            status = data.get("Status")
+            logger.info(f"[Video][Seedance] 轮询 {elapsed}s: status={status} ({data.get('StatusText','')})")
+            if status == 2:                              # 已完成
+                url = data.get("VideoUrl") or ""
+                if url:
+                    return url
+            elif status == 3:                            # 失败
+                raise VideoError(data.get("Message") or "Seedance 生成失败", raw=str(data)[:500])
+            else:                                        # 0 待处理 / 1 处理中
+                if on_progress:
+                    on_progress(40 if status == 1 else 15)
+        except VideoError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Video][Seedance] 轮询异常: {e}")
+            continue
+    raise VideoError(f"Seedance 生成超时（{timeout}秒）")
 
 
 def _download(video_url, model, duration, save_dir, filename_prefix) -> dict:
@@ -206,10 +420,17 @@ def _download(video_url, model, duration, save_dir, filename_prefix) -> dict:
     filename = f"{video_id}_{model.replace('/', '_')}.mp4"
     filepath = save_dir / filename
     try:
-        dl = http.get(video_url, timeout=180)
-        dl.raise_for_status()
-        filepath.write_bytes(dl.content)
-        logger.info(f"[Video] 已保存 {filepath} ({len(dl.content)} bytes)")
+        # stream to disk in chunks so the whole video never sits in RAM at once
+        # (keeps memory bounded when several episodes generate concurrently)
+        size = 0
+        with http.get(video_url, timeout=180, stream=True) as dl:
+            dl.raise_for_status()
+            with open(filepath, "wb") as fh:
+                for chunk in dl.iter_content(chunk_size=1 << 20):
+                    if chunk:
+                        fh.write(chunk)
+                        size += len(chunk)
+        logger.info(f"[Video] 已保存 {filepath} ({size} bytes)")
         saved = str(filepath)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[Video] 下载失败: {e}; 仅返回 URL")

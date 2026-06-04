@@ -53,6 +53,16 @@ async function downloadBlob(method, path, body) {
   return { ok: true, name }
 }
 
+// POST a multipart/form-data body (file upload). Returns parsed JSON.
+async function upload(path, formData) {
+  const resp = await fetch(path, { method: 'POST', body: formData })
+  const text = await resp.text()
+  let data
+  try { data = text ? JSON.parse(text) : {} } catch { data = { error: text } }
+  if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+  return data
+}
+
 export const api = {
   get: (p) => req('GET', p),
   post: (p, b) => req('POST', p, b),
@@ -60,6 +70,8 @@ export const api = {
 
   health: () => req('GET', '/api/health'),
   logs: (sinceId = 0) => req('GET', `/api/logs?since_id=${sinceId}`),
+  exportLogs: () => downloadBlob('GET', '/api/logs/export'),
+  clearLogs: () => req('POST', '/api/logs/clear'),
 
   getSettings: () => req('GET', '/api/settings'),
   saveSettings: (patch) => req('POST', '/api/settings', patch),
@@ -74,7 +86,9 @@ export const api = {
   // projects (Phase 2)
   listProjects: () => req('GET', '/api/projects'),
   getProject: (pid) => req('GET', `/api/projects/${pid}`),
+  getProjectOverview: (pid) => req('GET', `/api/projects/${pid}/overview`),
   deleteProject: (pid) => req('DELETE', `/api/projects/${pid}`),
+  renameProject: (pid, name) => req('PATCH', `/api/projects/${pid}`, { name }),
   importProject: (body) => req('POST', '/api/projects/import', body),
   analyzeProject: (pid, body) => req('POST', `/api/projects/${pid}/analyze`, body),
   updateStoryBible: (pid, patch) => req('PATCH', `/api/projects/${pid}/story_bible`, patch),
@@ -97,12 +111,21 @@ export const api = {
   deleteAsset: (pid, aid) => req('DELETE', `/api/projects/${pid}/assets/${aid}`),
   seedAssets: (pid) => req('POST', `/api/projects/${pid}/assets/seed`),
   genAssetRefImage: (pid, aid, body) => req('POST', `/api/projects/${pid}/assets/${aid}/refimage`, body),
+  genMissingAssets: (pid, body) => req('POST', `/api/projects/${pid}/assets/generate-missing`, body || {}),
+  importAssetImage: (pid, aid, file) => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return upload(`/api/projects/${pid}/assets/${aid}/import-image`, fd)
+  },
   assetImageUrl: (pid, filename) => `/api/projects/${pid}/asset-image/${filename}`,
   resolveMentions: (pid, text) => req('POST', `/api/projects/${pid}/resolve`, { text }),
 
   // batches (Phase 4)
   listBatches: (pid) => req('GET', `/api/projects/${pid}/batches`),
+  previewShotPrompts: (pid, body) => req('POST', `/api/projects/${pid}/shot_prompts`, body),
+  inferShotPrompt: (pid, body) => req('POST', `/api/projects/${pid}/infer_shot_prompt`, body),
   createBatch: (pid, body) => req('POST', `/api/projects/${pid}/batches`, body),
+  createEpisodeBatches: (pid, body) => req('POST', `/api/projects/${pid}/episode_batches`, body),
   getBatch: (pid, bid) => req('GET', `/api/projects/${pid}/batches/${bid}`),
   deleteBatch: (pid, bid) => req('DELETE', `/api/projects/${pid}/batches/${bid}`),
   startBatch: (pid, bid) => req('POST', `/api/projects/${pid}/batches/${bid}/start`),

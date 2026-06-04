@@ -26,6 +26,22 @@ logger = logging.getLogger("batch_studio")
 
 _EXE = ".exe" if os.name == "nt" else ""
 
+# On Windows the app runs windowed (pythonw / frozen GUI) with no console, so
+# spawning console subsystem binaries (ffmpeg/ffprobe) pops a black cmd window
+# that flashes on screen. CREATE_NO_WINDOW + a hidden STARTUPINFO suppress it.
+_NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+
+
+def _run(cmd, **kwargs):
+    """subprocess.run that never flashes a console window on Windows."""
+    if os.name == "nt":
+        kwargs.setdefault("creationflags", _NO_WINDOW)
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0  # SW_HIDE
+        kwargs.setdefault("startupinfo", si)
+    return subprocess.run(cmd, **kwargs)
+
 
 class FFmpegError(Exception):
     pass
@@ -70,7 +86,7 @@ def probe_duration(video_path: str | Path) -> Optional[float]:
     video_path = str(video_path)
     if probe:
         try:
-            out = subprocess.run(
+            out = _run(
                 [probe, "-v", "quiet", "-print_format", "json", "-show_format", video_path],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=30,
@@ -117,16 +133,16 @@ def extract_tail_frame(
            "-update", "1", "-q:v", "2", str(out_path)]
 
     logger.info(f"[ffmpeg] 抽取尾帧: {' '.join(cmd)}")
-    proc = subprocess.run(cmd, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", timeout=120)
+    proc = _run(cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=120)
     if proc.returncode != 0 or not out_path.exists():
         # last resort: seek slightly before the known end and grab one frame
         if duration:
             seek = max(0.0, duration - max(offset_from_end, 0.2))
             cmd2 = [ff, "-y", "-ss", f"{seek:.3f}", "-i", video_path,
                     "-update", "1", "-frames:v", "1", "-q:v", "2", str(out_path)]
-            proc = subprocess.run(cmd2, capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace", timeout=120)
+            proc = _run(cmd2, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=120)
         if proc.returncode != 0 or not out_path.exists():
             raise FFmpegError(f"尾帧抽取失败: {(proc.stderr or '')[-300:]}")
     return str(out_path)
@@ -143,7 +159,7 @@ def probe_image_size(path: str | Path) -> Optional[tuple[int, int]]:
     if not probe:
         return None
     try:
-        out = subprocess.run(
+        out = _run(
             [probe, "-v", "quiet", "-select_streams", "v:0",
              "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
@@ -184,10 +200,10 @@ def crop_b64_to_aspect(img_b64: str, ar_w: int, ar_h: int, *, tol: float = 0.01)
         # centered crop to the target ratio (crop defaults to centered)
         vf = (f"crop='if(gt(iw/ih,{target}),ih*{target},iw)':"
               f"'if(gt(iw/ih,{target}),ih,iw/{target})'")
-        proc = subprocess.run([ff, "-y", "-i", str(tmp_in), "-vf", vf,
-                               "-frames:v", "1", str(tmp_out)],
-                              capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=60)
+        proc = _run([ff, "-y", "-i", str(tmp_in), "-vf", vf,
+                     "-frames:v", "1", str(tmp_out)],
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=60)
         if proc.returncode == 0 and tmp_out.exists():
             return _b64.b64encode(tmp_out.read_bytes()).decode()
         logger.warning(f"[ffmpeg] 参考图裁剪到 {ar_w}:{ar_h} 失败: {(proc.stderr or '')[-200:]}")

@@ -3,7 +3,8 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NSelect, NButton, NIcon, NCard, NTag, NEmpty, NSpace, NProgress, NSpin,
-  NCollapse, NCollapseItem, NDataTable, NAlert, NInput, useMessage,
+  NCollapse, NCollapseItem, NDataTable, NAlert, NInput, NRadioGroup, NRadioButton,
+  NTooltip, useMessage,
 } from 'naive-ui'
 import {
   SparklesOutline, GitBranchOutline, PersonOutline, LocationOutline, CubeOutline,
@@ -25,11 +26,51 @@ const analyzing = computed(() => tasks.isAnalyzing(store.currentId, store.curren
 const decomposing = computed(() => tasks.isDecomposing(store.currentId, store.currentEpisodeId))
 const progressPct = computed(() => tasks.decomposePercent)
 
+// ── 阶段二：分镜模式（自动/手动）+ 分镜模式预设（按剧本类型，可在「提示词模板」新增）──
+const decomposeMode = ref('auto')        // 'auto' | 'manual'
+const presetOptions = ref([])            // batch_decompose 的多套提示词预设
+const selectedPreset = ref(null)         // 选中的分镜模式预设 id
+const manualText = ref('')               // 手动分镜：每段（空行分隔）= 一镜
+
+async function loadDecomposePresets() {
+  try {
+    const tpls = await api.listTemplates()
+    const bd = tpls?.batch_decompose
+    if (bd?.presets?.length) {
+      presetOptions.value = bd.presets.map((p) => ({ label: p.name, value: p.id }))
+      if (!selectedPreset.value || !bd.presets.some((p) => p.id === selectedPreset.value)) {
+        selectedPreset.value = bd.active || bd.presets[0].id
+      }
+    }
+  } catch { /* 模板拉取失败不阻塞拆解（后端用 active 预设兜底） */ }
+}
+
+// 手动分镜：按空行把原文切成「一段=一镜」的片段
+const manualSegments = computed(() =>
+  manualText.value.split(/\n\s*\n/).map((s) => s.trim()).filter(Boolean))
+
+// 切到手动模式时，用本集原文预填，方便人工在此切分（增删空行=调整分镜边界）
+watch(decomposeMode, (m) => {
+  if (m === 'manual' && !manualText.value.trim()) {
+    const ep = store.currentEpisode
+    const segs = (ep?.segments || []).map((s) => (s.text || '').trim()).filter(Boolean)
+    if (segs.length) {
+      manualText.value = segs.join('\n\n')
+    } else {
+      const raw = ep?.raw_text || ''
+      manualText.value = raw
+        ? raw.split(/\n\s*\n/).map((s) => s.trim()).filter(Boolean).join('\n\n')
+        : ''
+    }
+  }
+})
+
 onMounted(async () => {
   await store.refreshList()
   if (!store.current && store.projects.length) {
     await store.select(store.projects[0].id)
   }
+  await loadDecomposePresets()
 })
 
 // Surface success/failure toasts when a job this view started finishes (the
@@ -55,6 +96,26 @@ async function onSelect(pid) {
 
 const bible = computed(() => store.current?.story_bible)
 const shots = computed(() => store.currentEpisode?.shots || [])
+
+const characterQuery = ref('')
+const showAllCharacters = ref(false)
+const visibleCharacters = computed(() => {
+  const list = bible.value?.characters || []
+  const q = characterQuery.value.trim().toLowerCase()
+  const filtered = q
+    ? list.filter((c) => [c.name, c.alias, c.bio, c.note, c.appearance, c.first_appearance].filter(Boolean).join(' ').toLowerCase().includes(q))
+    : list
+  return showAllCharacters.value ? filtered : filtered.slice(0, 8)
+})
+const hiddenCharacterCount = computed(() => Math.max(0, (bible.value?.characters?.length || 0) - visibleCharacters.value.length))
+const characterGroups = computed(() => {
+  const groups = {}
+  for (const c of visibleCharacters.value) {
+    const key = (c.first_appearance || '未标注首次出现').split('·')[0]
+    ;(groups[key] ||= []).push(c)
+  }
+  return Object.entries(groups).map(([k, items]) => ({ key: k, items }))
+})
 
 // 风格 {{style}} 可手动设定：草稿与圣经保持同步，失焦/回车保存。
 const styleDraft = ref('')
@@ -84,7 +145,19 @@ async function runAnalyze() {
 
 async function runDecompose() {
   if (!store.current) return
-  await tasks.startDecompose(store.current.id, store.currentEpisodeId)
+  if (decomposeMode.value === 'manual') {
+    if (!manualSegments.value.length) {
+      message.warning('请先在下方文本框用「空行」分隔出至少一个分镜片段')
+      return
+    }
+    await tasks.startDecompose(store.current.id, store.currentEpisodeId, {
+      mode: 'manual', manual_segments: manualSegments.value,
+    })
+  } else {
+    await tasks.startDecompose(store.current.id, store.currentEpisodeId, {
+      mode: 'auto', template_preset: selectedPreset.value,
+    })
+  }
 }
 
 const shotColumns = [
@@ -140,13 +213,46 @@ const shotColumns = [
           <div class="stage-head">
             <div>
               <div class="stage-title">阶段二 · 分批拆解</div>
-              <div class="stage-desc">按块切分（滑动窗口带全局锚定+上块接口）→ 结构化分镜</div>
+              <div class="stage-desc">自动＝强制 LLM 按分镜模式拆解；手动＝人工切段、LLM 逐段填结构</div>
             </div>
             <n-button type="primary" :disabled="!bible" :loading="decomposing" @click="runDecompose">
               <template #icon><n-icon :component="GitBranchOutline" /></template>
-              {{ shots.length ? '重新拆解' : '开始拆解' }}
+              {{ decomposeMode === 'manual' ? '按手动分镜结构化' : (shots.length ? '重新拆解' : '开始拆解') }}
             </n-button>
           </div>
+
+          <div class="stage-controls">
+            <n-radio-group v-model:value="decomposeMode" size="small">
+              <n-radio-button value="auto">自动（强制 LLM）</n-radio-button>
+              <n-radio-button value="manual">手动分镜</n-radio-button>
+            </n-radio-group>
+            <n-tooltip v-if="decomposeMode === 'auto'" trigger="hover">
+              <template #trigger>
+                <n-select
+                  v-model:value="selectedPreset"
+                  :options="presetOptions"
+                  size="small"
+                  placeholder="分镜模式（剧本类型）"
+                  style="width: 200px"
+                />
+              </template>
+              分镜模式＝不同剧本类型的拆解提示词；可在「提示词模板 · 分批拆解」里新增自定义预设
+            </n-tooltip>
+          </div>
+
+          <div v-if="decomposeMode === 'manual'" class="manual-box">
+            <div class="manual-hint">
+              一段（空行分隔）＝一个分镜，由你决定镜头边界；其余结构（场景/角色/动作/机位/对白/时长）由 LLM 逐段填充。
+              当前共 <b>{{ manualSegments.length }}</b> 个分镜。
+            </div>
+            <n-input
+              v-model:value="manualText"
+              type="textarea"
+              :autosize="{ minRows: 6, maxRows: 16 }"
+              placeholder="把本集原文按镜切分，用空行分隔每个分镜片段……"
+            />
+          </div>
+
           <n-progress
             v-if="decomposing"
             type="line"
@@ -177,12 +283,31 @@ const shotColumns = [
             <span class="bible-hint">全流程统一沿用此风格值；留空将回退 AI 分析缺省</span>
           </div>
         </div>
+        <div class="asset-toolbar">
+          <n-input v-model:value="characterQuery" size="small" clearable placeholder="搜索人物（姓名/别名/小传/备注/外形）" style="max-width: 360px" />
+          <n-button size="small" quaternary @click="showAllCharacters = !showAllCharacters">
+            {{ showAllCharacters ? '收起人物' : `展开全部人物${hiddenCharacterCount ? `（+${hiddenCharacterCount}）` : ''}` }}
+          </n-button>
+        </div>
         <div class="asset-cols">
           <div class="asset-col">
             <div class="asset-h"><n-icon :component="PersonOutline" /> 人物 <span class="tg">@</span></div>
-            <div v-for="(c, i) in bible.characters" :key="i" class="asset-item">
-              <b>@{{ c.name }}</b><div class="asset-d">{{ c.appearance || c.note }}</div>
-            </div>
+            <n-collapse accordion>
+              <n-collapse-item v-for="g in characterGroups" :key="g.key" :title="`${g.key}（${g.items.length}）`">
+                <div v-for="(c, i) in g.items" :key="i" class="asset-item">
+                  <div class="asset-item-head">
+                    <b>@{{ c.name }}</b>
+                    <n-tag v-if="c.alias" size="tiny" :bordered="false">别名</n-tag>
+                  </div>
+                  <div class="asset-d" v-if="c.bio">{{ c.bio }}</div>
+                  <div class="asset-d" v-else>{{ c.appearance || c.note }}</div>
+                  <div class="asset-mini" v-if="c.alias">别名：{{ c.alias }}</div>
+                  <div class="asset-mini" v-if="c.first_appearance">首次出现：{{ c.first_appearance }}</div>
+                  <div class="asset-mini" v-if="c.appearance">外形：{{ c.appearance }}</div>
+                  <div class="asset-mini" v-if="c.note && c.note !== c.bio">备注：{{ c.note }}</div>
+                </div>
+              </n-collapse-item>
+            </n-collapse>
           </div>
           <div class="asset-col">
             <div class="asset-h"><n-icon :component="LocationOutline" /> 场景 <span class="tg sc">#</span></div>
@@ -239,6 +364,20 @@ const shotColumns = [
 }
 .stage-title { font-weight: 700; font-size: 15px; }
 .stage-desc { color: var(--app-text-muted); font-size: 12px; margin-top: 4px; }
+.stage-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+.manual-box { margin-top: 12px; }
+.manual-hint {
+  color: var(--app-text-muted);
+  font-size: 12px;
+  margin-bottom: 8px;
+  line-height: 1.6;
+}
 .bible-head {
   display: flex;
   flex-wrap: wrap;
@@ -251,6 +390,14 @@ const shotColumns = [
 .bible-k {
   color: var(--app-text-muted);
   margin-right: 8px;
+}
+.asset-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
 }
 .asset-cols {
   display: grid;

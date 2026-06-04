@@ -1,16 +1,19 @@
 """Phase 2/3 routes: project import, two-stage LLM analysis, prompt templates,
 asset library (@/#/$) and reference-image generation."""
 
+import os
+
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
 from .core import assets as assets_core
 from .core import batches, jobs, projects
 from .core import prompt_templates as tpl
+from .core import settings as settings_store
 from .core import story_state
 from .core.paths import OUTPUT_DIR, PROJECTS_DIR
-from .services import (asset_gen, batch_engine, continuity, episode_splitter,
-                       ffmpeg_util, image_gen, jianying_export,
-                       script_analysis, script_parser)
+from .services import (asset_gen, batch_engine, continuity, episode_runner,
+                       episode_splitter, ffmpeg_util, image_gen,
+                       jianying_export, script_analysis, script_parser)
 from .services import llm as llm_service
 
 
@@ -27,6 +30,64 @@ def register(app: Flask) -> None:
             return jsonify({"error": "项目不存在"}), 404
         return jsonify(p)
 
+    @app.route("/api/projects/<pid>/overview", methods=["GET"])
+    def project_overview(pid):
+        """项目概览：每集的体量 + 按批次聚合的图片/视频任务进度（done/total/error）。
+        供概览页项目管理钻取使用，一次返回，避免逐集多次请求。"""
+        p = projects.get_project(pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        # 按 episode_id + kind 聚合批次进度
+        agg: dict = {}
+        for b in batches.list_batches(pid):
+            eid = b.get("episode_id")
+            kind = b.get("kind", "image")
+            slot = agg.setdefault(eid, {
+                "image": {"done": 0, "total": 0, "error": 0},
+                "video": {"done": 0, "total": 0, "error": 0},
+            })
+            if kind in slot:
+                slot[kind]["done"] += b.get("done", 0)
+                slot[kind]["total"] += b.get("total", 0)
+                slot[kind]["error"] += b.get("error", 0)
+        eps = []
+        for ep in p.get("episodes", []):
+            prog = agg.get(ep["id"], {
+                "image": {"done": 0, "total": 0, "error": 0},
+                "video": {"done": 0, "total": 0, "error": 0},
+            })
+            eps.append({
+                "id": ep["id"],
+                "idx": ep.get("idx"),
+                "name": ep.get("name", ""),
+                "stage": ep.get("stage", "imported"),
+                "segment_count": len(ep.get("segments", [])),
+                "shot_count": len(ep.get("shots", [])),
+                "char_count": ep.get("char_count", 0),
+                "progress": prog,
+            })
+        return jsonify({
+            "id": p["id"],
+            "name": p.get("name", ""),
+            "episode_count": len(eps),
+            "segment_count": sum(e["segment_count"] for e in eps),
+            "shot_count": sum(e["shot_count"] for e in eps),
+            "updated_at": p.get("updated_at"),
+            "episodes": eps,
+        })
+
+    @app.route("/api/projects/<pid>", methods=["PATCH"])
+    def rename_project(pid):
+        """重命名项目（项目管理基础操作）。"""
+        if not projects.get_project(pid):
+            return jsonify({"error": "项目不存在"}), 404
+        body = request.json or {}
+        name = (body.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "项目名不能为空"}), 400
+        p = projects.update_project(pid, {"name": name})
+        return jsonify(p)
+
     @app.route("/api/projects/<pid>", methods=["DELETE"])
     def delete_project(pid):
         projects.delete_project(pid)
@@ -40,10 +101,17 @@ def register(app: Flask) -> None:
         name = body.get("name", "")
         if not text.strip():
             return jsonify({"error": "文本为空"}), 400
-        episodes = episode_splitter.split_into_episodes(text, file_type)
+        use_llm = body.get("use_llm", True)
+        llm_model = body.get("llm_model") or None
+        split_meta: dict = {}
+        episodes = episode_splitter.split_into_episodes(
+            text, file_type, use_llm=use_llm, llm_model=llm_model, meta=split_meta)
         if not episodes:
             return jsonify({"error": "未解析出任何片段，请检查文件格式"}), 400
         project = projects.create_project(name, episodes=episodes)
+        # 自适应分集结果（method: markers/llm/volume；episodes: 集数）供前端 toast 提示
+        project = dict(project)
+        project["split"] = split_meta
         return jsonify(project)
 
     # ── episodes (集) ──
@@ -172,6 +240,11 @@ def register(app: Flask) -> None:
             return jsonify({"error": "分集不存在"}), 404
         model = body.get("model")
         ep_no = ep.get("idx", 1)
+        mode = (body.get("mode") or "auto").strip()
+        template_preset = body.get("template_preset")  # 分镜模式（batch_decompose 预设）
+        manual_segments = body.get("manual_segments") or []
+        if mode == "manual" and not [s for s in manual_segments if (s or "").strip()]:
+            return jsonify({"error": "手动分镜模式需提供至少一个分镜片段"}), 400
         # cross-episode handoff: seed with the previous episode's closing handoff
         prev_ep = projects.prev_episode(pid, eid)
         prev_handoff = None
@@ -181,11 +254,18 @@ def register(app: Flask) -> None:
 
         def worker(job_id):
             def on_progress(done, total):
+                label = "结构化分镜" if mode == "manual" else "拆解块"
                 jobs.update(job_id, progress=done, total=total,
-                            message=f"拆解块 {done}/{total}")
-            result = script_analysis.run_decompose(
-                ctx, model=model, on_progress=on_progress,
-                episode_no=ep_no, prev_handoff_init=prev_handoff)
+                            message=f"{label} {done}/{total}")
+            if mode == "manual":
+                result = script_analysis.run_decompose_manual(
+                    ctx, manual_segments, model=model, on_progress=on_progress,
+                    episode_no=ep_no, prev_handoff_init=prev_handoff)
+            else:
+                result = script_analysis.run_decompose(
+                    ctx, model=model, on_progress=on_progress,
+                    episode_no=ep_no, prev_handoff_init=prev_handoff,
+                    template_preset=template_preset)
             projects.update_episode(pid, eid, {
                 "shots": result["shots"],
                 "blocks": result["blocks"],
@@ -262,6 +342,47 @@ def register(app: Flask) -> None:
             return jsonify({"error": str(e)}), 500
         return jsonify(out)
 
+    @app.route("/api/projects/<pid>/assets/generate-missing", methods=["POST"])
+    def gen_missing_ref_images(pid):
+        p = projects.get_project(pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        body = request.json or {}
+        try:
+            out = asset_gen.generate_missing(
+                pid, model=body.get("model"), size=body.get("size", "1024x1024"),
+                concurrency=body.get("concurrency"))
+        except image_gen.GenerationError as e:
+            return jsonify({"error": str(e)}), 502
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": str(e)}), 500
+        return jsonify(out)
+
+    @app.route("/api/projects/<pid>/assets/<aid>/import-image", methods=["POST"])
+    def import_ref_image(pid, aid):
+        if not projects.get_project(pid):
+            return jsonify({"error": "项目不存在"}), 404
+        f = request.files.get("file")
+        if not f:
+            return jsonify({"error": "未收到图片文件"}), 400
+        import tempfile
+        suffix = "." + (f.filename.rsplit(".", 1)[-1] if "." in (f.filename or "") else "png")
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        try:
+            f.save(tmp.name)
+            tmp.close()
+            out = asset_gen.import_ref_image(pid, aid, tmp.name, orig_name=f.filename or "")
+        except image_gen.GenerationError as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": str(e)}), 500
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+        return jsonify(out)
+
     @app.route("/api/projects/<pid>/asset-image/<path:filename>", methods=["GET"])
     def serve_asset_image(pid, filename):
         return send_from_directory(PROJECTS_DIR / pid / "assets", filename)
@@ -279,6 +400,56 @@ def register(app: Flask) -> None:
         if not projects.get_project(pid):
             return jsonify({"error": "项目不存在"}), 404
         return jsonify(batches.list_batches(pid))
+
+    @app.route("/api/projects/<pid>/shot_prompts", methods=["POST"])
+    def shot_prompts(pid):
+        """Preview editable image/video prompts for shots (no generation)."""
+        p = projects.get_project(pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        body = request.json or {}
+        _eid, ep = _resolve_episode(pid, body)
+        if not ep:
+            return jsonify({"error": "分集不存在"}), 404
+        ctx = {**ep, "_pid": pid, "assets": p.get("assets", []),
+               "story_bible": p.get("story_bible")}
+        prompts = batch_engine.build_shot_prompts(ctx, body.get("shot_nos"))
+        return jsonify({"prompts": prompts})
+
+    @app.route("/api/projects/<pid>/infer_shot_prompt", methods=["POST"])
+    def infer_shot_prompt(pid):
+        """LLM 逐镜推理图片+视频提示词（点「AI推理」时调用，喂连续性+关联资产）。"""
+        p = projects.get_project(pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        body = request.json or {}
+        shot_no = body.get("shot_no")
+        if not shot_no:
+            return jsonify({"error": "缺少 shot_no"}), 400
+        _eid, ep = _resolve_episode(pid, body)
+        if not ep:
+            return jsonify({"error": "分集不存在"}), 404
+        ctx = {**ep, "_pid": pid, "assets": p.get("assets", []),
+               "story_bible": p.get("story_bible")}
+        try:
+            res = batch_engine.infer_shot_prompt(ctx, shot_no, model=body.get("model"))
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify(res)
+
+    def _apply_prompts(tasks, kind, overrides):
+        """Resolve each task's final generation prompt:
+        - explicit per-shot override (the worktable's edited text) wins;
+        - else for video, render the user-editable `video_prompt` template
+          (image description + 【镜头动态】) so engine-default video batches use
+          the same video prompt the worktable shows;
+        - else (image) keep the engine image prompt as-is."""
+        for t in tasks:
+            ov = (overrides or {}).get(t.get("shot_no"))
+            if ov and ov.strip():
+                t["prompt"] = ov.strip()
+            elif kind == "video":
+                t["prompt"] = batch_engine.build_video_prompt(t, t.get("prompt", ""))
 
     @app.route("/api/projects/<pid>/batches", methods=["POST"])
     def create_batch(pid):
@@ -307,12 +478,7 @@ def register(app: Flask) -> None:
             ctx = {**ep, "assets": p.get("assets", []),
                    "story_bible": p.get("story_bible")}
             tasks = batch_engine.build_tasks_from_shots(ctx, body.get("shot_nos"))
-            # per-shot prompt overrides from the worktable (keep materials intact)
-            overrides = body.get("prompt_overrides") or {}
-            for t in tasks:
-                ov = overrides.get(t.get("shot_no"))
-                if ov and ov.strip():
-                    t["prompt"] = ov.strip()
+            _apply_prompts(tasks, kind, body.get("prompt_overrides") or {})
         if not tasks:
             return jsonify({"error": "没有可生成的任务"}), 400
         params = dict(body.get("params", {}) or {})
@@ -366,6 +532,56 @@ def register(app: Flask) -> None:
         batches.reset_failed(pid, bid)
         return jsonify({"job_id": _start_batch_job(pid, bid)})
 
+    @app.route("/api/projects/<pid>/episode_batches", methods=["POST"])
+    def create_episode_batches(pid):
+        """Per-episode concurrent generation: one serial batch per episode, run
+        with bounded cross-episode parallelism (单集串行 · 多集并发).
+
+        body: {kind, episodes:[{episode_id, shot_nos?, prompt_overrides?}],
+               params?, max_parallel?}
+        """
+        p = projects.get_project(pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        body = request.json or {}
+        kind = body.get("kind", "image")
+        eps = body.get("episodes") or []
+        if not eps:
+            return jsonify({"error": "未选择任何分集"}), 400
+        params_base = dict(body.get("params") or {})
+        default_cap = settings_store.load_settings().get("max_parallel_episodes", 2)
+        max_parallel = int(body.get("max_parallel") or default_cap)
+        created, skipped = [], []
+        for item in eps:
+            eid = (item or {}).get("episode_id")
+            ep = projects.get_episode(pid, eid)
+            if not ep or (ep.get("stage") != "decomposed" and not ep.get("shots")):
+                skipped.append({"episode_id": eid, "reason": "未拆解或不存在"})
+                continue
+            ctx = {**ep, "assets": p.get("assets", []),
+                   "story_bible": p.get("story_bible")}
+            tasks = batch_engine.build_tasks_from_shots(ctx, item.get("shot_nos"))
+            _apply_prompts(tasks, kind, item.get("prompt_overrides") or {})
+            if not tasks:
+                skipped.append({"episode_id": eid, "reason": "无可生成分镜"})
+                continue
+            label = f"{ep.get('name', eid)}-并发{'生视频' if kind == 'video' else '生图'}"
+            params = {**params_base, "episode_id": eid}
+            try:
+                # 单集串行：concurrency=1（含连续性链路）
+                batch = batches.create_batch(
+                    pid, kind, label, tasks, concurrency=1, params=params,
+                    max_attempts=body.get("max_attempts", 3))
+            except ValueError as e:
+                skipped.append({"episode_id": eid, "reason": str(e)})
+                continue
+            created.append({"episode_id": eid, "batch_id": batch["id"], "total": len(tasks)})
+        if not created:
+            return jsonify({"error": "没有可生成的分集", "skipped": skipped}), 400
+        job_id = episode_runner.start(pid, [c["batch_id"] for c in created], max_parallel)
+        return jsonify({"created": created, "skipped": skipped,
+                        "job_id": job_id, "max_parallel": max_parallel})
+
     @app.route("/api/output/<pid>/<bid>/<path:filename>", methods=["GET"])
     def serve_output(pid, bid, filename):
         return send_from_directory(OUTPUT_DIR / pid / bid, filename)
@@ -393,7 +609,7 @@ def register(app: Flask) -> None:
         if prev is None:
             prev = story_state.get_current(pid)
         decision = continuity.decide_handoff(
-            shot, prev, use_llm=bool(body.get("use_llm")), model=body.get("model"))
+            shot, prev, use_llm=bool(body.get("use_llm", True)), model=body.get("model"))
         if body.get("commit"):
             story_state.set_decision(pid, shot.get("shot_no", ""), decision)
         return jsonify(decision)

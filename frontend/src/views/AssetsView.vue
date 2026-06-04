@@ -8,6 +8,7 @@ import {
 import {
   PersonOutline, LocationOutline, CubeOutline, AddOutline, ImageOutline,
   CreateOutline, TrashOutline, DownloadOutline, SparklesOutline, FlaskOutline,
+  FlashOutline, CloudUploadOutline, RefreshOutline,
 } from '@vicons/ionicons5'
 import PageHeader from '../components/PageHeader.vue'
 import { api } from '../api'
@@ -48,6 +49,13 @@ async function loadAssets() {
 }
 
 const byType = (t) => assets.value.filter((a) => a.type === t)
+
+// Stable per-type asset code (C01 / S01 / P01 …) shown on each card so users can
+// reference assets by number and keep numbering consistent across episodes.
+const CODE_PREFIX = { character: 'C', scene: 'S', prop: 'P' }
+function assetCode(col, idx) {
+  return `${CODE_PREFIX[col.type] || 'A'}${String(idx + 1).padStart(2, '0')}`
+}
 
 // ── add / edit modal ──
 const modal = ref(false)
@@ -91,6 +99,62 @@ async function seedFromBible() {
     message.success('已从故事圣经导入资产')
     await loadAssets()
   } catch (e) { message.error(e.message) }
+}
+
+// ── one-click generate missing reference images ──
+const missingCount = computed(() => assets.value.filter((a) => !a.ref_image).length)
+const batchGen = ref({ running: false, done: 0, total: 0, failed: [] })
+
+async function genMissing() {
+  if (!store.current) return
+  if (!missingCount.value) { message.info('所有资产都已有参考图'); return }
+  batchGen.value = { running: true, done: 0, total: missingCount.value, failed: [] }
+  try {
+    const r = await api.genMissingAssets(store.current.id, {})
+    batchGen.value.done = r.generated
+    batchGen.value.total = r.total
+    batchGen.value.failed = r.failed || []
+    await loadAssets()
+    if (r.failed?.length) {
+      message.warning(`生成完成：成功 ${r.generated}/${r.total}，失败 ${r.failed.length}（可重试）`)
+    } else if (r.total) {
+      message.success(`已补全 ${r.generated} 张缺失参考图`)
+    }
+  } catch (e) {
+    message.error('一键生成失败: ' + e.message)
+  } finally {
+    batchGen.value.running = false
+  }
+}
+
+async function retryFailed() {
+  // failed assets still have no ref_image, so generate-missing only retries them.
+  await genMissing()
+}
+
+// ── import an external image as the reference ──
+const importingId = ref(null)
+const fileInput = ref(null)
+let importTarget = null
+function pickImport(a) {
+  importTarget = a
+  fileInput.value?.click()
+}
+async function onFilePicked(e) {
+  const file = e.target.files?.[0]
+  e.target.value = ''  // allow re-picking the same file
+  if (!file || !importTarget) return
+  importingId.value = importTarget.id
+  try {
+    await api.importAssetImage(store.current.id, importTarget.id, file)
+    message.success(`已导入 ${importTarget.trigger}${importTarget.name} 参考图`)
+    await loadAssets()
+  } catch (err) {
+    message.error('导入失败: ' + err.message)
+  } finally {
+    importingId.value = null
+    importTarget = null
+  }
 }
 
 const genningId = ref(null)
@@ -139,8 +203,41 @@ async function runResolve() {
           <template #icon><n-icon :component="SparklesOutline" /></template>
           从故事圣经导入
         </n-button>
-        <span class="hint">提示：人物用「三视图+四头像」标准参考图；道具记录形制/年代/材质防穿帮。</span>
+        <n-button
+          size="small" type="primary"
+          :loading="batchGen.running"
+          :disabled="!missingCount && !batchGen.running"
+          @click="genMissing"
+        >
+          <template #icon><n-icon :component="FlashOutline" /></template>
+          一键生成缺失参考图<span v-if="missingCount">（{{ missingCount }}）</span>
+        </n-button>
+        <span class="hint">提示：仅补全未生成的资产（后续集新增资产也只补缺）；可逐个「导入」外部图片。</span>
       </div>
+
+      <n-alert
+        v-if="batchGen.running || batchGen.total"
+        :type="batchGen.failed.length ? 'warning' : (batchGen.running ? 'info' : 'success')"
+        :bordered="false" style="margin-bottom: 14px"
+      >
+        <template v-if="batchGen.running">
+          正在生成缺失参考图… 共 {{ batchGen.total }} 个待补全
+        </template>
+        <template v-else>
+          本次补全：成功 {{ batchGen.done }} / {{ batchGen.total }}
+          <template v-if="batchGen.failed.length">
+            ，失败 {{ batchGen.failed.length }}：
+            <n-tag
+              v-for="f in batchGen.failed" :key="f.id" size="small"
+              type="error" :bordered="false" style="margin: 0 4px 4px 0"
+            >{{ f.trigger }}{{ f.name }}</n-tag>
+            <n-button size="tiny" tertiary style="margin-left: 6px" @click="retryFailed">
+              <template #icon><n-icon :component="RefreshOutline" /></template>重试失败项
+            </n-button>
+          </template>
+        </template>
+      </n-alert>
+      <input ref="fileInput" type="file" accept="image/*" style="display:none" @change="onFilePicked" />
 
       <n-spin :show="loading">
         <div class="cols">
@@ -158,10 +255,11 @@ async function runResolve() {
 
             <n-empty v-if="!byType(col.type).length" description="暂无" size="small" style="margin: 24px 0" />
             <div v-else class="cards">
-              <div v-for="a in byType(col.type)" :key="a.id" class="asset">
+              <div v-for="(a, ai) in byType(col.type)" :key="a.id" class="asset">
                 <div class="thumb">
                   <n-image v-if="imgUrl(a)" :src="imgUrl(a)" object-fit="cover" width="100%" />
                   <div v-else class="thumb-empty"><n-icon :component="ImageOutline" size="22" /></div>
+                  <span class="code-badge">{{ assetCode(col, ai) }}</span>
                 </div>
                 <div class="asset-body">
                   <div class="asset-name"><span class="tg" :class="col.cls">{{ col.trigger }}</span>{{ a.name }}</div>
@@ -170,6 +268,9 @@ async function runResolve() {
                     <n-button size="tiny" :loading="genningId === a.id" @click="genRef(a)">
                       <template #icon><n-icon :component="ImageOutline" /></template>
                       {{ a.ref_image ? '重生' : '参考图' }}
+                    </n-button>
+                    <n-button size="tiny" quaternary :loading="importingId === a.id" title="从外部导入图片" @click="pickImport(a)">
+                      <template #icon><n-icon :component="CloudUploadOutline" /></template>
                     </n-button>
                     <n-button size="tiny" quaternary @click="openEdit(a)">
                       <template #icon><n-icon :component="CreateOutline" /></template>
@@ -284,10 +385,17 @@ async function runResolve() {
   background: var(--app-bg-soft); border: 1px solid var(--app-border); border-radius: 12px;
 }
 .thumb {
+  position: relative;
   width: 72px; height: 72px; flex: 0 0 72px; border-radius: 8px; overflow: hidden;
   background: var(--app-bg); display: flex; align-items: center; justify-content: center;
 }
 .thumb-empty { color: var(--app-text-muted); }
+.code-badge {
+  position: absolute; left: 3px; top: 3px;
+  font-family: var(--font-mono, monospace); font-size: 10px; font-weight: 700;
+  line-height: 1; padding: 2px 4px; border-radius: 4px;
+  background: rgba(0, 0, 0, 0.6); color: #fff;
+}
 .asset-body { flex: 1; min-width: 0; }
 .asset-name { font-weight: 600; margin-bottom: 3px; }
 .asset-desc {

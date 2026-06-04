@@ -25,7 +25,7 @@ const previewing = ref(false)
 // add / rename preset dialog
 const dialog = ref({ show: false, mode: 'add', name: '', clone: true })
 
-const STAGE_ORDER = ['stage1', 'stage2', 'asset', 'continuity']
+const STAGE_ORDER = ['stage1', 'stage2', 'asset', 'continuity', 'video']
 const groups = computed(() => {
   const by = {}
   for (const [key, t] of Object.entries(templates.value)) {

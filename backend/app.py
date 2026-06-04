@@ -8,13 +8,13 @@ browser for development.
 
 import logging
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 from . import routes_projects
 from .core import credentials, settings
-from .core.logbus import get_logs, setup_logging
+from .core.logbus import clear_logs, export_text, get_logs, setup_logging
 from .core.paths import STATIC_DIR, ensure_dirs
-from .services import llm
+from .services import llm, video_gen
 
 logger = setup_logging()
 
@@ -39,12 +39,29 @@ def create_app() -> Flask:
     # ── health / meta ──
     @app.route("/api/health")
     def health():
-        return jsonify({"ok": True, "service": "batch-studio", "version": "0.1.0"})
+        return jsonify({"ok": True, "service": "batch-studio", "version": "1.0.1"})
+
+    APP_VERSION = "1.0.1"
 
     @app.route("/api/logs")
     def logs():
         since = int(request.args.get("since_id", 0))
         return jsonify(get_logs(since))
+
+    @app.route("/api/logs/export")
+    def logs_export():
+        import time as _t
+        text = export_text(APP_VERSION)
+        fname = f"batch-studio-logs-{_t.strftime('%Y%m%d-%H%M%S')}.log"
+        resp = Response(text, mimetype="text/plain; charset=utf-8")
+        resp.headers["Content-Disposition"] = f'attachment; filename="{fname}"'
+        return resp
+
+    @app.route("/api/logs/clear", methods=["POST"])
+    def logs_clear():
+        n = clear_logs()
+        logger.info("日志已清空（移除 %d 条）", n)
+        return jsonify({"ok": True, "removed": n})
 
     # ── settings ──
     @app.route("/api/settings", methods=["GET"])
@@ -89,7 +106,17 @@ def create_app() -> Flask:
             if category == "llm":
                 models = llm.list_models(base_url=base_url, api_key=api_key)
                 return jsonify({"ok": True, "models": models[:200]})
-            # image/video/image_host: a lightweight reachability check
+            if category == "video":
+                provider = video_gen._detect_provider(base_url or "", body.get("provider", ""))
+                if provider == "seedance":
+                    # resolve stored key if the form sent a masked placeholder
+                    b, k, _m, _p = video_gen._resolve_creds(base_url, api_key)
+                    info = video_gen.seedance_user_info(b, k)
+                    return jsonify({"ok": True, "models": [], "info": {
+                        "Token": info.get("Token"), "FastToken": info.get("FastToken"),
+                        "SdDuration": info.get("SdDuration"),
+                    }})
+            # image/image_host (and OpenAI-style video): lightweight reachability
             return jsonify({"ok": True, "models": []})
         except Exception as e:  # noqa: BLE001
             return jsonify({"ok": False, "error": str(e)}), 200
