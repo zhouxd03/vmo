@@ -184,7 +184,9 @@ def build_tasks_from_shots(project: dict, shot_nos: Optional[list] = None) -> li
     return tasks
 
 
-# 搴撳唴 #鍦烘櫙/$閬撳叿 浠呬綔鍒嗙被锛涘杺缁欑敓鎴愭ā鍨嬫椂鎵€鏈夊紩鐢ㄧ粺涓€ @銆傚凡娉ㄥ唽璧勪骇鐢?# resolve_mentions 鏄犲皠涓?@鍚嶏紝鏈敞鍐岀殑娈嬬暀 #x/$x 涔熺粺涓€鏀瑰啓涓?@x銆?_STRAY_TAG_RE = re.compile(r"[#$](?=[\w\u4e00-\u9fff])")
+# Registered assets are resolved to @name; unresolved #scene/$prop tags are
+# also normalized to @name before entering image/video prompts.
+_STRAY_TAG_RE = re.compile(r"[#$](?=[\w\u4e00-\u9fff])")
 
 
 def _norm_refs(text: str, asset_list: list) -> str:
@@ -421,10 +423,10 @@ def _compose_llm_video_prompt(task: dict, image_prompt: str, video_prompt: str) 
 
 
 _PROMPT_META_SECTION_RE = re.compile(
-    r"\n*\s*銆愯緭鍑鸿姹傘€慬\s\S]*?(?=\n\s*銆怺^銆慮+銆憒\Z)",
+    r"\n*\s*【输出要求】[\s\S]*?(?=\n\s*【[^】]+】|\Z)",
     re.MULTILINE,
 )
-_ENGINE_REF_TOKEN_RE = re.compile(r"@鍥綷d+|reference_image_urls", re.IGNORECASE)
+_ENGINE_REF_TOKEN_RE = re.compile(r"@图\d+|reference_image_urls", re.IGNORECASE)
 
 
 def _clean_generated_prompt(text: str) -> str:
@@ -434,8 +436,8 @@ def _clean_generated_prompt(text: str) -> str:
     cleaned = reference_set.strip_definition_block(str(text)).strip()
     cleaned = _PROMPT_META_SECTION_RE.sub("", cleaned).strip()
     # LLMs sometimes echo these as plain bullets even when no heading is present.
-    cleaned = re.sub(r"(?m)^\s*[-鈥\s*鍙啓鏈暅鐪熸闇€瑕佺殑鍔ㄦ€佷俊鎭?*(?:\n|$)", "", cleaned)
-    cleaned = re.sub(r"(?m)^\s*[-鈥\s*涓嶈涓轰簡鐐妧鍫嗗彔杩囧杩愰暅鏈.*(?:\n|$)", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*[-•]\s*只写本镜真正需要的动态信息.*(?:\n|$)", "", cleaned)
+    cleaned = re.sub(r"(?m)^\s*[-•]\s*不要为了炫技堆叠过多运镜术语.*(?:\n|$)", "", cleaned)
     return cleaned.strip()
 
 

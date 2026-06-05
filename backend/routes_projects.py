@@ -484,6 +484,9 @@ def register(app: Flask) -> None:
             res = batch_engine.infer_shot_prompt(ctx, shot_no, model=body.get("model"))
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
+        except Exception as e:  # noqa: BLE001
+            app.logger.exception("infer_shot_prompt failed: pid=%s episode=%s shot=%s", pid, ep.get("id"), shot_no)
+            return jsonify({"error": f"提示词推理失败: {e}"}), 500
         saved = projects.update_shot_prompts(pid, ep["id"], shot_no, {
             "image": res.get("image", ""),
             "video": res.get("video", ""),
