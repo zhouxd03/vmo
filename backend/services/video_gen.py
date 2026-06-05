@@ -53,6 +53,16 @@ def _data_url(img_b64: str, mime: str = "image/png") -> str:
     return f"data:{mime};base64,{img_b64}"
 
 
+def _bearer_header(api_key: str) -> str:
+    key = (api_key or "").strip()
+    return key if key.lower().startswith("bearer ") else f"Bearer {key}"
+
+
+def _openai_video_base(api_base: str) -> str:
+    base = (api_base or "").strip().rstrip("/")
+    return base if base.endswith("/v1") else f"{base}/v1"
+
+
 def _video_reference_transport() -> str:
     value = str(settings_store.load_settings().get("video_reference_transport", "auto") or "auto").strip().lower()
     if value in {"auto", "public_url", "data_url"}:
@@ -104,6 +114,7 @@ def _detect_provider(base_url: str, provider: str) -> str:
 
 
 _VIDEO_URL_RE = re.compile(r"https?://[^\s\"'<>]+?\.(?:mp4|mov|webm)(?:\?[^\s\"'<>]*)?", re.I)
+_REF_TOKEN_LINE_RE = re.compile(r"(?m)^@图(\d+)\s+")
 
 
 def _looks_like_video_url(value: str) -> bool:
@@ -146,7 +157,7 @@ def _extract_video_url(obj) -> str:
 
 
 def _extract_task_id(obj: dict) -> str:
-    for k in ("id", "task_id", "taskId", "request_id", "job_id"):
+    for k in ("id", "Id", "ID", "task_id", "taskId", "request_id", "job_id"):
         v = obj.get(k)
         if v:
             return str(v)
@@ -154,6 +165,29 @@ def _extract_task_id(obj: dict) -> str:
     if isinstance(data, dict):
         return _extract_task_id(data)
     return ""
+
+
+def _adapt_seedance_prompt(prompt: str) -> str:
+    """Seedance receives images as multipart ``files`` parts.
+
+    Keep the engine's @图N numbering for local review, but add the provider's
+    @imageN and natural 图片N wording so the submitted prompt works with
+    both placeholder styles by upload order.
+    """
+    text = prompt or ""
+    text = text.replace(
+        "@图N 按 reference_image_urls 数组顺序编号",
+        "@图N/@imageN/图片N 按 multipart files 上传顺序编号",
+    )
+    text = text.replace(
+        "仅说明随附参考图的对应关系",
+        "仅说明随附参考图的对应关系；Seedance 中 @imageN/图片N 即第N个上传的 files",
+    )
+    text = text.replace("各 @图 对象", "各 @图/@image/图片 对象")
+    return _REF_TOKEN_LINE_RE.sub(
+        lambda m: f"@图{m.group(1)} / @image{m.group(1)} / 图片{m.group(1)} ",
+        text,
+    )
 
 
 def _stringify_upstream(value, limit: int = 1200) -> str:
@@ -317,7 +351,7 @@ def generate_video(
         ref_url_cache[transport] = urls
         return urls
 
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    headers = {"Authorization": _bearer_header(key), "Content-Type": "application/json"}
     payload = {
         "model": model,
         "prompt": prompt,
@@ -330,7 +364,7 @@ def generate_video(
     # 澶氭ā鎬佽蒋鍙傝€冪敓瑙嗛锛氫笂涓€闀滃熬甯?/ 瀵兼紨鍥?/ 绔欎綅鍥?/ 璧勪骇鍥惧潎浠ュ弬鑰冨浘
     # (reference_image_urls) 鍠傚叆锛屾ā鍨嬫嵁姝ら噸娓叉煋褰撳墠闀溿€傛敞锛氭湰涓浆 seed-2.0fast
     # 涓嶆敮鎸併€岄甯ч拤姝汇€嶅浘鐢熻棰戯紙瀹炴祴杈撳叆鍥捐闈欓粯涓㈠純锛夛紝鏁呯粺涓€璧拌蒋鍙傝€冦€?
-    submit_url = f"{api_base}/v1/videos"
+    submit_url = f"{_openai_video_base(api_base)}/videos"
 
     def _attach_refs(transport):
         if ref_images_b64:
@@ -378,8 +412,8 @@ def generate_video(
 
 
 def _poll(api_base, task_id, key, timeout, interval, on_progress, on_stage=None) -> str:
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    poll_url = f"{api_base}/v1/videos/{task_id}"
+    headers = {"Authorization": _bearer_header(key), "Content-Type": "application/json"}
+    poll_url = f"{_openai_video_base(api_base)}/videos/{task_id}"
     elapsed = 0
     while elapsed < timeout:
         time.sleep(interval)
@@ -460,6 +494,7 @@ def _generate_seedance(
 ) -> dict:
     root = _seedance_root(api_base)
     model = model or _SEEDANCE_DEFAULT_MODEL
+    prompt = _adapt_seedance_prompt(prompt)
     dur = max(4, min(15, int(duration or 5)))          # Seedance allows 4-15s
     aspect = aspect_ratio if aspect_ratio in _SEEDANCE_ASPECTS else "16:9"
     res = resolution if resolution in _SEEDANCE_RES else "720p"
@@ -476,26 +511,30 @@ def _generate_seedance(
         "watermark": "true" if watermark else "false",
     }
     files = []
+    ref_mapping: list[dict] = []
     for i, b in enumerate(ref_images_b64 or []):
         try:
             raw = base64.b64decode(b)
         except Exception as e:  # noqa: BLE001
             raise VideoError(f"绗?{i+1} 寮犲弬鑰冨浘鏁版嵁鏃犳晥") from e
         files.append(("files", (f"ref{i+1}.png", raw, "image/png")))
-    if files and on_refs_prepared:
-        mapping = []
+    if files:
         for idx, _b in enumerate(ref_images_b64 or []):
             meta = (ref_meta or [])[idx] if idx < len(ref_meta or []) else {}
-            mapping.append({
+            ref_mapping.append({
                 "index": idx + 1,
                 "token": meta.get("token") or f"@图{idx + 1}",
+                "provider_token": f"@image{idx + 1}",
+                "provider_tokens": [f"@image{idx + 1}", f"图片{idx + 1}"],
                 "role": meta.get("role") or "unknown",
                 "name": meta.get("name") or "",
                 "filename": meta.get("filename") or f"ref{idx + 1}.png",
                 "sha256": meta.get("sha256") or "",
                 "host": "seedance-multipart",
             })
-        on_refs_prepared(mapping, [])
+        logger.info("[Video][Seedance] multipart refs prepared: %s", ref_mapping)
+        if on_refs_prepared:
+            on_refs_prepared(ref_mapping, [])
 
     mode = "鍥剧敓瑙嗛" if files else "鏂囩敓瑙嗛"
     submit_url = f"{root}/seedanceapi/common/File/All"
@@ -530,6 +569,10 @@ def _generate_seedance(
     if on_stage:
         on_stage("downloading", "下载视频中", 99)
     out = _download(video_url, model, dur, save_dir, filename_prefix)
+    if ref_mapping:
+        out["reference_image_mapping"] = ref_mapping
+        out["reference_image_urls"] = []
+        out["reference_transport"] = "seedance-multipart"
     if on_progress:
         on_progress(100)
     return out

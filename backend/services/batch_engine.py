@@ -851,6 +851,17 @@ def _finalize_refs(task: dict, items: list, kind: str = "video", max_refs: int |
     return [it["b64"] for it in kept], prompt
 
 
+def _is_seedance_video_params(params: dict) -> bool:
+    model = str((params or {}).get("model") or "").strip().lower()
+    if model.startswith("doubao-seedance"):
+        return True
+    try:
+        _base, _key, default_model, provider = video_gen._resolve_creds(None, None)
+        return provider == "seedance" or str(default_model or "").lower().startswith("doubao-seedance")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _generate_video_with_refs(pid: str, batch: dict, task: dict, params: dict,
                               items: list, *, filename_prefix: str,
                               prompt_prefix: str = "",
@@ -890,13 +901,16 @@ def _generate_video_with_refs(pid: str, batch: dict, task: dict, params: dict,
 
     def _persist_prepared_refs(mapping: list[dict], urls: list[str]) -> None:
         try:
+            transport = "public_url"
+            if mapping and all((m.get("host") == "seedance-multipart") for m in mapping):
+                transport = "seedance-multipart"
             batches.update_task(pid, batch["id"], task["id"], {
                 "reference_image_mapping": mapping,
                 "reference_image_urls": urls,
                 "reference_preflight": {
                     "status": "prepared",
-                    "count": len(urls),
-                    "transport": "public_url",
+                    "count": len(mapping) or len(urls),
+                    "transport": transport,
                     "updated_at": time.time(),
                 },
             })
@@ -910,7 +924,7 @@ def _generate_video_with_refs(pid: str, batch: dict, task: dict, params: dict,
                 "reference_preflight": {
                     "status": "submitted",
                     "count": len(refs),
-                    "transport": "public_url",
+                    "transport": "seedance-multipart" if _is_seedance_video_params(params) else "public_url",
                     "video_task_id": task_id,
                     "updated_at": time.time(),
                 },
