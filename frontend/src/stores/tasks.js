@@ -17,11 +17,12 @@ let batchTimer = null
 let batchClock = null
 let decomposeTimer = null
 let batchPollStart = 0
+let batchRefreshing = false
 
 // Batch generation is slow (esp. video), but the UI must clear promptly when
 // a batch finishes. Poll quickly at first, then back off to avoid hammering.
-const BATCH_POLL_INITIAL_DELAY = 2_000
-const BATCH_POLL_INTERVAL = 15_000
+const BATCH_POLL_INITIAL_DELAY = 4_000
+const BATCH_POLL_INTERVAL = 20_000
 const BATCH_POLL_MAX_MINUTES_DEFAULT = 30
 const DECOMPOSE_POLL_INTERVAL = 1_000
 
@@ -94,10 +95,14 @@ export const useTasksStore = defineStore('tasks', {
 
     async refreshBatches() {
       if (!this.batchProjectId) return
+      if (batchRefreshing) return
+      batchRefreshing = true
       try {
         this.batches = await api.listBatches(this.batchProjectId)
       } catch {
         return // keep last-known batches on a transient fetch error
+      } finally {
+        batchRefreshing = false
       }
       this.batchActive = this.batches.some((b) => ['running', 'pending'].includes(b.status))
       if (this.batchActive) {

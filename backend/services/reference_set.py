@@ -51,6 +51,50 @@ ROLE_LABEL = {
 _FIRST_FRAME_ROLES = {"first_frame"}
 
 
+def clean_ref_name(value) -> str:
+    return str(value or "").lstrip("@#$").strip()
+
+
+def ordered_names(values) -> list[str]:
+    out, seen = [], set()
+    for value in values or []:
+        name = clean_ref_name(value)
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def shot_sort_key(shot: dict, item: dict) -> tuple:
+    """Canonical reference order used by preview, prompt numbering, and upload.
+
+    The order is based on the decomposed shot fields, never on raw mention
+    detection order:
+      characters[] -> scene -> props[] -> other refs.
+    Continuity refs should be appended by the caller in the explicit decision
+    order after asset refs.
+    """
+    role = item.get("role") or ""
+    name = clean_ref_name(item.get("name"))
+    characters = ordered_names((shot or {}).get("characters") or (shot or {}).get("characters_ref"))
+    scene = clean_ref_name((shot or {}).get("scene") or (shot or {}).get("scene_ref"))
+    props = ordered_names((shot or {}).get("props"))
+    if role in {"character", "support"}:
+        idx = characters.index(name) if name in characters else 999
+        return (0, idx, name)
+    if role == "scene":
+        idx = 0 if scene and name == scene else 999
+        return (1, idx, name)
+    if role == "prop":
+        idx = props.index(name) if name in props else 999
+        return (2, idx, name)
+    return (3, ROLE_RANK.get(role, 99), name)
+
+
+def sort_for_shot(items: list, shot: dict) -> list:
+    return sorted(list(items or []), key=lambda it: shot_sort_key(shot or {}, it))
+
+
 def material_role(material: dict) -> str:
     """Map an asset material (from resolve_mentions) to a priority role."""
     trig = material.get("trigger")
@@ -136,12 +180,13 @@ def _definition_desc(it: dict, kind: str) -> str:
     """「@图N 是 …」定义行里 `是` 之后的说明文本（按角色/资产名）。"""
     role = it.get("role")
     name = (it.get("name") or "").strip()
+    voice = (it.get("voice") or "").strip()
     is_video = (kind == "video")
     if role == "director":
         return ("是导演图，请参考该图中的构图、分镜与镜头语言生成剧情视频"
                 if is_video else "是导演图，请参考该图确定画面构图与分镜")
     if role == "staging":
-        return "是站位图，请参考该图确定各角色的站位与相对位置关系"
+        return "是站位图，仅用于确定各角色站位、左右关系、视线方向与空间相对位置；不要照抄其俯视图视角、草图画风或图中文字"
     if role == "first_frame":
         return "是上一镜尾帧，作为本镜视频首帧画面，从该画面自然运动起势"
     if role == "scene":
@@ -152,16 +197,22 @@ def _definition_desc(it: dict, kind: str) -> str:
     if role == "prop":
         return f"是 {name}" if name else "是 道具"
     if role == "support":
-        return f"是 {name}" if name else "是 配角"
+        base = f"是 {name}" if name else "是 配角"
+        return base + (f"（音色为：{voice}）" if voice else "")
     # character (@主角)
-    return f"是 {name}" if name else "是 主要角色"
+    base = f"是 {name}" if name else "是 主要角色"
+    return base + (f"（音色为：{voice}）" if voice else "")
 
 
-_DEF_HEAD = "【画面定义】（仅说明随附参考图的对应关系，不作为画面内容/文字输出）"
+_DEF_HEAD = "【画面定义】（@图N 按 reference_image_urls 数组顺序编号；仅说明随附参考图的对应关系，不作为画面内容/文字输出）"
 _DEF_TAIL = "务必严格保持各 @图 对象的形象/服装/场景/道具与参考图一致。"
 # 用于幂等：识别并剥离已存在于文本开头的【画面定义】块（含其后的空行）。
 _DEF_BLOCK_RE = re.compile(
     r"^\s*" + re.escape(_DEF_HEAD) + r".*?" + re.escape(_DEF_TAIL) + r"\s*",
+    re.DOTALL,
+)
+_DEF_FALLBACK_RE = re.compile(
+    r"^\s*【画面定义】[^\n]*(?:\n@图\d+[^\n]*)*(?:\n" + re.escape(_DEF_TAIL) + r")?\s*",
     re.DOTALL,
 )
 
@@ -171,7 +222,10 @@ def strip_definition_block(text: str) -> str:
     无论可编辑/预览提示词里是否已带定义行，生成时都重新生成权威定义、不重复堆叠。"""
     if not text:
         return text or ""
-    return _DEF_BLOCK_RE.sub("", text, count=1)
+    stripped = _DEF_BLOCK_RE.sub("", text, count=1)
+    if stripped != text:
+        return stripped
+    return _DEF_FALLBACK_RE.sub("", text, count=1)
 
 
 def build_definition_block(kept: list, kind: str = "video",

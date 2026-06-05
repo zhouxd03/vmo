@@ -32,7 +32,12 @@ DEFAULTS = {
     # reference images: hard cap on how many垫图 a single shot may feed the model.
     # When exceeded, lowest-priority images are dropped first, in the order
     # 导演图/首帧图 ＞ 角色图 ＞ 背景图 ＞ 配角图 ＞ 道具图.
-    "max_reference_images": 8,
+    "max_reference_images": 4,
+    # Video reference transport:
+    # - auto: public URL first, then Data URL if all public hosts fail
+    # - public_url: require a fetchable public URL
+    # - data_url: send data:image/...;base64 directly when the relay supports it
+    "video_reference_transport": "auto",
     # storage / theme
     "output_dir": str(OUTPUT_DIR),
     # 剪映/CapCut Windows 默认草稿目录。留空时只生成 zip，不自动写入剪映草稿库。

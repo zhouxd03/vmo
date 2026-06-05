@@ -219,6 +219,59 @@ def crop_b64_to_aspect(img_b64: str, ar_w: int, ar_h: int, *, tol: float = 0.01)
                 pass
 
 
+def fit_b64_to_size(img_b64: str, width: int, height: int, *, tol: float = 0.01) -> str:
+    """Fit a base64 image onto an exact output canvas without stretching.
+
+    Some image-to-video relays choose the video canvas from the first reference
+    image, even when ``aspect_ratio`` is also present. Rebuilding every
+    reference to the requested video canvas keeps the request self-consistent.
+    """
+    import base64 as _b64
+
+    if not img_b64 or width <= 0 or height <= 0:
+        return img_b64
+    tmp_in = APP_DIR / f"_vref_{uuid.uuid4().hex[:8]}_in.png"
+    tmp_out = APP_DIR / f"_vref_{uuid.uuid4().hex[:8]}_out.png"
+    try:
+        tmp_in.write_bytes(_b64.b64decode(img_b64))
+        dims = probe_image_size(tmp_in)
+        if dims:
+            w, h = dims
+            if w == width and h == height:
+                return img_b64
+            cur = w / h if h else 0
+            target = width / height
+            if abs(cur - target) <= tol:
+                vf = f"scale={width}:{height}:force_original_aspect_ratio=disable"
+            else:
+                vf = (
+                    f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                    f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+                )
+        else:
+            vf = (
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+            )
+        ff = ffmpeg_path()
+        proc = _run([ff, "-y", "-i", str(tmp_in), "-vf", vf, "-frames:v", "1", str(tmp_out)],
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=60)
+        if proc.returncode == 0 and tmp_out.exists():
+            return _b64.b64encode(tmp_out.read_bytes()).decode()
+        logger.warning(f"[ffmpeg] 参考图适配到 {width}x{height} 失败: {(proc.stderr or '')[-200:]}")
+        return img_b64
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[ffmpeg] 参考图画布适配异常: {e}")
+        return img_b64
+    finally:
+        for p in (tmp_in, tmp_out):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def aspect_to_image_size(aspect_ratio: str) -> str:
     """Map a video aspect ratio to the nearest gpt-image supported size that
     shares the same orientation (so director/staging helper images are framed

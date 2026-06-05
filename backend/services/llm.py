@@ -7,6 +7,7 @@ completions, including multimodal (image) messages for the continuity review.
 
 import json
 import logging
+import re
 from typing import Any, Optional
 
 import requests as http
@@ -18,6 +19,12 @@ logger = logging.getLogger("batch_studio")
 
 class LLMError(Exception):
     pass
+
+
+_JSON_UNSUPPORTED_RE = re.compile(
+    r"response_format|json_object|unsupported|not support|不支持|无效|invalid",
+    re.IGNORECASE,
+)
 
 
 def _resolve_creds(base_url: Optional[str], api_key: Optional[str]) -> tuple[str, str, str]:
@@ -71,12 +78,16 @@ def chat(
         payload["max_tokens"] = max_tokens
     if response_json:
         payload["response_format"] = {"type": "json_object"}
-    resp = http.post(
-        url,
-        json=payload,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        timeout=timeout,
-    )
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    resp = http.post(url, json=payload, headers=headers, timeout=timeout)
+    if resp.status_code >= 400 and response_json and _JSON_UNSUPPORTED_RE.search(resp.text or ""):
+        # Some OpenAI-compatible relays reject response_format even though the
+        # model can still return JSON when the prompt asks for it. Retry without
+        # that transport-level hint instead of failing the whole workflow.
+        retry_payload = dict(payload)
+        retry_payload.pop("response_format", None)
+        logger.info("[LLM] response_format unsupported; retrying JSON prompt without it")
+        resp = http.post(url, json=retry_payload, headers=headers, timeout=timeout)
     if resp.status_code >= 400:
         raise LLMError(f"LLM 调用失败 (HTTP {resp.status_code}): {resp.text[:300]}")
     data = resp.json()
@@ -103,4 +114,5 @@ def chat_json(messages: list[dict], **kwargs) -> Any:
         end = max(txt.rfind("}"), txt.rfind("]"))
         if start != -1 and end != -1:
             return json.loads(txt[start:end + 1])
-        raise LLMError(f"无法解析 LLM JSON 输出: {raw[:300]}")
+        snippet = raw[:500].replace("\n", "\\n")
+        raise LLMError(f"无法解析 LLM JSON 输出，请检查模型是否按模板返回严格 JSON。片段: {snippet}")

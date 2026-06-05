@@ -60,16 +60,16 @@ function assetCode(col, idx) {
 // ── add / edit modal ──
 const modal = ref(false)
 const editing = ref(null)
-const form = ref({ type: 'character', name: '', desc: '', appearance: '' })
+const form = ref({ type: 'character', name: '', desc: '', appearance: '', voice: '' })
 
 function openAdd(type) {
   editing.value = null
-  form.value = { type, name: '', desc: '', appearance: '' }
+  form.value = { type, name: '', desc: '', appearance: '', voice: '' }
   modal.value = true
 }
 function openEdit(a) {
   editing.value = a
-  form.value = { type: a.type, name: a.name, desc: a.desc, appearance: a.appearance }
+  form.value = { type: a.type, name: a.name, desc: a.desc, appearance: a.appearance, voice: a.voice || '' }
   modal.value = true
 }
 async function submit() {
@@ -77,7 +77,7 @@ async function submit() {
   try {
     if (editing.value) {
       await api.updateAsset(store.current.id, editing.value.id, {
-        name: form.value.name, desc: form.value.desc, appearance: form.value.appearance,
+        name: form.value.name, desc: form.value.desc, appearance: form.value.appearance, voice: form.value.voice,
       })
       message.success('已保存')
     } else {
@@ -255,7 +255,7 @@ async function runResolve() {
 
             <n-empty v-if="!byType(col.type).length" description="暂无" size="small" style="margin: 24px 0" />
             <div v-else class="cards">
-              <div v-for="(a, ai) in byType(col.type)" :key="a.id" class="asset">
+              <div v-for="(a, ai) in byType(col.type)" :key="a.id" class="asset" :class="{ 'character-card': col.type === 'character' }">
                 <div class="thumb">
                   <n-image v-if="imgUrl(a)" :src="imgUrl(a)" object-fit="cover" width="100%" />
                   <div v-else class="thumb-empty"><n-icon :component="ImageOutline" size="22" /></div>
@@ -263,7 +263,21 @@ async function runResolve() {
                 </div>
                 <div class="asset-body">
                   <div class="asset-name"><span class="tg" :class="col.cls">{{ col.trigger }}</span>{{ a.name }}</div>
-                  <div class="asset-desc">{{ a.appearance || a.desc || '—' }}</div>
+                  <template v-if="col.type === 'character'">
+                    <div class="prop-line voice-line">
+                      <span class="prop-k">音色</span>
+                      <span class="prop-v">{{ a.voice || '未设置' }}</span>
+                    </div>
+                    <div class="prop-line">
+                      <span class="prop-k">外形</span>
+                      <span class="prop-v">{{ a.appearance || '未设置' }}</span>
+                    </div>
+                    <div class="prop-line">
+                      <span class="prop-k">描述</span>
+                      <span class="prop-v">{{ a.desc || '—' }}</span>
+                    </div>
+                  </template>
+                  <div v-else class="asset-desc">{{ a.appearance || a.desc || '—' }}</div>
                   <div class="asset-actions">
                     <n-button size="tiny" :loading="genningId === a.id" @click="genRef(a)">
                       <template #icon><n-icon :component="ImageOutline" /></template>
@@ -338,6 +352,9 @@ async function runResolve() {
           <n-input v-model:value="form.appearance" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }"
             placeholder="外形/服装/发型/特征，用于生成三视图参考图" />
         </n-form-item>
+        <n-form-item v-if="form.type === 'character'" label="角色音色（voice）">
+          <n-input v-model:value="form.voice" placeholder="如：少女音，清亮偏软，急促时尾音发颤" />
+        </n-form-item>
         <n-form-item :label="form.type === 'prop' ? '形制/年代/材质（防穿帮）' : '描述'">
           <n-input v-model:value="form.desc" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }"
             :placeholder="form.type === 'prop' ? '如：古代青铜酒爵，非现代玻璃高脚杯' : '地点/时代/光影/布局 等'" />
@@ -384,6 +401,17 @@ async function runResolve() {
   display: flex; gap: 10px; padding: 10px;
   background: var(--app-bg-soft); border: 1px solid var(--app-border); border-radius: 12px;
 }
+.asset.character-card {
+  align-items: flex-start;
+  padding: 12px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--app-surface) 76%, var(--app-bg-soft));
+  box-shadow: 0 10px 24px rgba(0,0,0,.12);
+}
+.asset.character-card .thumb {
+  width: 92px; height: 112px; flex-basis: 92px;
+  border-radius: 10px;
+}
 .thumb {
   position: relative;
   width: 72px; height: 72px; flex: 0 0 72px; border-radius: 8px; overflow: hidden;
@@ -397,10 +425,28 @@ async function runResolve() {
   background: rgba(0, 0, 0, 0.6); color: #fff;
 }
 .asset-body { flex: 1; min-width: 0; }
-.asset-name { font-weight: 600; margin-bottom: 3px; }
+.asset-name {
+  display: flex; align-items: center; gap: 4px;
+  font-weight: 700; margin-bottom: 6px;
+}
 .asset-desc {
   color: var(--app-text-muted); font-size: 12px; line-height: 1.5;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.prop-line {
+  display: grid; grid-template-columns: 38px minmax(0, 1fr); gap: 8px;
+  margin-top: 5px; font-size: 12px; line-height: 1.45;
+}
+.prop-k {
+  color: var(--app-text-muted);
+}
+.prop-v {
+  color: var(--app-text-secondary);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.voice-line .prop-v {
+  color: var(--app-accent);
+  font-weight: 700;
 }
 .asset-actions { display: flex; gap: 6px; margin-top: 8px; }
 .resolver {

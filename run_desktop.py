@@ -302,12 +302,17 @@ def main() -> None:
     # Wait until the backend actually answers (not just the socket binds) so
     # the webview never navigates to a not-yet-serving URL (which would leave
     # a blank page with no retry).
-    _wait_for_health(port)
+    if not _wait_for_health(port):
+        _wlog.warning("Backend health check timed out before opening desktop window")
 
     api = Api()
+    start_route = os.environ.get("BATCH_STUDIO_START_ROUTE", "/worktable").strip() or "/worktable"
+    if not start_route.startswith("/"):
+        start_route = "/" + start_route
+    start_url = f"http://127.0.0.1:{port}/?desktop_ts={int(time.time())}#{start_route}"
     window = webview.create_window(
         "连续性批量创作工具",
-        f"http://127.0.0.1:{port}/",
+        start_url,
         width=1280,
         height=820,
         min_size=(860, 600),

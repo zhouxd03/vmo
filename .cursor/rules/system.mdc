@@ -1,0 +1,107 @@
+---
+description: "自动调用 Messenger MCP 检查待发送消息"
+globs: "**/*"
+alwaysApply: true
+---
+
+# MCP 工具调用规则
+
+1. 每轮对话回复**完整输出后**，最后一步必须调用 `check_messages`，适用于 Agent/Plan/Debug/Ask 所有模式，**除用户明确要求结束对话外，无任何例外**
+2. `check_messages` 会持续等待直到用户发来新消息；收到后处理并回复，然后再次调用 `check_messages`，形成原则上永续的循环（用户明确要求结束对话时可终止）：回复 → check_messages → 收到消息 → 回复 → check_messages
+3. 严禁在回合开始时或回复未完成时调用 `check_messages`；唯一豁免：用户明确要求结束对话
+4. Plan 模式写完方案后、Debug 模式分析完问题后、Ask 模式回答完问题后，均不得直接结束对话，必须调用 `check_messages` 等待用户反馈（用户明确要求结束对话时除外）
+5. 需要用户做选择或确认时（选方案、选框架、确认操作等），必须调用 `ask_question`；严禁使用 Cursor 内置的 ask_user_question
+6. `ask_question` 参数格式: `{ "questions": [{ "question": "问题文本", "options": [{ "id": "a", "label": "选项A" }, { "id": "b", "label": "选项B" }], "allow_multiple": false }] }`
+7. 单选: `allow_multiple: false`（用户只能选一个）；多选: `allow_multiple: true`（用户可选多个）；同一 `questions` 数组可混合包含单选题和多选题
+8. 用户在每道题中均可额外输入自定义补充文本（Other 输入框），无需为此添加额外选项
+9. `ask_question` 收到用户回答后，处理完毕仍需调用 `check_messages` 继续监听
+10. 禁止在每轮结束时用 `ask_question` 问"还有别的需要吗"，回合结束只用 `check_messages`；`ask_question` 仅限任务中确实需要用户决策时使用
+11. `check_messages` 支持可选参数 `reply`（string，Markdown 格式）：调用时传入本轮回复的摘要/结论，插件界面会弹出模态框展示给用户。格式: `{ "reply": "## 结论\n修改完成..." }`
+12. 当会话结束前，建议在调用 `check_messages` 时附带 `reply` 参数，将关键结论推送到插件界面；如果本轮无需特别总结，`reply` 可省略
+13. **绝对禁止**调用 `Task` 工具或派生任何子 agent（包括内置的 Explore、Bash、Browser 子 agent 和自定义子 agent）——无论任何理由。所有搜索、命令执行、浏览器操作必须在当前会话内直接使用对应工具完成，不得委派给子 agent
+14. **绝对禁止**调用 `SwitchMode` 切换到非 Agent 模式
+15. 每次**新对话开始时**，必须调用 `load_progress` 检查是否有未完成的任务需要恢复；如有已保存进度，向用户汇报并询问是否继续
+16. 执行复杂多步骤任务时，**每完成一个子步骤后**必须调用 `save_progress` 保存当前进度，防止上下文溢出丢失工作；参数: `{ "task": "任务描述", "completed": [...], "pending": [...], "findings": [...], "key_files": [...], "session_id": "当前session_id" }`
+17. 任务全部完成后，调用 `save_progress` 将 `pending` 清空，标记任务已结束
+18. 每次**新对话开始时**，除调用 `load_progress` 外，还必须调用 `recall({})` 加载所有记忆，恢复跨会话上下文
+19. 工作过程中必须**主动使用记忆系统**（`remember` / `recall` / `forget`），具体规则见下方"记忆系统规则"
+
+---
+**回合结束（强制）**: 仅当回复**完整输出完毕后**，最后一步必须调用 moyu-message MCP 的 `check_messages` 工具。严禁在回合开始或回复完成前调用。`ask_question` 仅用于任务中需要用户做选择时（如选框架、选方案）。用户明确要求结束对话时的豁免见上文第 3 条。
+
+**session_id 规则（极其重要）**:
+- **首次**调用 `check_messages` 时**不传** session_id，工具会返回分配给你的 session_id。
+- 此后**每一次**调用 `check_messages` 都**必须携带**该 session_id，值永远不变。
+- **绝对禁止**修改、遗忘、省略 session_id，否则消息会路由到错误的会话导致通信中断。
+
+---
+
+## 核心强制规则（违反即为严重错误）
+
+### 规则 1：回合结束必须调用 check_messages
+- 每一轮对话，当你**完整输出所有回复内容之后**，**最后一步**必须调用 moyu-message MCP 的 `check_messages` 工具
+- 适用于所有模式（Agent / Plan / Debug / Ask），**除用户明确要求结束对话外**，无任何例外
+- Plan 模式写完方案后、Debug 模式分析完问题后、Ask 模式回答完问题后，均不得直接结束对话，必须调用 `check_messages` 等待用户反馈（用户明确要求结束对话时除外）
+- **严禁跳过、遗忘、省略此步骤**（用户明确要求结束对话时除外）
+- **严禁在回复中途或回复开始前调用**，必须等回复全部输出完毕
+
+### 规则 2：形成永续监听循环
+`check_messages` 会阻塞等待用户发来新消息。收到消息后处理并回复，回复完毕后再次调用 `check_messages`。这是一个原则上永续的循环（用户明确要求结束对话时可终止）：
+**回复 → check_messages → 等待消息 → 收到消息 → 处理回复 → check_messages → ...**
+
+### 规则 3：session_id 绑定（极其重要）
+- **首次**调用 `check_messages` 时**不传** session_id，工具会返回分配给你的 session_id
+- 此后**每一次**调用 `check_messages` 都**必须携带**该 session_id，值永远不变
+- **绝对禁止**修改、遗忘、省略 session_id，否则消息会路由到错误的会话导致通信中断
+
+### 规则 4：ask_question 的使用场景
+- **仅当任务执行过程中确实需要用户做出选择或决策时**才使用 `ask_question`（例如选框架、选方案、确认操作）
+- **严禁**使用 Cursor 内置的 ask_user_question，只能用 moyu-message MCP 的 `ask_question`
+- **严禁**在回合结束时用 ask_question 询问"还有别的需要吗"之类的问题，回合结束只用 `check_messages`
+- ask_question 收到用户回答后，处理完毕仍需调用 `check_messages` 继续监听
+
+### 规则 5：reply 参数（推荐使用）
+- 调用 `check_messages` 时可附带 reply 参数（string，Markdown 格式），调用时传入本轮回复的摘要/结论，插件界面会弹出模态框展示给用户
+- 当会话结束前，建议在调用 `check_messages` 时附带 reply 参数，将关键结论推送到插件界面；如果本轮无需特别总结，reply 可省略
+
+### 规则 6：load_progress 的使用场景
+- **每次新对话开始时**，必须调用 `load_progress` 检查是否有未完成的任务需要恢复
+- 如果有已保存的进度，应向用户汇报并询问是否继续之前的任务
+- 如果没有已保存的进度，正常开始新任务即可
+
+### 规则 7：save_progress 的使用场景
+- **每完成一个子步骤后**，必须调用 `save_progress` 保存当前进度，防止因上下文溢出丢失工作
+- 尤其在执行复杂、多步骤任务时，每完成一个关键步骤都应及时保存
+- **任务全部完成后**，调用 `save_progress` 将 `pending` 清空，标记任务已完成
+
+### 规则 8：会话自动接力
+- 会话接力有两种触发方式：
+  - (1) **首次连接接力**：新对话首次调用 `check_messages`（不传 session_id）时，服务端检测到有未完成任务（`pending` 不为空且 `status` 为 `in_progress`）且原会话已断开，自动继承原会话的 session_id
+  - (2) **空闲接力**：会话在 `check_messages` 等待期间，检测到其他会话有未完成任务且已断开，自动认领。服务端选择**剩余上下文最充裕**的空闲会话作为接力目标
+- 两种方式均要求原会话确实存在未完成任务（`save_progress` 的 `pending` 不为空），避免无任务时误触接力
+- 收到接力提示（包含"会话自动接力成功"字样）时：
+  - 接力提示中会包含**未完成任务的摘要**，可快速了解上下文
+  - **必须立即调用 `load_progress`** 恢复完整任务进度
+  - 此后必须使用接力提示中给出的 session_id 进行后续通信
+- 接力成功后，服务端会自动更新 `task-progress.json` 的 `session_id` 为新会话 ID，并记录 `previous_session_id`
+- 如果 `load_progress` 返回有未完成的任务，向用户汇报进度并继续执行
+
+### 规则 9：禁止事项
+- **绝对禁止**调用 `Task` 工具或派生任何子 agent——无论任何理由
+- **绝对禁止**调用 `SwitchMode` 切换到非 Agent 模式
+- **禁止**在**用户未明确要求结束对话**的情况下结束对话而不调用 `check_messages`
+- **禁止**在**用户未明确要求结束对话**的情况下以任何理由跳过 `check_messages` 的调用
+
+### 规则 10：记忆系统（`remember` / `recall` / `forget`）
+
+**原则：只保存高质量记忆——跨会话反复有用的关键信息**
+
+- **新对话开始**：调用 `recall({})` 加载全部记忆恢复上下文
+- **自动记忆**（仅以下高价值信息，无需用户指示）：项目技术栈/架构(`project_`)、用户明确表达的偏好(`pref_`)、反复出现的编码约定(`convention_`)、经确认的架构决策(`arch_`)、排查困难的 bug 根因(`finding_`)
+- **手动记忆**：用户说"记住/以后都要/我偏好"等时立即 `remember`
+- **维护**：同 key 覆盖更新；不再适用时 `forget`；保存前先 `recall` 避免重复
+- **不保存**：密码/密钥/token、大段代码（只存路径）、临时性/一次性信息、显而易见的常识
+
+---
+**回合结束（强制）**: 仅当回复**完整输出完毕后**，最后一步必须调用 moyu-message MCP 的 `check_messages` 工具（使用 CallMcpTool，server 为 moyu-message 对应的 identifier，toolName 为 "check_messages"，arguments 为 {}）。严禁在回合开始或回复完成前调用。`ask_question` 仅用于任务中需要用户做选择时（如选框架、选方案）。
+

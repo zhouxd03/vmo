@@ -59,14 +59,72 @@ def run_global_analysis(
     )
     if not isinstance(bible, dict):
         raise llm.LLMError("全局分析未返回 JSON 对象")
-    bible.setdefault("title", "")
-    bible.setdefault("logline", "")
-    bible.setdefault("style", "")
-    bible.setdefault("characters", [])
-    bible.setdefault("scenes", [])
-    bible.setdefault("props", [])
-    bible.setdefault("continuity_constraints", [])
+    bible = _normalize_bible(bible)
     return bible
+
+
+def _as_list(v) -> list:
+    if isinstance(v, list):
+        return v
+    if v in (None, ""):
+        return []
+    return [v]
+
+
+def _normalize_bible(bible: dict) -> dict:
+    out = dict(bible or {})
+    for key in ("title", "logline", "style", "summary"):
+        out[key] = str(out.get(key) or "")
+    for key in ("characters", "scenes", "props"):
+        items = []
+        for it in _as_list(out.get(key)):
+            if isinstance(it, dict):
+                item = dict(it)
+                item["name"] = str(item.get("name") or "").strip()
+                if item["name"]:
+                    items.append(item)
+            elif str(it).strip():
+                items.append({"name": str(it).strip()})
+        out[key] = items
+    out["continuity_constraints"] = [
+        str(x).strip() for x in _as_list(out.get("continuity_constraints")) if str(x).strip()
+    ]
+    if not (out["characters"] or out["scenes"] or out["props"] or out.get("style")):
+        raise llm.LLMError("全局分析结果缺少人物/场景/道具/风格等有效信息，请换模型或调整原文后重试")
+    return out
+
+
+def _clean_text(v) -> str:
+    return str(v or "").strip()
+
+
+def _normalize_names(v) -> list[str]:
+    raw = v if isinstance(v, list) else ([v] if v else [])
+    return [_clean_text(x) for x in raw if _clean_text(x)]
+
+
+def _normalize_shot(raw: dict, *, chunk_seqs: list, shot_idx: int) -> dict:
+    if not isinstance(raw, dict):
+        raise llm.LLMError(f"第 {shot_idx + 1} 个分镜不是 JSON 对象")
+    sh = dict(raw)
+    sh["scene"] = _clean_text(sh.get("scene"))
+    sh["characters"] = _normalize_names(sh.get("characters"))
+    sh["props"] = _normalize_names(sh.get("props"))
+    sh["action"] = _clean_text(sh.get("action"))
+    sh["camera"] = _clean_text(sh.get("camera"))
+    sh["dialogue"] = _clean_text(sh.get("dialogue"))
+    sh["emotion"] = _clean_text(sh.get("emotion") or sh.get("mood"))
+    sh["key_elements"] = _clean_text(sh.get("key_elements"))
+    sh["handoff"] = _clean_text(sh.get("handoff"))
+    if not (sh["action"] or sh["dialogue"] or sh["scene"]):
+        raise llm.LLMError(f"第 {shot_idx + 1} 个分镜缺少 scene/action/dialogue，无法确定画面内容")
+    sh["seq"] = _coerce_int(sh.get("seq"))
+    for end_key in ("seq_end", "end_seq", "src_seq_end"):
+        if end_key in sh:
+            sh[end_key] = _coerce_int(sh.get(end_key))
+    if sh.get("seq") is None and chunk_seqs:
+        sh["seq"] = chunk_seqs[min(shot_idx, len(chunk_seqs) - 1)]
+    return sh
 
 
 def _entity_name(x) -> str:
@@ -160,6 +218,31 @@ def _resolve_src_seq(raw, seq_set: set, chunk_seqs: list, shot_idx: int, n_shots
     return chunk_seqs[pos]
 
 
+def _seq_index(chunk_seqs: list) -> dict:
+    return {seq: i for i, seq in enumerate(chunk_seqs)}
+
+
+def _src_text_for_seqs(chunk: list[dict], seqs: list) -> str:
+    wanted = set(seqs or [])
+    return "\n".join(
+        s.get("text") or "" for s in chunk
+        if s.get("seq") in wanted and (s.get("text") or "").strip()
+    ).strip()
+
+
+def _contiguous_seq_range(chunk_seqs: list, start, end=None) -> list:
+    if not chunk_seqs:
+        return []
+    idx = _seq_index(chunk_seqs)
+    if start not in idx:
+        return []
+    si = idx[start]
+    ei = idx.get(end, si) if end is not None else si
+    if ei < si:
+        ei = si
+    return chunk_seqs[si:ei + 1]
+
+
 _MATCH_PUNCT_RE = re.compile(r"[\s，。、；：！？“”‘’（）()\[\]【】…—\-·~,.!?;:\"'`*#@$]+")
 
 
@@ -187,25 +270,76 @@ def _coverage(shot_t: str, seg_t: str) -> float:
     return len(a & b) / len(a)
 
 
-def _match_source(shot: dict, chunk: list[dict]) -> tuple:
-    """Deterministically locate the source segment a shot derives from by
-    content overlap (narrative first, scene-slug only as a weak fallback).
+def _match_source_range(shot: dict, chunk: list[dict]) -> tuple:
+    """Locate the contiguous source segment range a shot derives from.
 
-    Returns (seq, text) of the best-matching segment, or (None, None) when no
-    segment is a confident match (caller then falls back to positional seq).
+    A shot may legitimately merge several source paragraphs/subtitles. Returning
+    only one seq makes the worktable "原文" look truncated, so we score short
+    contiguous windows and keep the smallest confident range.
     """
     core = (shot.get("action") or "") + (shot.get("dialogue") or "")
     target = _norm_match(core) or _norm_match(shot.get("scene") or "")
     if not target:
-        return None, None
-    best_seg, best = None, 0.0
-    for seg in chunk:
-        sc = _coverage(target, _norm_match(seg.get("text") or ""))
-        if sc > best:
-            best, best_seg = sc, seg
-    if best_seg is not None and best >= 0.18:
-        return best_seg.get("seq"), best_seg.get("text") or ""
-    return None, None
+        return [], ""
+    best: tuple[float, int, int] | None = None
+    max_window = min(8, len(chunk))
+    for i in range(len(chunk)):
+        combined = ""
+        for j in range(i, min(len(chunk), i + max_window)):
+            combined = (combined + "\n" + (chunk[j].get("text") or "")).strip()
+            raw_score = _coverage(target, _norm_match(combined))
+            # Prefer compact ranges when coverage is otherwise similar.
+            score = raw_score - max(0, j - i) * 0.015
+            if best is None or score > best[0]:
+                best = (score, i, j)
+    if not best or best[0] < 0.18:
+        return [], ""
+    _, i, j = best
+    seqs = [s.get("seq") for s in chunk[i:j + 1] if s.get("seq") is not None]
+    return seqs, _src_text_for_seqs(chunk, seqs)
+
+
+def _source_span_from_shot(shot: dict, chunk: list[dict], chunk_seqs: list,
+                           seq_set: set, shot_idx: int, n_shots: int) -> tuple:
+    """Return (start_seq, src_seq_list, src_text, is_content_match)."""
+    matched_seqs, matched_text = _match_source_range(shot, chunk)
+    if matched_seqs and matched_text:
+        return matched_seqs[0], matched_seqs, matched_text, True
+
+    start = _resolve_src_seq(shot.get("seq"), seq_set, chunk_seqs, shot_idx, n_shots)
+    raw_end = shot.get("seq_end") or shot.get("end_seq") or shot.get("src_seq_end")
+    end = _coerce_int(raw_end)
+    if end is not None and end in seq_set:
+        seqs = _contiguous_seq_range(chunk_seqs, start, end)
+    else:
+        seqs = [start] if start is not None else []
+    return start, seqs, _src_text_for_seqs(chunk, seqs), False
+
+
+def _fill_missing_source_ranges(shots_in_chunk: list[dict], chunk: list[dict],
+                                chunk_seqs: list) -> None:
+    """Expand weak single-seq fallbacks up to the next shot start when needed."""
+    if not chunk_seqs:
+        return
+    idx = _seq_index(chunk_seqs)
+    starts = [sh.get("seq") for sh in shots_in_chunk]
+    for i, sh in enumerate(shots_in_chunk):
+        cur = sh.get("src_seq") or []
+        if sh.pop("_src_content_match", False):
+            continue
+        if len(cur) != 1 or cur[0] not in idx:
+            continue
+        next_start = None
+        for cand in starts[i + 1:]:
+            if cand in idx and idx[cand] > idx[cur[0]]:
+                next_start = cand
+                break
+        if next_start is None:
+            continue
+        expanded = chunk_seqs[idx[cur[0]]:idx[next_start]]
+        if len(expanded) > len(cur):
+            sh["src_seq"] = expanded
+            sh["src_text"] = _src_text_for_seqs(chunk, expanded)
 
 
 def _bible_summary(bible: dict, chunk_text: str = "", prev_handoff: str = "") -> str:
@@ -293,28 +427,29 @@ def run_decompose(
             model=model,
             temperature=0.5,
         )
-        chunk_shots = result if isinstance(result, list) else result.get("shots", [])
+        chunk_shots = result if isinstance(result, list) else (
+            result.get("shots", []) if isinstance(result, dict) else [])
+        if not isinstance(chunk_shots, list) or not chunk_shots:
+            raise llm.LLMError(f"拆解块 {ci + 1} 未返回有效分镜数组")
         # Valid source seqs for this chunk; used to repair bad/duplicate seq so the
         # worktable「原文」maps each shot to the source paragraph it derives from.
         chunk_seqs = [s.get("seq") for s in chunk if s.get("seq") is not None]
         seq_set = set(chunk_seqs)
         n_shots = len(chunk_shots)
         block_shot_nos = []
-        for si, sh in enumerate(chunk_shots):
+        chunk_out: list[dict] = []
+        for si, raw_sh in enumerate(chunk_shots):
+            sh = _normalize_shot(raw_sh, chunk_seqs=chunk_seqs, shot_idx=si)
             counter += 1
             sh["shot_no"] = f"S{episode_no:02d}-C{counter:03d}"
-            # 原文映射：先按内容确定性匹配源段（最稳，避开场景头行/LLM 乱给 seq），
-            # 匹配不到再退回信任 LLM seq / 位置分配；并把命中的源文落到 src_text 上，
-            # 让工作台「原文」始终对应本镜真正出处（修：拆解后原文与分镜不符）。
-            m_seq, m_text = _match_source(sh, chunk)
-            if m_text:
-                sh["seq"] = m_seq if m_seq is not None else _resolve_src_seq(
-                    sh.get("seq"), seq_set, chunk_seqs, si, n_shots)
-                sh["src_text"] = m_text
-            else:
-                sh["seq"] = _resolve_src_seq(sh.get("seq"), seq_set, chunk_seqs, si, n_shots)
-                sh["src_text"] = next(
-                    (s.get("text") or "" for s in chunk if s.get("seq") == sh["seq"]), "")
+            # 原文映射：保存完整 src_seq/src_text。一个分镜可能由多个连续源段合并，
+            # 不能只显示起始 seq 的单段原文，否则工作台「原文」会看起来被截断。
+            start_seq, src_seq, src_text, src_matched = _source_span_from_shot(
+                sh, chunk, chunk_seqs, seq_set, si, n_shots)
+            sh["seq"] = start_seq
+            sh["src_seq"] = src_seq
+            sh["src_text"] = src_text
+            sh["_src_content_match"] = src_matched
             # 按台词体量 + 情绪估算单镜时长（正常 5 字/秒，急/怒更快、悲/沉更慢），
             # 钳制到 [3,15] 秒（视频模型单条上限 15s）。LLM 已给时则尊重其值。
             if not sh.get("duration"):
@@ -322,9 +457,11 @@ def run_decompose(
                     sh.get("dialogue", ""), sh.get("action", ""),
                     sh.get("emotion") or sh.get("mood") or "",
                     target_seconds=shot_target)
-            shots.append(sh)
+            chunk_out.append(sh)
             block_shot_nos.append(sh["shot_no"])
             prev_handoff = sh.get("handoff") or prev_handoff
+        _fill_missing_source_ranges(chunk_out, chunk, chunk_seqs)
+        shots.extend(chunk_out)
         blocks.append({"index": ci, "chunk_seq": [s.get("seq") for s in chunk], "shot_nos": block_shot_nos})
         if on_progress:
             on_progress(ci + 1, total)
@@ -375,9 +512,11 @@ def run_decompose_manual(
             [{"role": "user", "content": prompt}], model=model, temperature=0.4)
         sh = result[0] if isinstance(result, list) and result else (
             result if isinstance(result, dict) else {})
+        sh = _normalize_shot(sh, chunk_seqs=[i + 1], shot_idx=i)
         sh["shot_no"] = f"S{episode_no:02d}-C{i+1:03d}"
         sh["seq"] = i + 1
         # 人工划定的原文片段即本镜出处，直接落 src_text（保证原文与分镜一致）。
+        sh["src_seq"] = [i + 1]
         sh["src_text"] = text
         if not sh.get("duration"):
             sh["duration"] = pacing.estimate_shot_seconds(

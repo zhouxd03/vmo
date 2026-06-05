@@ -10,6 +10,7 @@ Stored under data/projects/<pid>/batches/<bid>.json with a per-project index.
 import threading
 import time
 import uuid
+import re
 from typing import Any, Optional
 
 from .paths import PROJECTS_DIR
@@ -28,6 +29,13 @@ def _batch_dir(pid: str):
 
 def _batch_path(pid: str, bid: str):
     return _batch_dir(pid) / f"{bid}.json"
+
+
+def _safe_folder_name(text: str, fallback: str = "batch") -> str:
+    text = (text or fallback).strip()
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text)
+    text = re.sub(r"\s+", "_", text).strip("._ ")
+    return (text or fallback)[:72]
 
 
 def _index_path(pid: str):
@@ -55,6 +63,7 @@ def _summarize(b: dict) -> dict:
         "done": done,
         "error": err,
         "concurrency": b.get("concurrency", 2),
+        "pause_requested": bool(b.get("pause_requested")),
         # surface episode membership in the lightweight index so the worktable /
         # episode bar can group batches per-episode without fetching every detail
         "episode_id": (b.get("params") or {}).get("episode_id"),
@@ -83,8 +92,11 @@ def create_batch(pid: str, kind: str, name: str, tasks: list,
     # re-submit attempts; users should inspect the error and manually retry.
     if kind == "video":
         max_attempts = 1
-    bid = uuid.uuid4().hex[:12]
     now = time.time()
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
+    episode_label = (params or {}).get("episode_name") or (params or {}).get("episode_id") or ""
+    label = "_".join(x for x in (episode_label, name or kind) if x)
+    bid = f"{_safe_folder_name(label)}_{stamp}_{uuid.uuid4().hex[:6]}"
     norm_tasks = []
     for i, t in enumerate(tasks):
         norm_tasks.append({
@@ -127,6 +139,7 @@ def create_batch(pid: str, kind: str, name: str, tasks: list,
         "concurrency": max(1, int(concurrency or 1)),
         "params": params or {},
         "status": "pending",
+        "pause_requested": False,
         "tasks": norm_tasks,
         "created_at": now,
         "updated_at": now,
@@ -172,16 +185,52 @@ def set_status(pid: str, bid: str, status: str) -> Optional[dict]:
         return save_batch(pid, batch)
 
 
+def request_pause(pid: str, bid: str) -> Optional[dict]:
+    with _mutate_lock:
+        batch = get_batch(pid, bid)
+        if not batch:
+            return None
+        batch["pause_requested"] = True
+        for t in batch["tasks"]:
+            if t.get("status") == "pending":
+                t["status"] = "paused"
+                t["stage"] = "paused"
+                t["stage_label"] = "已停止等待"
+                t["updated_at"] = time.time()
+            elif t.get("status") == "running":
+                t["stage"] = "stopping"
+                t["stage_label"] = "停止中"
+                t["updated_at"] = time.time()
+        return save_batch(pid, batch)
+
+
+def clear_pause_request(pid: str, bid: str) -> Optional[dict]:
+    with _mutate_lock:
+        batch = get_batch(pid, bid)
+        if not batch:
+            return None
+        batch["pause_requested"] = False
+        for t in batch["tasks"]:
+            if t.get("status") == "paused":
+                t["status"] = "pending"
+                t["stage"] = "pending"
+                t["stage_label"] = ""
+        return save_batch(pid, batch)
+
+
 def reset_failed(pid: str, bid: str) -> Optional[dict]:
     with _mutate_lock:
         batch = get_batch(pid, bid)
         if not batch:
             return None
         for t in batch["tasks"]:
-            if t["status"] == "error":
+            if t["status"] in ("error", "paused"):
                 t["status"] = "pending"
                 t["error"] = None
                 t["attempts"] = 0
+                t["stage"] = "pending"
+                t["stage_label"] = ""
+        batch["pause_requested"] = False
         return save_batch(pid, batch)
 
 

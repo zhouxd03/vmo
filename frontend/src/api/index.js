@@ -81,6 +81,7 @@ export const api = {
   deleteCredential: (category, id) => req('DELETE', `/api/credentials/${category}/${id}`),
   setDefaultCredential: (category, id) => req('POST', `/api/credentials/${category}/${id}/default`),
   testCredential: (category, body) => req('POST', `/api/credentials/${category}/test`, body),
+  credentialModels: (category, body) => req('POST', `/api/credentials/${category}/models`, body),
   llmModels: (body) => req('POST', '/api/llm/models', body),
 
   // projects (Phase 2)
@@ -123,6 +124,8 @@ export const api = {
   // batches (Phase 4)
   listBatches: (pid) => req('GET', `/api/projects/${pid}/batches`),
   previewShotPrompts: (pid, body) => req('POST', `/api/projects/${pid}/shot_prompts`, body),
+  saveShotPrompts: (pid, body) => req('POST', `/api/projects/${pid}/shot_prompts/save`, body),
+  saveShotMaterial: (pid, body) => req('POST', `/api/projects/${pid}/shot_material/select`, body),
   inferShotPrompt: (pid, body) => req('POST', `/api/projects/${pid}/infer_shot_prompt`, body),
   createBatch: (pid, body) => req('POST', `/api/projects/${pid}/batches`, body),
   createEpisodeBatches: (pid, body) => req('POST', `/api/projects/${pid}/episode_batches`, body),

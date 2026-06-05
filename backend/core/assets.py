@@ -41,7 +41,7 @@ def _save_assets(pid: str, assets: list) -> Optional[dict]:
 
 
 def add_asset(pid: str, asset_type: str, name: str, desc: str = "", appearance: str = "",
-              role: str = "main") -> dict:
+              role: str = "main", voice: str = "") -> dict:
     if asset_type not in TRIGGERS:
         raise ValueError(f"未知资产类型: {asset_type}")
     name = (name or "").strip()
@@ -57,6 +57,7 @@ def add_asset(pid: str, asset_type: str, name: str, desc: str = "", appearance: 
         "name": name,
         "desc": desc or "",
         "appearance": appearance or "",
+        "voice": voice or "",
         # main vs support — only meaningful for characters; drives reference-image
         # priority when capping (角色图 ＞ 配角图).
         "role": role if role in ("main", "support") else "main",
@@ -74,7 +75,7 @@ def update_asset(pid: str, asset_id: str, patch: dict[str, Any]) -> Optional[dic
         found = None
         for a in assets:
             if a["id"] == asset_id:
-                for k in ("name", "desc", "appearance", "ref_image", "role",
+                for k in ("name", "desc", "appearance", "voice", "ref_image", "role",
                           "aerial_image", "ref_source"):
                     if k in patch:
                         a[k] = patch[k]
@@ -102,7 +103,7 @@ def seed_from_bible(pid: str) -> list:
     assets = p.get("assets", [])
     existing = {(a["type"], a["name"]) for a in assets}
 
-    def _add(asset_type, name, desc, appearance=""):
+    def _add(asset_type, name, desc, appearance="", voice=""):
         key = (asset_type, (name or "").strip())
         if not key[1] or key in existing:
             return
@@ -113,13 +114,14 @@ def seed_from_bible(pid: str) -> list:
             "name": key[1],
             "desc": desc or "",
             "appearance": appearance or "",
+            "voice": voice or "",
             "ref_image": None,
             "created_at": time.time(),
         })
         existing.add(key)
 
     for c in bible.get("characters", []) or []:
-        _add("character", c.get("name", ""), c.get("note", ""), c.get("appearance", ""))
+        _add("character", c.get("name", ""), c.get("note", ""), c.get("appearance", ""), c.get("voice", ""))
     for s in bible.get("scenes", []) or []:
         _add("scene", s.get("name", ""), s.get("desc", ""))
     for pr in bible.get("props", []) or []:

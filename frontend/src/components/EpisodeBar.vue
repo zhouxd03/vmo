@@ -15,6 +15,7 @@ import { useTasksStore } from '../stores/tasks'
 const store = useProjectStore()
 const tasks = useTasksStore()
 const message = useMessage()
+const emit = defineEmits(['open-errors'])
 
 const episodes = computed(() => store.episodes || [])
 const activeId = computed(() => store.currentEpisodeId)
@@ -25,6 +26,11 @@ const stageLabel = { imported: '已导入', analyzed: '已分析', decomposed: '
 const genLabel = { running: '生成中', queued: '排队', error: '部分失败', done: '已完成' }
 function genStat(ep) { return tasks.episodeStat(ep.id) }
 function shotCount(ep) { return ep.shot_count ?? (ep.shots ? ep.shots.length : 0) }
+function openErrors(ep, ev) {
+  ev?.stopPropagation()
+  if (genStat(ep)?.status !== 'error') return
+  emit('open-errors', ep.id)
+}
 
 // ── add episode modal ──
 const showAdd = ref(false)
@@ -114,7 +120,14 @@ async function move(ep, dir) {
         <span class="ep-name">{{ ep.name }}</span>
         <span class="ep-stage" :data-stage="ep.stage">{{ stageLabel[ep.stage] || ep.stage }}</span>
         <span class="ep-meta">{{ shotCount(ep) }}镜</span>
-        <span v-if="genStat(ep)" class="ep-gen" :data-gen="genStat(ep).status">
+        <span
+          v-if="genStat(ep)"
+          class="ep-gen"
+          :class="{ clickable: genStat(ep).status === 'error' }"
+          :data-gen="genStat(ep).status"
+          :title="genStat(ep).status === 'error' ? '查看本集全部错误' : ''"
+          @click="openErrors(ep, $event)"
+        >
           <span v-if="genStat(ep).status === 'running'" class="dot" />
           {{ genLabel[genStat(ep).status] }} {{ genStat(ep).done }}/{{ genStat(ep).total }}
         </span>
@@ -231,6 +244,8 @@ async function move(ep, dir) {
 .ep-gen[data-gen="queued"] { background: color-mix(in srgb, var(--app-accent-alt) 18%, transparent); color: var(--app-accent-alt); }
 .ep-gen[data-gen="done"] { background: color-mix(in srgb, #22c55e 22%, transparent); color: #22c55e; }
 .ep-gen[data-gen="error"] { background: color-mix(in srgb, #ef4444 22%, transparent); color: #ef4444; }
+.ep-gen.clickable { cursor: pointer; }
+.ep-gen.clickable:hover { box-shadow: 0 0 0 1px currentColor inset; }
 .ep-gen .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: epPulse 1s infinite; }
 @keyframes epPulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
 .ep-ops { display: flex; align-items: center; gap: 7px; margin-left: 4px; padding-left: 8px; border-left: 1px solid var(--app-border); }

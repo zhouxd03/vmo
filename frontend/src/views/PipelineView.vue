@@ -311,7 +311,13 @@ function anyBusy(shotNo) { return !!busy.value[shotNo] }
 .srow .k { color: var(--app-text-muted); font-size: 12px; }
 .srow .v { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
 .mono { font-family: var(--font-mono, monospace); }
-.opt { display: flex; align-items: center; justify-content: space-between; font-size: 13px; margin-top: 8px; }
+.opt {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px;
+  min-height: 32px; padding: 6px 8px; margin-top: 8px;
+  border: 1px solid var(--app-border); border-radius: 8px; background: var(--app-bg-soft);
+  font-size: 13px;
+}
+.opt > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .opthint { font-size: 11px; color: var(--app-text-muted); margin: 3px 0 6px; line-height: 1.4; }
 .field { margin-top: 10px; }
 .field > label { display: block; font-size: 12px; color: var(--app-text-muted); margin-bottom: 5px; }

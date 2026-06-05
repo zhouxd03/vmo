@@ -38,6 +38,7 @@ const editing = ref(null) // { category, entry }
 const form = ref({})
 const saving = ref(false)
 const testing = ref(false)
+const modelLoading = ref(false)
 const modelOptions = ref([])
 
 async function reload() {
@@ -81,15 +82,20 @@ const effectiveModelOptions = computed(() =>
   form.value.provider === 'seedance' ? SEEDANCE_MODELS : modelOptions.value)
 
 async function fetchModels() {
-  testing.value = true
+  modelLoading.value = true
   try {
-    const resp = await api.llmModels({ base_url: form.value.base_url, api_key: form.value.api_key })
+    const resp = await api.credentialModels(editing.value.category, {
+      id: form.value.id,
+      base_url: form.value.base_url,
+      api_key: form.value.api_key,
+      provider: form.value.provider,
+    })
     modelOptions.value = (resp.models || []).map((m) => ({ label: m, value: m }))
-    message.success(`拉取到 ${modelOptions.value.length} 个模型`)
+    message.success(`${resp.builtin ? '已载入内置候选' : '拉取到'} ${modelOptions.value.length} 个模型`)
   } catch (e) {
-    message.error('拉取模型失败: ' + e.message)
+    message.error('获取模型失败: ' + e.message)
   } finally {
-    testing.value = false
+    modelLoading.value = false
   }
 }
 
@@ -236,9 +242,9 @@ async function makeDefault(category, id) {
               :options="effectiveModelOptions"
               placeholder="选择或手动输入模型名"
             />
-            <n-button v-if="currentCat.fetchModels" size="small" :loading="testing" @click="fetchModels">
+            <n-button size="small" :loading="modelLoading" @click="fetchModels">
               <template #icon><n-icon :component="FlashOutline" /></template>
-              拉取模型列表 (GET /v1/models)
+              {{ form.provider === 'seedance' ? '载入 Seedance 模型' : '获取模型列表' }}
             </n-button>
           </n-space>
         </n-form-item>

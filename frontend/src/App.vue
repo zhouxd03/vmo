@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted } from 'vue'
+import { computed, onErrorCaptured, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { NConfigProvider, NMessageProvider, NDialogProvider, NLoadingBarProvider } from 'naive-ui'
 import { zhCN, dateZhCN } from 'naive-ui'
@@ -16,6 +16,12 @@ const fullBleed = computed(() => !!route.meta.fullBleed)
 const themeStore = useThemeStore()
 const naiveTheme = computed(() => (themeStore.mode === 'light' ? lightTheme : darkTheme))
 const naiveOverrides = computed(() => buildThemeOverrides(themeStore.theme))
+const viewError = ref('')
+onErrorCaptured((err) => {
+  viewError.value = err?.message || String(err || '页面加载失败')
+  console.error(err)
+  return false
+})
 onMounted(() => themeStore.init())
 </script>
 
@@ -32,8 +38,12 @@ onMounted(() => themeStore.init())
               <SideBar v-if="!fullBleed" />
               <main class="app-main" :class="{ bleed: fullBleed }">
                 <GenTabs v-if="fullBleed" />
+                <div v-if="viewError" class="view-error">
+                  <strong>页面加载失败</strong>
+                  <span>{{ viewError }}</span>
+                </div>
                 <router-view v-slot="{ Component }">
-                  <component :is="Component" />
+                  <component :is="Component" v-if="!viewError" />
                 </router-view>
               </main>
             </div>
@@ -68,5 +78,19 @@ onMounted(() => themeStore.init())
 }
 .app-main.bleed > :not(.gentabs) {
   padding: 18px 24px 0;
+}
+.view-error {
+  margin: 18px 24px;
+  border: 1px solid rgba(255, 92, 92, .35);
+  border-radius: 8px;
+  background: rgba(80, 20, 24, .35);
+  color: #ffd8d8;
+  display: grid;
+  gap: 8px;
+  padding: 16px;
+}
+.view-error span {
+  color: rgba(255, 216, 216, .82);
+  word-break: break-word;
 }
 </style>

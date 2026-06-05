@@ -8,6 +8,7 @@ browser for development.
 
 import logging
 
+import requests as http
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 from . import routes_projects
@@ -18,11 +19,64 @@ from .services import llm, video_gen
 
 logger = setup_logging()
 
+SEEDANCE_MODELS = [
+    "doubao-seedance-2-0-fast-260128",
+    "doubao-seedance-2-0-260128",
+    "doubao-seedance-2-0-260128-1",
+    "doubao-seedance-2-0-260128-2",
+    "doubao-seedance-2-0-260128-3",
+]
+
+
+def _openai_model_list(base_url: str, api_key: str) -> list[str]:
+    base = (base_url or "").strip().rstrip("/")
+    key = (api_key or "").strip()
+    if not base or not key:
+        raise ValueError("请先填写 API 地址和 Key")
+    url = f"{base if base.endswith('/v1') else base + '/v1'}/models"
+    resp = http.get(url, headers={"Authorization": f"Bearer {key}"}, timeout=30)
+    if resp.status_code >= 400:
+        raise ValueError(f"获取模型列表失败 (HTTP {resp.status_code}): {resp.text[:200]}")
+    data = resp.json()
+    items = data.get("data", data if isinstance(data, list) else [])
+    models = []
+    for item in items:
+        if isinstance(item, dict) and item.get("id"):
+            models.append(item["id"])
+        elif isinstance(item, str):
+            models.append(item)
+    return sorted(set(models))
+
+
+def _credential_api_key(category: str, body: dict) -> str:
+    api_key = body.get("api_key")
+    if api_key and "***" not in api_key:
+        return api_key
+    entry_id = body.get("id")
+    if entry_id:
+        for entry in credentials.load_raw().get(category, []):
+            if entry.get("id") == entry_id:
+                return credentials._resolve_entry(entry).get("api_key", "")
+    default = credentials.get_default(category)
+    return (default or {}).get("api_key", "")
+
 
 def create_app() -> Flask:
     ensure_dirs()
     app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/assets_static")
     app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
+
+    @app.after_request
+    def no_cache_for_frontend(resp):
+        # Desktop WebView2 can keep the old SPA shell/chunks after local rebuilds,
+        # leaving only the app chrome visible while the route body fails to mount.
+        # Keep frontend/static/API responses fresh; leave media ranges cacheable
+        # enough for playback seeking.
+        if not request.path.startswith("/api/output/"):
+            resp.headers["Cache-Control"] = "no-store, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
+        return resp
 
     # ── SPA shell ──
     @app.route("/")
@@ -129,6 +183,23 @@ def create_app() -> Flask:
             api_key = None
         try:
             return jsonify({"models": llm.list_models(base_url=body.get("base_url"), api_key=api_key)})
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": str(e)}), 502
+
+    @app.route("/api/credentials/<category>/models", methods=["POST"])
+    def credential_models(category):
+        body = request.json or {}
+        api_key = _credential_api_key(category, body)
+        try:
+            if category == "llm":
+                return jsonify({"models": llm.list_models(base_url=body.get("base_url"), api_key=api_key)})
+            if category == "video":
+                provider = video_gen._detect_provider(body.get("base_url") or "", body.get("provider", ""))
+                if provider == "seedance":
+                    return jsonify({"models": SEEDANCE_MODELS, "builtin": True})
+            if category in ("image", "video"):
+                return jsonify({"models": _openai_model_list(body.get("base_url"), api_key)})
+            return jsonify({"models": []})
         except Exception as e:  # noqa: BLE001
             return jsonify({"error": str(e)}), 502
 

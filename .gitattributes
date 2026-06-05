@@ -1,0 +1,2 @@
+dist_new/BatchStudio/_internal/ffmpeg.exe filter=lfs diff=lfs merge=lfs -text
+dist_new/BatchStudio/_internal/ffprobe.exe filter=lfs diff=lfs merge=lfs -text

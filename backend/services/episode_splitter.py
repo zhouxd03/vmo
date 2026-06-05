@@ -183,7 +183,17 @@ def _split_by_llm(
         end = ordered[k + 1][0] if k + 1 < len(ordered) else len(segments)
         if idx < end:
             groups.append((name, segments[idx:end]))
-    return groups if len(groups) >= 2 else None
+    if len(groups) < 2:
+        return None
+    total_chars = sum(len(s.get("text", "")) for s in segments)
+    avg_chars = total_chars / max(1, len(groups))
+    # Guard against malformed LLM output that turns nearly every paragraph into
+    # an episode. Volume fallback is safer than creating dozens of runt episodes.
+    if len(groups) > max(3, len(segments) // 2) and avg_chars < MIN_TAIL_CHARS:
+        logger.warning("[EpisodeSplit] LLM 分集过碎，回退体量切分: groups=%s avg_chars=%.1f",
+                       len(groups), avg_chars)
+        return None
+    return groups
 
 
 def _build_episode(name: str, segs: list[dict], source_type: str) -> dict:

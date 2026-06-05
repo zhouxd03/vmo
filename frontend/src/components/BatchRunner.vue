@@ -329,8 +329,15 @@ function thumbUrl(t) {
 .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .hint { font-size: 12px; color: var(--app-text-muted); margin-bottom: 12px; }
 .continuity-box { padding: 10px; border: 1px dashed var(--app-border); border-radius: 10px; }
-.opt { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
-.opt > label { font-size: 12px; color: var(--app-text-muted); }
+.opt {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px;
+  min-height: 32px; padding: 6px 8px; margin-bottom: 8px;
+  border: 1px solid var(--app-border); border-radius: 8px; background: var(--app-bg-soft);
+}
+.opt > label {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12px; color: var(--app-text-muted);
+}
 .blist { display: flex; flex-direction: column; gap: 8px; }
 .bitem {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;

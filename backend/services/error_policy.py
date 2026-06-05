@@ -35,7 +35,7 @@ _FATAL_KEYS = (
     "invalid_api_key", "invalid api key", "unauthorized", "authentication",
     "permission", "forbidden", "insufficient_quota", "insufficient quota",
     "insufficient_balance", "insufficient balance", "exceeded your current quota",
-    "billing", "no balance", "out of credit", "account",
+    "insufficient_user_quota", "quota", "billing", "no balance", "out of credit", "account",
     "密钥", "鉴权", "未授权", "无权限", "额度", "余额", "欠费", "配额",
 )
 _TRANSIENT_KEYS = (
@@ -43,7 +43,16 @@ _TRANSIENT_KEYS = (
     "rate limit", "ratelimit", "too many requests", "overloaded", "busy",
     "connection", "reset by peer", "bad gateway", "service unavailable",
     "gateway timeout", "upstream_unavailable", "fail_to_fetch_task",
+    "reference_image_upload_failed",
     "task not found", "任务查询", "任务获取", "超时", "稍后", "重试", "繁忙", "限流", "网络",
+)
+_PARAM_KEYS = (
+    "invalid_reference_inputs", "reference_inputs", "invalid_request_error",
+    "too many reference", "maximum reference", "reference image limit",
+    "reference images exceeds", "reference images exceed",
+    "参考图片最多支持", "最多支持 4 张", "最多支持4张",
+    "参考图片数量", "参考图数量", "参考图片数", "参考图数",
+    "超过当前视频接口上限", "超过上限", "最多支持",
 )
 
 _META = {
@@ -101,7 +110,9 @@ def classify(exc: Exception) -> dict:
         category = "transient"
     else:
         # 2) keyword wins over status (a 400 can be a content rejection)
-        if _match(text, _CONTENT_KEYS):
+        if _match(text, _PARAM_KEYS):
+            category = "param"
+        elif _match(text, _CONTENT_KEYS):
             category = "content"
         elif _match(text, _FATAL_KEYS):
             category = "fatal"
@@ -138,6 +149,17 @@ _CATEGORY_LABEL = {
 
 
 def _friendly_message(category: str, code: str, detail: str) -> str:
+    text = " ".join(str(x or "") for x in (code, detail)).lower()
+    if _match(text, _FATAL_KEYS) and any(k in text for k in ("quota", "balance", "余额", "额度")):
+        return "[额度不足] 视频服务预扣费失败或账户余额不足；请充值/更换视频凭据后重试。"
+    if "missing_video_url" in text:
+        return "[视频结果链接缺失] 上游显示生成完成，但没有返回可下载视频链接；已停止等待，请查看错误详情中的原始返回。"
+    if _match(text, _PARAM_KEYS):
+        return "[图生视频参数错误] 参考图数量超过当前视频接口的实际上限；为避免少图提交，系统不会自动丢图，请在设置里调低「总参考图上限」后重试。"
+    if "fail_to_fetch_task" in text:
+        return "[图生视频参考图抓取失败] 视频服务未能抓取已上传的参考图 URL；请重试，或更换可被上游访问的图床/视频接口。"
+    if "reference_image_upload_failed" in text:
+        return "[图生视频参考图上传失败] 无法生成可被视频服务公网抓取的参考图 URL；请检查网络或更换图床/视频接口。"
     label = _CATEGORY_LABEL[category]
     # surface a short upstream snippet (strip noisy JSON braces if present)
     snippet = detail.strip()

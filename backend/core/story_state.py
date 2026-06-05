@@ -17,10 +17,23 @@ can resume and the UI (分镜流水线) can visualise the whole chain.
 """
 
 import time
+import threading
 from typing import Any, Optional
 
 from .paths import PROJECTS_DIR
 from .store import read_json, write_json
+
+_locks_guard = threading.Lock()
+_locks: dict[str, threading.RLock] = {}
+
+
+def continuity_lock(pid: str) -> threading.RLock:
+    with _locks_guard:
+        lock = _locks.get(pid)
+        if lock is None:
+            lock = threading.RLock()
+            _locks[pid] = lock
+        return lock
 
 
 def _state_path(pid: str):
@@ -46,13 +59,14 @@ def _empty_current() -> dict:
 
 
 def get_state(pid: str) -> dict:
-    st = read_json(_state_path(pid), None)
-    if not st:
-        st = {"pid": pid, "current": _empty_current(), "shots": {}, "updated_at": time.time()}
-        write_json(_state_path(pid), st)
-    st.setdefault("current", _empty_current())
-    st.setdefault("shots", {})
-    return st
+    with continuity_lock(pid):
+        st = read_json(_state_path(pid), None)
+        if not st:
+            st = {"pid": pid, "current": _empty_current(), "shots": {}, "updated_at": time.time()}
+            write_json(_state_path(pid), st)
+        st.setdefault("current", _empty_current())
+        st.setdefault("shots", {})
+        return st
 
 
 def get_current(pid: str) -> dict:
@@ -76,44 +90,52 @@ def commit_shot(pid: str, shot_no: str, state: dict[str, Any]) -> dict:
     director_note. Missing keys inherit from the previous ``current`` so the
     chain never loses information (sliding-window handoff).
     """
-    st = get_state(pid)
-    prev = st["current"]
-    merged = _empty_current()
-    merged.update(prev)
-    merged.update({k: v for k, v in (state or {}).items() if v is not None})
-    merged["shot_no"] = shot_no
+    with continuity_lock(pid):
+        st = get_state(pid)
+        prev = st["current"]
+        merged = _empty_current()
+        merged.update(prev)
+        merged.update({k: v for k, v in (state or {}).items() if v is not None})
+        merged["shot_no"] = shot_no
 
-    snapshot = dict(merged)
-    prev_snap = st["shots"].get(shot_no, {})
-    snapshot.setdefault("decision", prev_snap.get("decision"))
-    snapshot.setdefault("review", prev_snap.get("review"))
-    snapshot.setdefault("decision_flushed", prev_snap.get("decision_flushed", False))
-    snapshot.setdefault("staging_flushed", prev_snap.get("staging_flushed", False))
-    snapshot.setdefault("director_flushed", prev_snap.get("director_flushed", False))
-    st["shots"][shot_no] = snapshot
-    st["current"] = merged
-    return _save(pid, st)
+        snapshot = dict(merged)
+        prev_snap = st["shots"].get(shot_no, {})
+        snapshot.setdefault("decision", prev_snap.get("decision"))
+        snapshot.setdefault("review", prev_snap.get("review"))
+        snapshot.setdefault("staging_image", prev_snap.get("staging_image"))
+        snapshot.setdefault("director_board", prev_snap.get("director_board"))
+        snapshot.setdefault("tail_frame", prev_snap.get("tail_frame"))
+        snapshot.setdefault("decision_flushed", prev_snap.get("decision_flushed", False))
+        snapshot.setdefault("staging_flushed", prev_snap.get("staging_flushed", False))
+        snapshot.setdefault("director_flushed", prev_snap.get("director_flushed", False))
+        for k in ("staging_image", "director_board", "tail_frame"):
+            if snapshot.get(k):
+                merged[k] = snapshot[k]
+        st["shots"][shot_no] = snapshot
+        st["current"] = merged
+        return _save(pid, st)
 
 
 def _update_shot_field(pid: str, shot_no: str, key: str, value: Any) -> dict:
-    st = get_state(pid)
-    shot = st["shots"].get(shot_no) or {"shot_no": shot_no}
-    shot[key] = value
-    st["shots"][shot_no] = shot
-    # mirror onto current when it is the active shot so the live accumulator
-    # and per-shot archive stay in sync for the UI / resume logic.
-    if st["current"].get("shot_no") == shot_no or st["current"].get("shot_no") is None:
-        if key == "tail_frame":
-            st["current"]["tail_frame"] = value
-        elif key == "staging_image":
-            st["current"]["staging_image"] = value
-        elif key == "director_board":
-            st["current"]["director_board"] = value
-        elif key == "decision":
-            st["current"]["decision"] = value
-        elif key == "review":
-            st["current"]["review"] = value
-    return _save(pid, st)
+    with continuity_lock(pid):
+        st = get_state(pid)
+        shot = st["shots"].get(shot_no) or {"shot_no": shot_no}
+        shot[key] = value
+        st["shots"][shot_no] = shot
+        # mirror onto current when it is the active shot so the live accumulator
+        # and per-shot archive stay in sync for the UI / resume logic.
+        if st["current"].get("shot_no") == shot_no or st["current"].get("shot_no") is None:
+            if key == "tail_frame":
+                st["current"]["tail_frame"] = value
+            elif key == "staging_image":
+                st["current"]["staging_image"] = value
+            elif key == "director_board":
+                st["current"]["director_board"] = value
+            elif key == "decision":
+                st["current"]["decision"] = value
+            elif key == "review":
+                st["current"]["review"] = value
+        return _save(pid, st)
 
 
 def set_decision(pid: str, shot_no: str, decision: dict) -> dict:
@@ -137,6 +159,7 @@ def set_director_board(pid: str, shot_no: str, filename: str) -> dict:
 
 
 def reset(pid: str) -> dict:
-    st = {"pid": pid, "current": _empty_current(), "shots": {}, "updated_at": time.time()}
-    write_json(_state_path(pid), st)
-    return st
+    with continuity_lock(pid):
+        st = {"pid": pid, "current": _empty_current(), "shots": {}, "updated_at": time.time()}
+        write_json(_state_path(pid), st)
+        return st

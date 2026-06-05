@@ -17,6 +17,7 @@ read into a single "第1集" episode so no data is lost.
 
 import time
 import uuid
+import re
 from typing import Any, Optional
 
 from .paths import PROJECTS_DIR
@@ -31,6 +32,13 @@ _EPISODE_FIELDS = ("source_type", "raw_text", "char_count",
 
 def _project_path(pid: str):
     return PROJECTS_DIR / pid / "project.json"
+
+
+def _safe_folder_name(text: str, fallback: str = "project") -> str:
+    text = (text or fallback).strip()
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text)
+    text = re.sub(r"\s+", "_", text).strip("._ ")
+    return (text or fallback)[:60]
 
 
 def _load_index() -> list:
@@ -154,8 +162,9 @@ def create_project(name: str, source_type: str = "", raw_text: str = "",
     the project is created with one 集 per entry (used by auto episode split on
     import). Otherwise a single 第1集 is built from source_type/raw_text/parsed.
     """
-    pid = uuid.uuid4().hex[:12]
     now = time.time()
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
+    pid = f"{_safe_folder_name(name or 'project')}_{stamp}_{uuid.uuid4().hex[:6]}"
     if episodes:
         eps = [
             _new_episode(i, name=e.get("name", ""),
@@ -246,6 +255,68 @@ def update_episode(pid: str, eid: str, patch: dict[str, Any]) -> Optional[dict]:
             e["updated_at"] = time.time()
             _write(p)
             return e
+    return None
+
+
+def update_shot_prompts(pid: str, eid: str, shot_no, prompts: dict[str, Any]) -> Optional[dict]:
+    """Persist worktable image/video prompt overrides on a single shot."""
+    p = get_project(pid)
+    if not p:
+        return None
+    for e in p.get("episodes", []):
+        if e.get("id") != eid:
+            continue
+        for s in e.get("shots", []) or []:
+            if str(s.get("shot_no")) != str(shot_no):
+                continue
+            cur = s.get("prompt_overrides") if isinstance(s.get("prompt_overrides"), dict) else {}
+            next_prompts = dict(cur)
+            for key in ("image", "video"):
+                val = prompts.get(key)
+                if isinstance(val, str):
+                    val = val.strip()
+                    if val:
+                        next_prompts[key] = val
+            if prompts.get("source"):
+                next_prompts["source"] = str(prompts.get("source"))
+            next_prompts["updated_at"] = time.time()
+            s["prompt_overrides"] = next_prompts
+            e["updated_at"] = time.time()
+            _write(p)
+            return next_prompts
+    return None
+
+
+def update_shot_selected_material(pid: str, eid: str, shot_no, material: dict[str, Any]) -> Optional[dict]:
+    """Persist the user-selected final material for a shot.
+
+    This is the authoritative choice used by preview, continuity tail-frame
+    extraction, and Jianying export. It intentionally lives on the shot instead
+    of browser storage so reopening the app keeps the same selection.
+    """
+    p = get_project(pid)
+    if not p:
+        return None
+    bid = str(material.get("bid") or "").strip()
+    filename = str(material.get("filename") or "").strip()
+    if not bid or not filename:
+        return None
+    selected = {
+        "bid": bid,
+        "filename": filename,
+        "kind": str(material.get("kind") or "").strip(),
+        "updated_at": time.time(),
+    }
+    for e in p.get("episodes", []):
+        if e.get("id") != eid:
+            continue
+        for s in e.get("shots", []) or []:
+            if str(s.get("shot_no")) != str(shot_no):
+                continue
+            s["selected_material"] = selected
+            e["updated_at"] = time.time()
+            _write(p)
+            return selected
     return None
 
 

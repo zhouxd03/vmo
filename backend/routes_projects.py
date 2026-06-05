@@ -187,6 +187,27 @@ def register(app: Flask) -> None:
         return send_file(str(zip_path), as_attachment=True,
                          download_name=zip_path.name, mimetype="application/zip")
 
+    @app.route("/api/projects/<pid>/shot_material/select", methods=["POST"])
+    def select_shot_material(pid):
+        if not projects.get_project(pid):
+            return jsonify({"error": "项目不存在"}), 404
+        body = request.json or {}
+        eid = body.get("episode_id") or projects.first_episode_id(pid)
+        shot_no = body.get("shot_no")
+        if not eid or not shot_no:
+            return jsonify({"error": "缺少 episode_id 或 shot_no"}), 400
+        material = {
+            "bid": body.get("bid"),
+            "filename": body.get("filename"),
+            "kind": body.get("kind"),
+        }
+        if not material["bid"] or not material["filename"]:
+            return jsonify({"error": "缺少素材批次或文件名"}), 400
+        selected = projects.update_shot_selected_material(pid, eid, shot_no, material)
+        if not selected:
+            return jsonify({"error": "分镜不存在或素材信息无效"}), 404
+        return jsonify({"ok": True, "selected_material": selected})
+
     def _resolve_episode(pid, body):
         eid = (body or {}).get("episode_id") or projects.first_episode_id(pid)
         return eid, projects.get_episode(pid, eid)
@@ -303,6 +324,7 @@ def register(app: Flask) -> None:
                 body.get("name", ""),
                 desc=body.get("desc", ""),
                 appearance=body.get("appearance", ""),
+                voice=body.get("voice", ""),
                 role=body.get("role", "main"),
             )
         except ValueError as e:
@@ -335,7 +357,8 @@ def register(app: Flask) -> None:
         body = request.json or {}
         try:
             out = asset_gen.generate_ref_image(
-                pid, aid, model=body.get("model"), size=body.get("size", "1024x1024"))
+                pid, aid, model=body.get("model"), size=body.get("size", "1024x1024"),
+                with_aerial=bool(body.get("with_aerial", False)))
         except image_gen.GenerationError as e:
             return jsonify({"error": str(e)}), 502
         except Exception as e:  # noqa: BLE001
@@ -413,8 +436,34 @@ def register(app: Flask) -> None:
             return jsonify({"error": "分集不存在"}), 404
         ctx = {**ep, "_pid": pid, "assets": p.get("assets", []),
                "story_bible": p.get("story_bible")}
-        prompts = batch_engine.build_shot_prompts(ctx, body.get("shot_nos"))
+        prompts = batch_engine.build_shot_prompts(
+            ctx, body.get("shot_nos"),
+            include_saved=not bool(body.get("ignore_saved")),
+            include_continuity_refs=bool(body.get("continuity")),
+        )
         return jsonify({"prompts": prompts})
+
+    @app.route("/api/projects/<pid>/shot_prompts/save", methods=["POST"])
+    def save_shot_prompts(pid):
+        """Persist worktable prompt overrides for a shot."""
+        p = projects.get_project(pid)
+        if not p:
+            return jsonify({"error": "项目不存在"}), 404
+        body = request.json or {}
+        shot_no = body.get("shot_no")
+        if not shot_no:
+            return jsonify({"error": "缺少 shot_no"}), 400
+        _eid, ep = _resolve_episode(pid, body)
+        if not ep:
+            return jsonify({"error": "分集不存在"}), 404
+        saved = projects.update_shot_prompts(pid, ep["id"], shot_no, {
+            "image": body.get("image", ""),
+            "video": body.get("video", ""),
+            "source": body.get("source", "manual"),
+        })
+        if saved is None:
+            return jsonify({"error": "分镜不存在"}), 404
+        return jsonify({"ok": True, "prompt_overrides": saved})
 
     @app.route("/api/projects/<pid>/infer_shot_prompt", methods=["POST"])
     def infer_shot_prompt(pid):
@@ -435,6 +484,16 @@ def register(app: Flask) -> None:
             res = batch_engine.infer_shot_prompt(ctx, shot_no, model=body.get("model"))
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
+        saved = projects.update_shot_prompts(pid, ep["id"], shot_no, {
+            "image": res.get("image", ""),
+            "video": res.get("video", ""),
+            "source": res.get("source", "llm"),
+        })
+        if saved is not None:
+            res["persisted"] = True
+            res["prompt_overrides"] = saved
+        else:
+            res["persisted"] = False
         return jsonify(res)
 
     def _apply_prompts(tasks, kind, overrides):
@@ -448,6 +507,10 @@ def register(app: Flask) -> None:
             ov = (overrides or {}).get(t.get("shot_no"))
             if ov and ov.strip():
                 t["prompt"] = ov.strip()
+            elif isinstance(t.get("prompt_overrides"), dict):
+                saved = t["prompt_overrides"].get(kind)
+                if isinstance(saved, str) and saved.strip():
+                    t["prompt"] = saved.strip()
             elif kind == "video":
                 t["prompt"] = batch_engine.build_video_prompt(t, t.get("prompt", ""))
 
@@ -484,6 +547,7 @@ def register(app: Flask) -> None:
         params = dict(body.get("params", {}) or {})
         if source != "manual":
             params.setdefault("episode_id", eid)
+            params.setdefault("episode_name", ep.get("name") or f"episode-{ep.get('idx', '')}")
         try:
             batch = batches.create_batch(
                 pid, kind, body.get("name", ""), tasks,
@@ -522,7 +586,10 @@ def register(app: Flask) -> None:
 
     @app.route("/api/projects/<pid>/batches/<bid>/pause", methods=["POST"])
     def pause_batch(pid, bid):
+        if not batches.get_batch(pid, bid):
+            return jsonify({"error": "批次不存在"}), 404
         batch_engine.pause(bid)
+        batches.request_pause(pid, bid)
         return jsonify({"ok": True})
 
     @app.route("/api/projects/<pid>/batches/<bid>/retry", methods=["POST"])
@@ -566,7 +633,8 @@ def register(app: Flask) -> None:
                 skipped.append({"episode_id": eid, "reason": "无可生成分镜"})
                 continue
             label = f"{ep.get('name', eid)}-并发{'生视频' if kind == 'video' else '生图'}"
-            params = {**params_base, "episode_id": eid}
+            params = {**params_base, "episode_id": eid,
+                      "episode_name": ep.get("name") or f"episode-{ep.get('idx', '')}"}
             try:
                 # 单集串行：concurrency=1（含连续性链路）
                 batch = batches.create_batch(
@@ -605,13 +673,14 @@ def register(app: Flask) -> None:
             return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         shot = body.get("shot") or {}
-        prev = body.get("prev_state")
-        if prev is None:
-            prev = story_state.get_current(pid)
-        decision = continuity.decide_handoff(
-            shot, prev, use_llm=bool(body.get("use_llm", True)), model=body.get("model"))
-        if body.get("commit"):
-            story_state.set_decision(pid, shot.get("shot_no", ""), decision)
+        with story_state.continuity_lock(pid):
+            prev = body.get("prev_state")
+            if prev is None:
+                prev = story_state.get_current(pid)
+            decision = continuity.decide_handoff(
+                shot, prev, use_llm=bool(body.get("use_llm", True)), model=body.get("model"))
+            if body.get("commit"):
+                story_state.set_decision(pid, shot.get("shot_no", ""), decision)
         return jsonify(decision)
 
     @app.route("/api/projects/<pid>/continuity/tailframe", methods=["POST"])
@@ -627,7 +696,8 @@ def register(app: Flask) -> None:
         if not video_path:
             return jsonify({"error": "缺少视频路径（video_path 或 bid+filename）"}), 400
         try:
-            out = continuity.extract_tail_frame(pid, shot_no, video_path)
+            with story_state.continuity_lock(pid):
+                out = continuity.extract_tail_frame(pid, shot_no, video_path)
         except ffmpeg_util.FFmpegError as e:
             return jsonify({"error": str(e)}), 502
         except Exception as e:  # noqa: BLE001
@@ -640,13 +710,20 @@ def register(app: Flask) -> None:
             return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         shot = body.get("shot") or {}
-        prev = body.get("prev_state") or story_state.get_current(pid)
-        bible = (projects.get_project(pid) or {}).get("story_bible") or {}
         try:
-            out = continuity.generate_staging(
-                pid, shot, prev, style=bible.get("style", ""), model=body.get("model"),
-                size=ffmpeg_util.aspect_to_image_size(body.get("aspect_ratio")),
-                assets=(projects.get_project(pid) or {}).get("assets") or [])
+            with story_state.continuity_lock(pid):
+                prev = body.get("prev_state") or story_state.get_current(pid)
+                bible = (projects.get_project(pid) or {}).get("story_bible") or {}
+                bridge_data = body.get("bridge_data")
+                if not isinstance(bridge_data, dict):
+                    bridge_data = continuity.build_bridge_data(body.get("decision") or {}, shot, prev)
+                bridge_context = body.get("bridge_context") or continuity.render_bridge_context(
+                    bridge_data, purpose="staging")
+                out = continuity.generate_staging(
+                    pid, shot, prev, style=bible.get("style", ""), model=body.get("model"),
+                    size=ffmpeg_util.aspect_to_image_size(body.get("aspect_ratio")),
+                    assets=(projects.get_project(pid) or {}).get("assets") or [],
+                    bridge_context=bridge_context)
         except image_gen.GenerationError as e:
             return jsonify({"error": str(e)}), 502
         except Exception as e:  # noqa: BLE001
@@ -659,13 +736,20 @@ def register(app: Flask) -> None:
             return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         shot = body.get("shot") or {}
-        prev = body.get("prev_state") or story_state.get_current(pid)
-        bible = (projects.get_project(pid) or {}).get("story_bible") or {}
         try:
-            out = continuity.generate_director_board(
-                pid, shot, prev, style=bible.get("style", ""), model=body.get("model"),
-                size=ffmpeg_util.aspect_to_image_size(body.get("aspect_ratio")),
-                assets=(projects.get_project(pid) or {}).get("assets") or [])
+            with story_state.continuity_lock(pid):
+                prev = body.get("prev_state") or story_state.get_current(pid)
+                bible = (projects.get_project(pid) or {}).get("story_bible") or {}
+                bridge_data = body.get("bridge_data")
+                if not isinstance(bridge_data, dict):
+                    bridge_data = continuity.build_bridge_data(body.get("decision") or {}, shot, prev)
+                bridge_context = body.get("bridge_context") or continuity.render_bridge_context(
+                    bridge_data, purpose="director")
+                out = continuity.generate_director_board(
+                    pid, shot, prev, style=bible.get("style", ""), model=body.get("model"),
+                    size=ffmpeg_util.aspect_to_image_size(body.get("aspect_ratio")),
+                    assets=(projects.get_project(pid) or {}).get("assets") or [],
+                    bridge_context=bridge_context)
         except image_gen.GenerationError as e:
             return jsonify({"error": str(e)}), 502
         except Exception as e:  # noqa: BLE001
@@ -678,9 +762,10 @@ def register(app: Flask) -> None:
             return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         shot = body.get("shot") or {}
-        prev = body.get("prev_state") or story_state.get_current(pid)
         try:
-            out = continuity.ai_review(pid, shot, prev, model=body.get("model"))
+            with story_state.continuity_lock(pid):
+                prev = body.get("prev_state") or story_state.get_current(pid)
+                out = continuity.ai_review(pid, shot, prev, model=body.get("model"))
         except llm_service.LLMError as e:
             return jsonify({"error": str(e)}), 502
         except Exception as e:  # noqa: BLE001

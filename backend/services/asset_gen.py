@@ -56,7 +56,7 @@ def build_aerial_prompt(project: dict, asset: dict) -> str:
 
 
 def generate_ref_image(pid: str, asset_id: str, *, model: Optional[str] = None,
-                       size: str = "1024x1024", with_aerial: bool = True) -> dict:
+                       size: str = "1024x1024", with_aerial: bool = False) -> dict:
     project = projects.get_project(pid)
     if not project:
         raise image_gen.GenerationError("项目不存在")

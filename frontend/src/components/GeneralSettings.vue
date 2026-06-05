@@ -44,9 +44,19 @@ const SCHEMA = [
   },
   {
     group: '参考图引用',
-    hint: '单镜喂给模型的垫图总数上限；超出时按优先级裁剪：导演图/首帧图 ＞ 角色图 ＞ 背景图 ＞ 配角图 ＞ 道具图。',
+    hint: '单镜喂给模型的垫图总数上限；超出时按优先级裁剪：导演图/首帧图 ＞ 角色图 ＞ 背景图 ＞ 配角图 ＞ 道具图。视频参考图可优先使用公网 URL，也可在中转支持时使用 Data URL。',
     fields: [
       { key: 'max_reference_images', label: '总参考图上限', type: 'number', min: 1, max: 16 },
+      {
+        key: 'video_reference_transport',
+        label: '视频参考图传输',
+        type: 'select',
+        options: [
+          { label: '自动', value: 'auto' },
+          { label: '公网 URL', value: 'public_url' },
+          { label: 'Data URL', value: 'data_url' },
+        ],
+      },
     ],
   },
   {
@@ -87,7 +97,7 @@ async function save() {
 }
 
 function selectOptions(field) {
-  return field.options.map((o) => ({ label: o, value: o }))
+  return field.options.map((o) => (typeof o === 'string' ? { label: o, value: o } : o))
 }
 </script>
 
