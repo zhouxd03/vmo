@@ -1,7 +1,7 @@
 <script setup>
 import { onMounted, ref } from 'vue'
 import {
-  NCard, NForm, NFormItem, NInputNumber, NSelect, NInput, NButton, NSpace, useMessage,
+  NButton, NCard, NForm, NFormItem, NInput, NInputNumber, NSelect, useMessage,
 } from 'naive-ui'
 import { api } from '../api'
 
@@ -28,7 +28,7 @@ const SCHEMA = [
   },
   {
     group: '分镜拆解',
-    hint: '拆解剧本生成分镜时按「单镜目标时长」折算每镜承载文字：纯画面/旁白≈8字/秒（如15秒≈120字），对白≈5字/秒；对白越多单镜字数越少，避免对话过载。单镜估算时长以此为中心，最终钳制到 3–15 秒。',
+    hint: '拆解剧本生成分镜时，按单镜目标时长折算每镜承载的文字量；纯画面/旁白约 8 字/秒，对白约 5 字/秒。对白越多，单镜字数越少，避免对白过载；最终会限制在模型支持的合理范围内。',
     fields: [
       { key: 'shot_target_seconds', label: '单镜目标时长(秒)', type: 'number', min: 3, max: 15 },
     ],
@@ -44,7 +44,7 @@ const SCHEMA = [
   },
   {
     group: '参考图引用',
-    hint: '单镜喂给模型的垫图总数上限；超出时按优先级裁剪：导演图/首帧图 ＞ 角色图 ＞ 背景图 ＞ 配角图 ＞ 道具图。视频参考图可优先使用公网 URL，也可在中转支持时使用 Data URL。',
+    hint: '单镜喂给模型的参考图总数上限；超过时按优先级裁剪。JSON/Relay 类视频接口默认使用 Data URL(Base64) 直传，避免公网图床失效导致漏图；只有明确需要公网抓取时再切换到公网 URL。',
     fields: [
       { key: 'max_reference_images', label: '总参考图上限', type: 'number', min: 1, max: 16 },
       {
@@ -52,23 +52,23 @@ const SCHEMA = [
         label: '视频参考图传输',
         type: 'select',
         options: [
-          { label: '自动', value: 'auto' },
+          { label: 'Data URL(Base64，默认)', value: 'data_url' },
+          { label: '自动(Base64 优先)', value: 'auto' },
           { label: '公网 URL', value: 'public_url' },
-          { label: 'Data URL', value: 'data_url' },
         ],
       },
     ],
   },
   {
     group: '资产库',
-    hint: '资产库「一键生成」并发数：同时生成多少张资产参考图。适度并发显著加速，过高会增大 API 压力/限流。场景资产会额外生成一张鸟瞰图用于固定空间位置。',
+    hint: '资产库一键生成并发数：同时生成多少张资产参考图。适度并发能提升速度，过高会增加 API 压力或触发限流。',
     fields: [
       { key: 'asset_gen_concurrency', label: '一键生成并发数', type: 'number', min: 1, max: 16 },
     ],
   },
   {
     group: '存储',
-    hint: '剪映草稿目录填写后，「导入剪映」会直接把草稿文件夹复制到该目录，同时仍保留 zip 备份。Windows 默认通常为：C:\\Users\\你的用户名\\AppData\\Local\\JianyingPro\\User Data\\Projects\\com.lveditor.draft',
+    hint: '剪映草稿目录填写后，导入剪映会直接把草稿文件夹复制到该目录，同时仍保留 zip 备份。Windows 默认通常为：C:\\Users\\你的用户名\\AppData\\Local\\JianyingPro\\User Data\\Projects\\com.lveditor.draft',
     fields: [
       { key: 'output_dir', label: '输出目录', type: 'text' },
       { key: 'jianying_draft_dir', label: '剪映草稿目录', type: 'text' },

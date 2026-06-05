@@ -34,10 +34,10 @@ DEFAULTS = {
     # 导演图/首帧图 ＞ 角色图 ＞ 背景图 ＞ 配角图 ＞ 道具图.
     "max_reference_images": 4,
     # Video reference transport:
-    # - auto: public URL first, then Data URL if all public hosts fail
+    # - data_url: default; send data:image/...;base64 directly to JSON relays
+    # - auto: Data URL first, public URL fallback only when the relay rejects it
     # - public_url: require a fetchable public URL
-    # - data_url: send data:image/...;base64 directly when the relay supports it
-    "video_reference_transport": "auto",
+    "video_reference_transport": "data_url",
     # storage / theme
     "output_dir": str(OUTPUT_DIR),
     # 剪映/CapCut Windows 默认草稿目录。留空时只生成 zip，不自动写入剪映草稿库。

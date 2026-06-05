@@ -45,7 +45,7 @@ def _api_error(resp, where="API") -> "VideoError":
             msg = str(err.get("message") or msg)
     except Exception:  # noqa: BLE001
         pass
-    return VideoError(f"{where} 閿欒 (HTTP {resp.status_code}): {msg}",
+    return VideoError(f"{where}错误 (HTTP {resp.status_code}): {msg}",
                       code=code, status=resp.status_code, err_type=err_type, raw=resp.text[:500])
 
 
@@ -64,10 +64,10 @@ def _openai_video_base(api_base: str) -> str:
 
 
 def _video_reference_transport() -> str:
-    value = str(settings_store.load_settings().get("video_reference_transport", "auto") or "auto").strip().lower()
+    value = str(settings_store.load_settings().get("video_reference_transport", "data_url") or "data_url").strip().lower()
     if value in {"auto", "public_url", "data_url"}:
         return value
-    return "auto"
+    return "data_url"
 
 
 def _video_size(aspect_ratio: str, resolution: str) -> str:
@@ -245,7 +245,7 @@ def _extract_error_fields(data: dict) -> tuple[str, str, str]:
     if not err_type and isinstance(data, dict):
         err_type = str(data.get("type") or data.get("error_type") or "")
     msg = _stringify_upstream(msg_src)
-    return msg or "鐢熸垚澶辫触", code, err_type
+    return msg or "生成失败", code, err_type
 
 
 def generate_video(
@@ -313,7 +313,7 @@ def generate_video(
         if transport == "data_url":
             return _data_url(b)
         try:
-            _stage("uploading_refs", f"棰勪笂浼犲苟楠岃瘉鍙傝€冨浘 {idx + 1}/{len(ref_images_b64)}", 2)
+            _stage("uploading_refs", f"预上传并验证参考图 {idx + 1}/{len(ref_images_b64)}", 2)
             return image_host.upload(b, allow_data_uri=False, verify=True)
         except Exception as e:  # noqa: BLE001
             raise VideoError(
@@ -328,26 +328,28 @@ def generate_video(
             return []
         if transport in ref_url_cache:
             return ref_url_cache[transport]
-        _stage("uploading_refs", "棰勪笂浼犲苟楠岃瘉鍙傝€冨浘", 2)
-        urls = [_to_url(b, i, "鍙傝€冨浘", transport) for i, b in enumerate(ref_images_b64)]
-        if transport != "data_url":
-            mapping = []
-            for idx, url in enumerate(urls):
-                meta = ref_meta[idx] if idx < len(ref_meta) else {}
-                mapping.append({
-                    "index": idx + 1,
-                    "token": meta.get("token") or f"@图{idx + 1}",
-                    "role": meta.get("role") or "unknown",
-                    "name": meta.get("name") or "",
-                    "filename": meta.get("filename") or "",
-                    "sha256": meta.get("sha256") or "",
-                    "host": urlparse(url).netloc,
-                })
-            ref_url_mapping[:] = mapping
-            logger.info("[Video] reference image pre-upload verified: refs=%s transport=%s mapping=%s",
-                        len(urls), transport, mapping)
-            if on_refs_prepared:
-                on_refs_prepared(mapping, urls)
+        if transport == "data_url":
+            _stage("uploading_refs", "准备 Base64 参考图", 2)
+        else:
+            _stage("uploading_refs", "预上传并验证参考图", 2)
+        urls = [_to_url(b, i, "参考图", transport) for i, b in enumerate(ref_images_b64)]
+        mapping = []
+        for idx, url in enumerate(urls):
+            meta = ref_meta[idx] if idx < len(ref_meta) else {}
+            mapping.append({
+                "index": idx + 1,
+                "token": meta.get("token") or f"@图{idx + 1}",
+                "role": meta.get("role") or "unknown",
+                "name": meta.get("name") or "",
+                "filename": meta.get("filename") or "",
+                "sha256": meta.get("sha256") or "",
+                "host": "data-url" if transport == "data_url" else urlparse(url).netloc,
+            })
+        ref_url_mapping[:] = mapping
+        logger.info("[Video] reference images prepared: refs=%s transport=%s mapping=%s",
+                    len(urls), transport, mapping)
+        if on_refs_prepared:
+            on_refs_prepared(mapping, [] if transport == "data_url" else urls)
         ref_url_cache[transport] = urls
         return urls
 
@@ -361,9 +363,8 @@ def generate_video(
         "size": _video_size(aspect_ratio, resolution),
     }
 
-    # 澶氭ā鎬佽蒋鍙傝€冪敓瑙嗛锛氫笂涓€闀滃熬甯?/ 瀵兼紨鍥?/ 绔欎綅鍥?/ 璧勪骇鍥惧潎浠ュ弬鑰冨浘
-    # (reference_image_urls) 鍠傚叆锛屾ā鍨嬫嵁姝ら噸娓叉煋褰撳墠闀溿€傛敞锛氭湰涓浆 seed-2.0fast
-    # 涓嶆敮鎸併€岄甯ч拤姝汇€嶅浘鐢熻棰戯紙瀹炴祴杈撳叆鍥捐闈欓粯涓㈠純锛夛紝鏁呯粺涓€璧拌蒋鍙傝€冦€?
+    # 多模态软参考生视频：上一镜尾帧 / 导演图 / 站位图 / 资产图均作为
+    # reference_image_urls 传入，模型按数组顺序与画面定义中的 @图N 对齐。
     submit_url = f"{_openai_video_base(api_base)}/videos"
 
     def _attach_refs(transport):
@@ -377,27 +378,27 @@ def generate_video(
         mode = _attach_refs(transport_label)
         _stage("submitting", "请求中", 8)
         logger.info(
-            f"[Video] 鎻愪氦 {mode}: model={model} {duration}s "
+            f"[Video] 提交 {mode}: model={model} {duration}s "
             f"{aspect_ratio} {resolution} size={payload.get('size')} "
             f"refs={len(payload.get('reference_image_urls') or [])} "
             f"transport={transport_label}"
         )
         resp = http.post(submit_url, json=payload, headers=headers, timeout=60)
         if resp.status_code >= 400:
-            raise _api_error(resp, "鎻愪氦")
+            raise _api_error(resp, "提交")
         return resp.json()
 
     actual_transport = ref_transport
     try:
-        result = _submit("public_url" if ref_transport == "auto" else ref_transport)
+        result = _submit("data_url" if ref_transport == "auto" else ref_transport)
         if ref_transport == "auto":
-            actual_transport = "public_url"
+            actual_transport = "data_url"
     except VideoError as exc:
-        if ref_transport != "auto" or exc.code != "reference_image_upload_failed":
+        if ref_transport != "auto" or not _is_reference_fetch_error(exc):
             raise
-        logger.warning("[Video] public reference upload failed in auto mode; retrying with data_url")
-        actual_transport = "data_url"
-        result = _submit("data_url")
+        logger.warning("[Video] data_url reference rejected in auto mode; retrying with public_url")
+        actual_transport = "public_url"
+        result = _submit("public_url")
     if on_submit_response:
         on_submit_response(result if isinstance(result, dict) else {"raw": result})
 
@@ -415,7 +416,7 @@ def generate_video(
     out = _download(video_url, model, duration, save_dir, filename_prefix)
     if ref_url_mapping:
         out["reference_image_mapping"] = ref_url_mapping
-        out["reference_image_urls"] = list(ref_url_cache.get(actual_transport) or [])
+        out["reference_image_urls"] = [] if actual_transport == "data_url" else list(ref_url_cache.get(actual_transport) or [])
     out["reference_transport"] = actual_transport
     if on_progress:
         on_progress(100)
@@ -466,7 +467,7 @@ def _poll(api_base, task_id, key, timeout, interval, on_progress, on_stage=None)
         except VideoError:
             raise
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[Video] 杞寮傚父: {e}")
+            logger.warning(f"[Video] 轮询异常: {e}")
             continue
     raise VideoError(f"生成超时（{timeout}秒）")
 
@@ -570,8 +571,8 @@ def _generate_seedance(
     except Exception as e:  # noqa: BLE001
         raise VideoError(f"Seedance 提交请求失败: {e}") from e
     if resp.status_code >= 400:
-        raise _api_error(resp, "Seedance 鎻愪氦")
-    body = _seedance_json(resp, "鎻愪氦")
+        raise _api_error(resp, "Seedance 提交")
+    body = _seedance_json(resp, "提交")
     if on_submit_response:
         on_submit_response(body)
     task_id = ((body.get("data") or {}).get("Id"))
@@ -623,8 +624,8 @@ def seedance_user_info(base_url: str, api_key: str) -> dict:
     resp = http.post(f"{root}/seedanceapi/user/UserIndex", json={"Id": 0},
                      headers=headers, timeout=30)
     if resp.status_code >= 400:
-        raise _api_error(resp, "Seedance 閴存潈")
-    return (_seedance_json(resp, "閴存潈").get("data") or {})
+        raise _api_error(resp, "Seedance 鉴权")
+    return (_seedance_json(resp, "鉴权").get("data") or {})
 
 
 def _poll_seedance(root, task_id, key, timeout, interval, on_progress, on_stage=None) -> dict:
@@ -683,7 +684,7 @@ def _poll_seedance(root, task_id, key, timeout, interval, on_progress, on_stage=
         except VideoError:
             raise
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[Video][Seedance] 杞寮傚父: {e}")
+            logger.warning(f"[Video][Seedance] 轮询异常: {e}")
             continue
     raise VideoError(f"Seedance 生成超时（{timeout}秒）")
 
