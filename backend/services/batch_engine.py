@@ -903,6 +903,12 @@ def _generate_video_with_refs(pid: str, batch: dict, task: dict, params: dict,
         }
         for idx, it in enumerate(kept)
     ]
+    logger.info(
+        "[Video][Request] build batch=%s task=%s shot=%s refs=%s ref_meta=%s prompt_chars=%s duration=%s aspect=%s resolution=%s",
+        batch.get("id"), task.get("id"), task.get("shot_no") or filename_prefix,
+        len(refs), ref_meta, len(prompt or ""), _shot_duration(task, params),
+        aspect_ratio, resolution,
+    )
     try:
         batches.update_task(pid, batch["id"], task["id"], {
             "prompt": prompt,
@@ -917,6 +923,8 @@ def _generate_video_with_refs(pid: str, batch: dict, task: dict, params: dict,
             transport = "public_url"
             if mapping and all((m.get("host") == "seedance-multipart") for m in mapping):
                 transport = "seedance-multipart"
+            elif mapping and all((m.get("host") == "data-url") for m in mapping):
+                transport = "data_url"
             batches.update_task(pid, batch["id"], task["id"], {
                 "reference_image_mapping": mapping,
                 "reference_image_urls": urls,
@@ -933,11 +941,12 @@ def _generate_video_with_refs(pid: str, batch: dict, task: dict, params: dict,
     def _persist_submit_response(resp: dict) -> None:
         try:
             task_id = video_gen._extract_task_id(resp) if isinstance(resp, dict) else ""
+            transport = "seedance-multipart" if _is_seedance_video_params(params) else "data_url"
             batches.update_task(pid, batch["id"], task["id"], {
                 "reference_preflight": {
                     "status": "submitted",
                     "count": len(refs),
-                    "transport": "seedance-multipart" if _is_seedance_video_params(params) else "public_url",
+                    "transport": transport,
                     "video_task_id": task_id,
                     "updated_at": time.time(),
                 },

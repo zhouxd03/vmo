@@ -6,6 +6,8 @@ Submits a job, then polls until done, downloading the result locally.
 """
 
 import base64
+import hashlib
+import json
 import logging
 import re
 import time
@@ -21,6 +23,54 @@ from ..core import settings as settings_store
 from . import image_host
 
 logger = logging.getLogger("batch_studio")
+
+
+def _clip(text: str, limit: int = 240) -> str:
+    text = str(text or "")
+    return text if len(text) <= limit else text[:limit] + "...<truncated>"
+
+
+def _safe_url(url: str) -> str:
+    try:
+        p = urlparse(url or "")
+        if not p.scheme or not p.netloc:
+            return url or ""
+        return f"{p.scheme}://{p.netloc}{p.path}"
+    except Exception:  # noqa: BLE001
+        return url or ""
+
+
+def _ref_digest(img_b64: str) -> dict:
+    size = 0
+    sha = ""
+    try:
+        raw = base64.b64decode(img_b64 or "")
+        size = len(raw)
+        sha = hashlib.sha256(raw).hexdigest()
+    except Exception:  # noqa: BLE001
+        size = len(img_b64 or "")
+    return {"bytes": size, "sha256": sha[:16]}
+
+
+def _json_keys(obj) -> list[str]:
+    return sorted(obj.keys()) if isinstance(obj, dict) else []
+
+
+def _response_summary(obj) -> dict:
+    if not isinstance(obj, dict):
+        return {"type": type(obj).__name__, "preview": _clip(str(obj), 300)}
+    data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+    return {
+        "keys": _json_keys(obj),
+        "data_keys": _json_keys(data),
+        "task_id": _extract_task_id(obj),
+        "video_url_present": bool(_extract_video_url(obj)),
+        "status": obj.get("status") or data.get("Status") or data.get("status"),
+        "progress": obj.get("progress") or data.get("Progress") or data.get("progress"),
+        "code": obj.get("code"),
+        "success": obj.get("success"),
+        "message": _clip(obj.get("message") or obj.get("msg") or data.get("Message") or "", 240),
+    }
 
 
 class VideoError(Exception):
@@ -346,8 +396,11 @@ def generate_video(
                 "host": "data-url" if transport == "data_url" else urlparse(url).netloc,
             })
         ref_url_mapping[:] = mapping
-        logger.info("[Video] reference images prepared: refs=%s transport=%s mapping=%s",
-                    len(urls), transport, mapping)
+        ref_digests = [_ref_digest(b) for b in ref_images_b64]
+        logger.info(
+            "[Video][Request] refs prepared transport=%s count=%s mapping=%s digests=%s",
+            transport, len(urls), mapping, ref_digests,
+        )
         if on_refs_prepared:
             on_refs_prepared(mapping, [] if transport == "data_url" else urls)
         ref_url_cache[transport] = urls
@@ -377,16 +430,47 @@ def generate_video(
     def _submit(transport_label):
         mode = _attach_refs(transport_label)
         _stage("submitting", "请求中", 8)
+        ref_urls = payload.get("reference_image_urls") or []
+        payload_summary = {
+            "keys": _json_keys(payload),
+            "model": payload.get("model"),
+            "seconds": payload.get("seconds"),
+            "aspect_ratio": payload.get("aspect_ratio"),
+            "resolution": payload.get("resolution"),
+            "size": payload.get("size"),
+            "prompt_chars": len(payload.get("prompt") or ""),
+            "prompt_preview": _clip(payload.get("prompt") or "", 300),
+            "reference_image_urls_count": len(ref_urls),
+            "reference_transport": transport_label,
+            "reference_value_types": [
+                "data_url" if str(u).startswith("data:") else _safe_url(str(u))
+                for u in ref_urls
+            ],
+        }
         logger.info(
             f"[Video] 提交 {mode}: model={model} {duration}s "
             f"{aspect_ratio} {resolution} size={payload.get('size')} "
             f"refs={len(payload.get('reference_image_urls') or [])} "
             f"transport={transport_label}"
         )
+        logger.info(
+            "[Video][Request] POST %s provider=openai-compatible mode=%s payload=%s",
+            _safe_url(submit_url), mode, json.dumps(payload_summary, ensure_ascii=False),
+        )
         resp = http.post(submit_url, json=payload, headers=headers, timeout=60)
+        logger.info(
+            "[Video][Response] POST %s status=%s content_type=%s bytes=%s",
+            _safe_url(submit_url), resp.status_code, resp.headers.get("Content-Type", ""),
+            len(resp.content or b""),
+        )
         if resp.status_code >= 400:
             raise _api_error(resp, "提交")
-        return resp.json()
+        data = resp.json()
+        logger.info(
+            "[Video][Response] submit json=%s",
+            json.dumps(_response_summary(data), ensure_ascii=False),
+        )
+        return data
 
     actual_transport = ref_transport
     try:
@@ -426,12 +510,20 @@ def generate_video(
 def _poll(api_base, task_id, key, timeout, interval, on_progress, on_stage=None) -> str:
     headers = {"Authorization": _bearer_header(key), "Content-Type": "application/json"}
     poll_url = f"{_openai_video_base(api_base)}/videos/{task_id}"
+    logger.info(
+        "[Video][Request] poll start GET %s task_id=%s timeout=%ss interval=%ss",
+        _safe_url(poll_url), task_id, timeout, interval,
+    )
     elapsed = 0
     while elapsed < timeout:
         time.sleep(interval)
         elapsed += interval
         try:
             r = http.get(poll_url, headers=headers, timeout=30)
+            logger.info(
+                "[Video][Poll] GET %s elapsed=%ss status_code=%s bytes=%s",
+                _safe_url(poll_url), elapsed, r.status_code, len(r.content or b""),
+            )
             if r.status_code >= 400:
                 continue
             data = r.json()
@@ -448,6 +540,10 @@ def _poll(api_base, task_id, key, timeout, interval, on_progress, on_stage=None)
             if on_stage:
                 on_stage("polling", "等待中", prog)
             logger.info(f"[Video] 轮询 {elapsed}s: status={status} progress={prog}%")
+            logger.info(
+                "[Video][Poll] json=%s",
+                json.dumps(_response_summary(data), ensure_ascii=False),
+            )
             if status in ("completed", "done", "success", "finished"):
                 url = _extract_video_url(data)
                 if url:
@@ -532,12 +628,20 @@ def _generate_seedance(
     }
     files = []
     ref_mapping: list[dict] = []
+    file_digests = []
     for i, b in enumerate(ref_images_b64 or []):
         try:
             raw = base64.b64decode(b)
         except Exception as e:  # noqa: BLE001
             raise VideoError(f"第 {i + 1} 张参考图数据无效") from e
         files.append(("files", (f"ref{i+1}.png", raw, "image/png")))
+        file_digests.append({
+            "index": i + 1,
+            "field": "files",
+            "filename": f"ref{i+1}.png",
+            "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest()[:16],
+        })
     if files:
         for idx, _b in enumerate(ref_images_b64 or []):
             meta = (ref_meta or [])[idx] if idx < len(ref_meta or []) else {}
@@ -565,14 +669,31 @@ def _generate_seedance(
             2 if files else 8,
         )
     logger.info(f"[Video][Seedance] 提交 {mode}: model={model} {dur}s {aspect} {res} refs={len(files)}")
+    logger.info(
+        "[Video][Request] POST %s provider=seedance multipart form=%s files=%s prompt_chars=%s prompt_preview=%s",
+        _safe_url(submit_url),
+        json.dumps({k: v for k, v in form.items() if k != "prompt"}, ensure_ascii=False),
+        json.dumps(file_digests, ensure_ascii=False),
+        len(prompt or ""),
+        _clip(prompt or "", 300),
+    )
     try:
         resp = http.post(submit_url, data=form, files=files or None,
                          headers={"token": key}, timeout=120)
     except Exception as e:  # noqa: BLE001
         raise VideoError(f"Seedance 提交请求失败: {e}") from e
+    logger.info(
+        "[Video][Response] POST %s status=%s content_type=%s bytes=%s",
+        _safe_url(submit_url), resp.status_code, resp.headers.get("Content-Type", ""),
+        len(resp.content or b""),
+    )
     if resp.status_code >= 400:
         raise _api_error(resp, "Seedance 提交")
     body = _seedance_json(resp, "提交")
+    logger.info(
+        "[Video][Response] seedance submit json=%s",
+        json.dumps(_response_summary(body), ensure_ascii=False),
+    )
     if on_submit_response:
         on_submit_response(body)
     task_id = ((body.get("data") or {}).get("Id"))
@@ -633,14 +754,27 @@ def _poll_seedance(root, task_id, key, timeout, interval, on_progress, on_stage=
     headers = {"token": key, "Content-Type": "application/json"}
     elapsed = 0
     interval = max(10, interval)
+    logger.info(
+        "[Video][Request] seedance poll start POST %s task_id=%s timeout=%ss interval=%ss",
+        _safe_url(query_url), task_id, timeout, interval,
+    )
     while elapsed < timeout:
         time.sleep(interval)
         elapsed += interval
         try:
             r = http.post(query_url, json={"Id": task_id}, headers=headers, timeout=30)
+            logger.info(
+                "[Video][Poll] POST %s elapsed=%ss status_code=%s bytes=%s payload=%s",
+                _safe_url(query_url), elapsed, r.status_code, len(r.content or b""),
+                json.dumps({"Id": task_id}, ensure_ascii=False),
+            )
             if r.status_code >= 400:
                 continue
             body = _seedance_json(r, "轮询")
+            logger.info(
+                "[Video][Poll] seedance json=%s",
+                json.dumps(_response_summary(body), ensure_ascii=False),
+            )
             data = (body.get("data") or {}) if isinstance(body, dict) else {}
             status = data.get("Status")
             status_text = str(data.get("StatusText") or "")
