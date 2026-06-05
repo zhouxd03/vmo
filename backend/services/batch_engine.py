@@ -442,13 +442,15 @@ def _clean_generated_prompt(text: str) -> str:
 
 
 def _continuity_ref_items(pid: Optional[str], task: dict,
-                          with_b64: bool = True) -> list:
+                          with_b64: bool = True,
+                          manual_decisions: Optional[dict] = None) -> list:
     if not pid or not task:
         return []
     shot_no = task.get("shot_no") or task.get("id")
     if not shot_no:
         return []
-    decision = (story_state.get_shot_state(pid, shot_no) or {}).get("decision") or {}
+    manual = (manual_decisions or {}).get(str(shot_no)) or (manual_decisions or {}).get(shot_no)
+    decision = manual if isinstance(manual, dict) else (story_state.get_shot_state(pid, shot_no) or {}).get("decision") or {}
     if not isinstance(decision, dict):
         decision = {}
     items: list = []
@@ -505,10 +507,12 @@ def _has_continuity_visual(pid: Optional[str], task: dict) -> bool:
 
 def _preview_ref_items(pid: Optional[str], task: dict,
                        with_b64: bool = False,
-                       include_continuity: bool = False) -> list:
+                       include_continuity: bool = False,
+                       manual_decisions: Optional[dict] = None) -> list:
     items = _asset_ref_items(pid, task, with_b64=with_b64)
     if include_continuity:
-        items += _continuity_ref_items(pid, task, with_b64=with_b64)
+        items += _continuity_ref_items(pid, task, with_b64=with_b64,
+                                       manual_decisions=manual_decisions)
     return items
 
 
@@ -550,9 +554,11 @@ def _serialize_ref_items(pid: Optional[str], kept: list) -> list:
 
 def _preview_refs(pid: Optional[str], task: dict,
                   kind: str = "video",
-                  include_continuity: bool = False) -> tuple[list, str]:
+                  include_continuity: bool = False,
+                  manual_decisions: Optional[dict] = None) -> tuple[list, str]:
     items = _preview_ref_items(pid, task, with_b64=False,
-                               include_continuity=include_continuity)
+                               include_continuity=include_continuity,
+                               manual_decisions=manual_decisions)
     kept = _stable_cap_items(items, _max_refs(), require_b64=False)
     if not kept:
         return [], ""
@@ -561,18 +567,23 @@ def _preview_refs(pid: Optional[str], task: dict,
 
 def _preview_definition_block(pid: Optional[str], task: dict,
                               kind: str = "video",
-                              include_continuity: bool = False) -> str:
+                              include_continuity: bool = False,
+                              manual_decisions: Optional[dict] = None) -> str:
     """Preview definition block using the same ref order as generation."""
-    _kept, head = _preview_refs(pid, task, kind, include_continuity=include_continuity)
+    _kept, head = _preview_refs(pid, task, kind, include_continuity=include_continuity,
+                                manual_decisions=manual_decisions)
     return head
 
 
 def _with_preview_def(pid: Optional[str], task: dict, video_prompt: str,
                       kind: str = "video",
-                      include_continuity: bool = False) -> str:
+                      include_continuity: bool = False,
+                      manual_decisions: Optional[dict] = None) -> str:
     """Prepend the preview definition block to *video_prompt* (idempotent)."""
     body = reference_set.strip_definition_block(video_prompt or "")
-    head = _preview_definition_block(pid, task, kind, include_continuity=include_continuity)
+    head = _preview_definition_block(pid, task, kind,
+                                     include_continuity=include_continuity,
+                                     manual_decisions=manual_decisions)
     if not head:
         return body
     return head + "\n\n" + body if body else head
@@ -580,7 +591,8 @@ def _with_preview_def(pid: Optional[str], task: dict, video_prompt: str,
 
 def build_shot_prompts(project: dict, shot_nos: Optional[list] = None,
                        *, include_saved: bool = True,
-                       include_continuity_refs: bool = False) -> dict:
+                       include_continuity_refs: bool = False,
+                       manual_continuity: Optional[dict] = None) -> dict:
     """Preview per-shot generation prompts without generating media."""
     pid = project.get("_pid") or project.get("id")
     want = {str(n) for n in shot_nos} if shot_nos else None
@@ -596,7 +608,8 @@ def build_shot_prompts(project: dict, shot_nos: Optional[list] = None,
             image = (saved.get("image") or img).strip()
             video = (saved.get("video") or build_video_prompt(t, image)).strip()
             kept, head = _preview_refs(pid, t, "video",
-                                       include_continuity=include_continuity_refs)
+                                       include_continuity=include_continuity_refs,
+                                       manual_decisions=manual_continuity)
             body = reference_set.strip_definition_block(video or "").strip()
             out[no] = {
                 "image": image,
@@ -875,7 +888,7 @@ def _generate_video_with_refs(pid: str, batch: dict, task: dict, params: dict,
                                        required_roles=required_roles)
     refs = [it["b64"] for it in kept]
     if not refs:
-        raise RuntimeError("鍥剧敓瑙嗛缂哄皯鍙敤鍙傝€冨浘锛氳鍏堜负璇ュ垎闀滅敓鎴?閫夋嫨鍥剧墖绱犳潗锛岄伩鍏嶉€€鍖栦负鏂囩敓瑙嗛")
+        raise RuntimeError("图生视频缺少可用参考图：请先为该分镜生成或选择图片素材，系统不会退化为文生视频")
     if prompt_prefix:
         prompt = f"{prompt_prefix}\n{prompt}"
     refs = _normalize_refs_aspect(refs, aspect_ratio, resolution)

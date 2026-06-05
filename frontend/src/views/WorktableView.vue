@@ -234,7 +234,13 @@ const imageModelOptions = [
   { label: '默认模型', value: '' }, { label: 'gpt-image-2', value: 'gpt-image-2' }, { label: 'jimeng-4.6', value: 'jimeng-4.6' },
 ]
 const videoModelOptions = [
-  { label: '默认模型', value: '' }, { label: 'seed-2.0fast', value: 'seed-2.0fast' },
+  { label: '默认模型', value: '' },
+  { label: 'doubao-seedance-2-0-fast-260128', value: 'doubao-seedance-2-0-fast-260128' },
+  { label: 'doubao-seedance-2-0-260128', value: 'doubao-seedance-2-0-260128' },
+  { label: 'doubao-seedance-2-0-260128-1', value: 'doubao-seedance-2-0-260128-1' },
+  { label: 'doubao-seedance-2-0-260128-2', value: 'doubao-seedance-2-0-260128-2' },
+  { label: 'doubao-seedance-2-0-260128-3', value: 'doubao-seedance-2-0-260128-3' },
+  { label: 'seed-2.0fast（旧接口兼容）', value: 'seed-2.0fast' },
 ]
 
 onMounted(async () => {
@@ -251,7 +257,7 @@ watch(() => store.currentId, () => { loadTb(); loadContinuitySettings(); loadMan
 watch(() => store.currentEpisodeId, () => { loadLocks(); loadContinuitySettings(); loadManualBridge(); loadMaterialSelections(); reload() })
 watch(tb, () => { saveTb(); saveContinuitySettings() }, { deep: true })
 watch(() => tb.continuity, () => {
-  if (store.current && shots.value.length) fillPrompts(shots.value.map((s) => s.shot_no))
+  if (store.current && shots.value.length) refreshVideoPrompts(shots.value.map((s) => s.shot_no))
 })
 // NOTE: we intentionally do NOT stop polling on unmount — the tasks store keeps
 // polling across tab switches so an in-flight batch keeps updating (§8.2).
@@ -394,6 +400,7 @@ async function fillPrompts(shotNos, { force = false } = {}) {
     res = await api.previewShotPrompts(store.current.id, {
       episode_id: store.currentEpisodeId, shot_nos: shotNos,
       continuity: !!tb.continuity,
+      manual_continuity: manualContinuityPayload(),
     })
   } catch (e) { message.error('提示词推理失败：' + e.message); return 0 }
   const prompts = res?.prompts || {}
@@ -407,6 +414,31 @@ async function fillPrompts(shotNos, { force = false } = {}) {
     n++
   })
   return n
+}
+
+async function refreshVideoPrompts(shotNos) {
+  if (!store.current || !shotNos.length) return 0
+  try {
+    const res = await api.previewShotPrompts(store.current.id, {
+      episode_id: store.currentEpisodeId,
+      shot_nos: shotNos,
+      continuity: !!tb.continuity,
+      manual_continuity: manualContinuityPayload(),
+    })
+    const prompts = res?.prompts || {}
+    let n = 0
+    shotNos.forEach((no) => {
+      const r = rowState[no]; const p = prompts[no]
+      if (!r || !p) return
+      r.videoPrompt = p.video || r.videoPrompt || ''
+      r.refs = Array.isArray(p.refs) ? p.refs : []
+      n++
+    })
+    return n
+  } catch (e) {
+    message.error('刷新连续性画面定义失败：' + e.message)
+    return 0
+  }
 }
 // 真·LLM 逐镜推理：调用 /infer_shot_prompt，喂入连续性(上一镜 handoff)+本镜关联资产
 // 说明+结构字段，产出干净规范的图片/视频提示词并回填（覆盖）。失败自动后端兜底确定性合成。
@@ -936,6 +968,7 @@ async function toggleBridge(prev, next, key) {
   d.reason = 'Manual continuity bridge selection'
   saveManualBridge()
   if (d[key]) await prepareBridgeAsset(prev, next, key)
+  await refreshVideoPrompts([next.shot_no])
 }
 function setBridgeBusy(prev, next, action) { bridgeBusy[bridgeKey(prev, next)] = action }
 function clearBridgeBusy(prev, next) { delete bridgeBusy[bridgeKey(prev, next)] }
@@ -973,6 +1006,7 @@ async function genBridgeStaging(prev, next) {
       model: tb.model || undefined,
     })
     await reload()
+    await refreshVideoPrompts([next.shot_no])
     message.success(`${next.shot_no} 站位图已${replacing ? '重新生成并覆盖' : '生成'}`)
   } catch (e) { message.error(e.message) } finally { clearBridgeBusy(prev, next) }
 }
@@ -985,6 +1019,7 @@ async function genBridgeDirector(prev, next) {
       model: tb.model || undefined,
     })
     await reload()
+    await refreshVideoPrompts([next.shot_no])
     message.success(`${next.shot_no} 导演图已${replacing ? '重新生成并覆盖' : '生成'}`)
   } catch (e) { message.error(e.message) } finally { clearBridgeBusy(prev, next) }
 }
@@ -996,6 +1031,7 @@ async function decideBridge(prev, next) {
       use_llm: tb.decisionLlm, model: tb.model || undefined, commit: true,
     })
     await reload()
+    await refreshVideoPrompts([next.shot_no])
     message.success(`${prev.shot_no} -> ${next.shot_no} 连续性决策完成`)
   } catch (e) { message.error(e.message) } finally { clearBridgeBusy(prev, next) }
 }

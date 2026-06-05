@@ -440,6 +440,7 @@ def register(app: Flask) -> None:
             ctx, body.get("shot_nos"),
             include_saved=not bool(body.get("ignore_saved")),
             include_continuity_refs=bool(body.get("continuity")),
+            manual_continuity=body.get("manual_continuity") if isinstance(body.get("manual_continuity"), dict) else None,
         )
         return jsonify({"prompts": prompts})
 
