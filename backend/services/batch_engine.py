@@ -875,6 +875,51 @@ def _is_seedance_video_params(params: dict) -> bool:
         return False
 
 
+_TAIL_NEGATION_PHRASES = (
+    "无需尾帧", "不需要尾帧", "不要尾帧", "不使用尾帧", "不用尾帧",
+    "取消尾帧", "禁止尾帧", "避免尾帧", "无需首尾帧", "不要首尾帧",
+    "不需要首尾帧", "非长镜头", "切镜头", "景别切换",
+)
+
+
+def _tail_frame_negated(decision: dict, task: dict) -> bool:
+    text = "\n".join(str(x or "") for x in (
+        decision.get("camera_hint"),
+        decision.get("reason"),
+        decision.get("bridge_context"),
+        continuity.render_bridge_context(decision.get("bridge_data") or {}, purpose="video"),
+        task.get("prompt"),
+    ))
+    return any(phrase in text for phrase in _TAIL_NEGATION_PHRASES)
+
+
+def _reconcile_tail_decision(decision: dict, task: dict) -> dict:
+    if not decision.get("use_tail_frame") or not _tail_frame_negated(decision, task):
+        return decision
+    out = {
+        **decision,
+        "use_tail_frame": False,
+        "long_take": False,
+        "prefer_cut": True,
+    }
+    out["scene_cut"] = not (out.get("use_staging") or out.get("use_director_board"))
+    if out.get("use_director_board"):
+        out["strategy"] = "director_board"
+    elif out.get("use_staging"):
+        out["strategy"] = "staging"
+    elif out.get("scene_cut"):
+        out["strategy"] = "scene_cut"
+    else:
+        out["strategy"] = "cinematic_cut"
+    reason = (out.get("reason") or "").strip()
+    out["reason"] = (reason + "；" if reason else "") + "检测到提示词/衔接文本明确否定尾帧，已取消上一镜尾帧引用"
+    logger.warning(
+        "[Continuity] %s tail-frame conflict reconciled: prompt/hint negates tail frame, use_tail_frame forced to false",
+        task.get("shot_no") or task.get("id"),
+    )
+    return out
+
+
 def _generate_video_with_refs(pid: str, batch: dict, task: dict, params: dict,
                               items: list, *, filename_prefix: str,
                               prompt_prefix: str = "",
@@ -1120,6 +1165,8 @@ def _gen_video_task_continuity(pid, batch, task, params):
             }
     decision = continuity.ensure_bridge_context(
         continuity.enforce_director_policy(decision, shot), shot, prev_state)
+    decision = _reconcile_tail_decision(decision, task)
+    decision = continuity.ensure_bridge_context(decision, shot, prev_state)
     task["_bridge_data"] = decision.get("bridge_data") or {}
     task["_bridge_context"] = continuity.render_bridge_context(
         task["_bridge_data"], purpose="video").strip() or decision.get("bridge_context", "")

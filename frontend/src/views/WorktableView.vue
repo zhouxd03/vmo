@@ -175,6 +175,23 @@ function defaultBridgeDecision() {
     reason: 'Manual continuity bridge selection',
   }
 }
+const tailNegationPhrases = ['无需尾帧', '不需要尾帧', '不要尾帧', '不使用尾帧', '不用尾帧', '取消尾帧', '禁止尾帧', '避免尾帧', '非长镜头', '切镜头', '景别切换']
+function bridgeNegatesTail(d) {
+  const text = [d?.camera_hint, d?.reason, d?.bridge_context].filter(Boolean).join('\n')
+  return tailNegationPhrases.some((p) => text.includes(p))
+}
+function sanitizeManualBridgeDecision(d) {
+  const out = { ...defaultBridgeDecision(), ...(d || {}) }
+  if (out.use_tail_frame && bridgeNegatesTail(out)) {
+    out.use_tail_frame = false
+    out.long_take = false
+    out.prefer_cut = true
+    out.scene_cut = !(out.use_staging || out.use_director_board)
+    out.strategy = out.use_director_board ? 'director_board' : out.use_staging ? 'staging' : out.scene_cut ? 'scene_cut' : 'cinematic_cut'
+    out.reason = `${out.reason || 'Manual continuity bridge selection'}；检测到衔接文本明确否定尾帧，已取消上一镜尾帧引用`
+  }
+  return out
+}
 function loadManualBridge() {
   Object.keys(manualBridge).forEach((k) => { delete manualBridge[k] })
   try {
@@ -182,7 +199,7 @@ function loadManualBridge() {
     const data = raw ? JSON.parse(raw) : {}
     if (!data || typeof data !== 'object') return
     Object.entries(data).forEach(([shotNo, value]) => {
-      manualBridge[shotNo] = { ...defaultBridgeDecision(), ...(value || {}) }
+      manualBridge[shotNo] = sanitizeManualBridgeDecision(value)
     })
   } catch { /* ignore */ }
 }
@@ -955,7 +972,6 @@ function ensureManualBridge(nextNo) {
   if (!manualBridge[nextNo]) {
     manualBridge[nextNo] = {
       ...defaultBridgeDecision(),
-      ...(snap(nextNo)?.decision || statusByShot[nextNo]?.decision || {}),
       source: 'manual',
     }
   }
@@ -1231,13 +1247,14 @@ function manualContinuityPayload() {
       }
       continue
     }
+    const clean = sanitizeManualBridgeDecision(d)
     out[s.shot_no] = {
       ...defaultBridgeDecision(),
-      ...d,
-      scene_cut: !(d.use_tail_frame || d.use_staging || d.use_director_board),
-      strategy: d.use_tail_frame ? 'tail_frame'
-        : d.use_staging ? 'staging'
-          : d.use_director_board ? 'director_board'
+      ...clean,
+      scene_cut: !(clean.use_tail_frame || clean.use_staging || clean.use_director_board),
+      strategy: clean.use_tail_frame ? 'tail_frame'
+        : clean.use_staging ? 'staging'
+          : clean.use_director_board ? 'director_board'
             : 'scene_cut',
       source: 'manual',
     }
