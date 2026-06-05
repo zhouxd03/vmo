@@ -1,23 +1,23 @@
 """Batch persistence (Phase 4).
 
-A batch is a queue of generation tasks (image or video) for one project. Each
-task maps to a shot (or a manual prompt) and tracks its own status/attempts so
-the engine can retry failures and resume from where it stopped.
+A batch is a queue of generation tasks for one project. Each task maps to a
+shot or manual prompt and tracks its own status/attempts so the engine can
+retry failures and resume from where it stopped.
 
 Stored under data/projects/<pid>/batches/<bid>.json with a per-project index.
 """
 
+import re
 import threading
 import time
 import uuid
-import re
 from typing import Any, Optional
 
 from .paths import PROJECTS_DIR
 from .store import read_json, write_json
 
-# Guards read-modify-write of a batch file so concurrent engine threads
-# (within one process) don't clobber each other's task updates.
+# Guards read-modify-write of a batch file so concurrent engine threads within
+# one process do not clobber each other's task updates.
 _mutate_lock = threading.RLock()
 
 
@@ -31,11 +31,11 @@ def _batch_path(pid: str, bid: str):
     return _batch_dir(pid) / f"{bid}.json"
 
 
-def _safe_folder_name(text: str, fallback: str = "batch") -> str:
-    text = (text or fallback).strip()
-    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text)
-    text = re.sub(r"\s+", "_", text).strip("._ ")
-    return (text or fallback)[:72]
+def _safe_id_part(text: str, fallback: str = "batch") -> str:
+    text = (text or "").strip()
+    text = re.sub(r"[^A-Za-z0-9_-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_-")
+    return (text or fallback)[:40]
 
 
 def _index_path(pid: str):
@@ -64,8 +64,6 @@ def _summarize(b: dict) -> dict:
         "error": err,
         "concurrency": b.get("concurrency", 2),
         "pause_requested": bool(b.get("pause_requested")),
-        # surface episode membership in the lightweight index so the worktable /
-        # episode bar can group batches per-episode without fetching every detail
         "episode_id": (b.get("params") or {}).get("episode_id"),
         "created_at": b.get("created_at"),
         "updated_at": b.get("updated_at"),
@@ -87,16 +85,21 @@ def create_batch(pid: str, kind: str, name: str, tasks: list,
         raise ValueError(f"未知批次类型: {kind}")
     if not tasks:
         raise ValueError("批次任务为空")
+
     # Video calls are expensive and prompt-sensitive. A failed provider task may
     # already have consumed quota, so never create video tasks with automatic
-    # re-submit attempts; users should inspect the error and manually retry.
+    # resubmit attempts; users should inspect the error and manually retry.
     if kind == "video":
         max_attempts = 1
+
     now = time.time()
     stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
-    episode_label = (params or {}).get("episode_name") or (params or {}).get("episode_id") or ""
-    label = "_".join(x for x in (episode_label, name or kind) if x)
-    bid = f"{_safe_folder_name(label)}_{stamp}_{uuid.uuid4().hex[:6]}"
+    params = params or {}
+    episode_label = params.get("episode_id") or ""
+    first_shot = (tasks[0] or {}).get("shot_no") if tasks else ""
+    label = "_".join(x for x in (kind, episode_label, first_shot) if x)
+    bid = f"{_safe_id_part(label, kind)}_{stamp}_{uuid.uuid4().hex[:6]}"
+
     norm_tasks = []
     for i, t in enumerate(tasks):
         norm_tasks.append({
@@ -108,7 +111,7 @@ def create_batch(pid: str, kind: str, name: str, tasks: list,
             "prompt": t.get("prompt", ""),
             "materials": t.get("materials", []),
             "params": t.get("params", {}),
-            # continuity fields (Phase 5) — preserved for the continuity engine
+            # Continuity fields are preserved for the continuity engine.
             "scene": t.get("scene", ""),
             "scene_ref": t.get("scene_ref", ""),
             "characters": t.get("characters", []),
@@ -128,16 +131,16 @@ def create_batch(pid: str, kind: str, name: str, tasks: list,
             "max_attempts": max_attempts,
             "result": None,
             "error": None,
-            "src_text": t.get("src_text", ""),
             "updated_at": now,
         })
+
     batch = {
         "id": bid,
         "pid": pid,
         "kind": kind,
         "name": name or f"批次 {time.strftime('%m-%d %H:%M')}",
         "concurrency": max(1, int(concurrency or 1)),
-        "params": params or {},
+        "params": params,
         "status": "pending",
         "pause_requested": False,
         "tasks": norm_tasks,
@@ -195,7 +198,7 @@ def request_pause(pid: str, bid: str) -> Optional[dict]:
             if t.get("status") == "pending":
                 t["status"] = "paused"
                 t["stage"] = "paused"
-                t["stage_label"] = "已停止等待"
+                t["stage_label"] = "已暂停等待"
                 t["updated_at"] = time.time()
             elif t.get("status") == "running":
                 t["stage"] = "stopping"

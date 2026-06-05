@@ -1,6 +1,6 @@
-﻿"""Video generation service (adapted from shengtu /api/video/generate).
+"""Video generation service (adapted from shengtu /api/video/generate).
 
-Key change vs shengtu: the API base URL is NOT hardcoded 鈥?it comes from the
+Key change vs shengtu: the API base URL is not hardcoded; it comes from the
 Credential Vault (category=video) so the user provides base_url + key manually.
 Submits a job, then polls until done, downloading the result locally.
 """
@@ -447,7 +447,7 @@ def _poll(api_base, task_id, key, timeout, interval, on_progress, on_stage=None)
                 on_progress(prog)
             if on_stage:
                 on_stage("polling", "等待中", prog)
-            logger.info(f"[Video] 杞 {elapsed}s: status={status} progress={prog}%")
+            logger.info(f"[Video] 轮询 {elapsed}s: status={status} progress={prog}%")
             if status in ("completed", "done", "success", "finished"):
                 url = _extract_video_url(data)
                 if url:
@@ -472,7 +472,7 @@ def _poll(api_base, task_id, key, timeout, interval, on_progress, on_stage=None)
     raise VideoError(f"生成超时（{timeout}秒）")
 
 
-# 鈹€鈹€ Seedance (doubao-seedance) provider 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# Seedance (doubao-seedance) provider
 # A different dialect from the OpenAI-style path above:
 #   submit : POST {root}/seedanceapi/common/File/All  (multipart/form-data)
 #            header `token`; reference images are uploaded as real `files` parts
@@ -618,7 +618,7 @@ def _seedance_json(resp, where: str) -> dict:
 
 def seedance_user_info(base_url: str, api_key: str) -> dict:
     """Query Seedance account balances (token / fast token / int'l seconds).
-    Credit-free 鈥?used as the connectivity/auth test for a Seedance credential."""
+    Credit-free; used as the connectivity/auth test for a Seedance credential."""
     root = _seedance_root((base_url or "").strip().rstrip("/"))
     headers = {"token": (api_key or "").strip(), "Content-Type": "application/json"}
     resp = http.post(f"{root}/seedanceapi/user/UserIndex", json={"Id": 0},
@@ -650,7 +650,7 @@ def _poll_seedance(root, task_id, key, timeout, interval, on_progress, on_stage=
                 elapsed, status, status_text, data.get("UseToken"), data.get("DeductToken"),
                 data.get("UseDuration"), message,
             )
-            if status == 2:                              # 宸插畬鎴?
+            if status == 2:                              # completed
                 url = data.get("VideoUrl") or ""
                 if url:
                     return {
@@ -668,14 +668,14 @@ def _poll_seedance(root, task_id, key, timeout, interval, on_progress, on_stage=
                     err_type="seedance",
                     raw=_stringify_upstream(data),
                 )
-            elif status == 3:                            # 澶辫触
+            elif status == 3:                            # failed
                 raise VideoError(
                     message or status_text or "Seedance 生成失败",
                     code=str(body.get("code") or ""),
                     err_type="seedance",
                     raw=_stringify_upstream(data),
                 )
-            else:                                        # 0 寰呭鐞?/ 1 澶勭悊涓?
+            else:                                        # 0 pending / 1 processing
                 if on_progress:
                     on_progress(40 if status == 1 else 15)
                 if on_stage:

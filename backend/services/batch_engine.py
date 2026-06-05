@@ -1,4 +1,4 @@
-﻿"""Batch generation engine (Phase 4).
+"""Batch generation engine (Phase 4).
 
 Runs a batch of image/video tasks with:
   - bounded concurrency (ThreadPoolExecutor sized by batch.concurrency)
@@ -73,7 +73,7 @@ def is_paused(bid: str) -> bool:
         return _pause_flags.get(bid, False)
 
 
-# 鈹€鈹€ task building from shots 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# Task building from shots
 def _shot_text(shot: dict) -> str:
     parts = [
         shot.get("scene", ""), shot.get("action", ""),
@@ -169,10 +169,10 @@ def build_tasks_from_shots(project: dict, shot_nos: Optional[list] = None) -> li
             "handoff": s.get("handoff", ""),
             "dialogue": s.get("dialogue", ""),
             "emotion": s.get("emotion") or s.get("mood") or "",
-            # per-shot duration from pacing (5瀛?绉掞紝鎸夋儏缁皟)锛屼緵瑙嗛鐢熸垚浣跨敤
+            # Per-shot duration from pacing, used by video generation.
             "duration": s.get("duration"),
             "prompt_overrides": s.get("prompt_overrides") if isinstance(s.get("prompt_overrides"), dict) else {},
-            # 缁熶竴 @ 寮曠敤鐨勫睍绀哄瓧娈碉紙渚涜棰戙€愰暅澶村姩鎬併€戠敤锛屼笉褰卞搷 continuity 鐨勫師濮嬪瓧娈碉級
+            # Normalized @ reference display fields for video prompt dynamics.
             "scene_ref": _norm_refs(s.get("scene", ""), asset_list),
             "action_ref": _norm_refs(s.get("action", ""), asset_list),
             "handoff_ref": _norm_refs(s.get("handoff", ""), asset_list),
@@ -741,7 +741,7 @@ def _shot_duration(task: dict, params: dict) -> int:
     return max(1, min(15, d))
 
 
-# 鈹€鈹€ reference-image assembly (asset materials 鈫?priority-capped base64) 鈹€鈹€鈹€鈹€鈹€鈹€
+# Reference-image assembly: asset materials to priority-capped base64
 def _max_refs() -> int:
     try:
         return int(settings_store.load_settings().get("max_reference_images", 8))
@@ -849,7 +849,7 @@ def _finalize_ref_items(task: dict, items: list, kind: str = "video", max_refs: 
         roles = [it.get("role") or "unknown" for it in kept]
         mapping = [f"@图{i + 1}:{it.get('role') or 'unknown'}:{it.get('name') or ''}"
                    for i, it in enumerate(kept)]
-        logger.info(f"[Refs] 瑙嗛鏈€缁堝紩鐢ㄥ浘 count={len(kept)} roles={roles} mapping={mapping}")
+        logger.info(f"[Refs] 视频最终引用图 count={len(kept)} roles={roles} mapping={mapping}")
     prompt = reference_set.compose_prompt(
         task.get("prompt", ""), task.get("materials", []), kept, kind=kind)
     return kept, prompt
@@ -1000,9 +1000,9 @@ def _normalize_refs_aspect(refs: list, aspect_ratio: str, resolution: str = "720
         try:
             out.append(ffmpeg_util.fit_b64_to_size(r, width, height))
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[Refs] 鍙傝€冨浘鐢诲竷褰掍竴鍖栬烦杩?#{idx + 1}: {e}")
+            logger.warning(f"[Refs] 参考图画布归一化跳过 #{idx + 1}: {e}")
             out.append(r)
-    logger.info(f"[Refs] 瑙嗛鍙傝€冨浘鐢诲竷褰掍竴鍖? refs={len(out)} size={width}x{height} aspect={aspect_ratio}")
+    logger.info(f"[Refs] 视频参考图画布归一化 refs={len(out)} size={width}x{height} aspect={aspect_ratio}")
     return out
 
 
@@ -1012,7 +1012,7 @@ def _out_dir(pid: str, bid: str):
     return d
 
 
-# 鈹€鈹€ generators (real) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# Real generators
 def _gen_image_task(pid, batch, task, params):
     refs, prompt = _finalize_refs(task, _asset_ref_items(pid, task), kind="image")
     out = image_gen.generate_image(
@@ -1058,8 +1058,8 @@ def _gen_video_task_continuity(pid, batch, task, params):
     }
     prev_state = story_state.get_current(pid)
     style = params.get("style", "")
-    # 榛樿鐩存帴寮€鍚€孡LM 鍗囩骇鍐崇瓥銆嶏細闄ら潪鏄惧紡浼?decision_llm=false锛屽惁鍒欒鎺ュ垽瀹氳蛋鐪熉稬LM
-    # 鍗囩骇锛堟棤鍑嵁/澶辫触鏃?decide_handoff 鑷姩鍥為€€纭畾鎬ц鍒欙紝涓嶉樆鏂級銆?    use_llm = bool(params.get("decision_llm", True))
+    # Enable LLM-assisted continuity decisions unless explicitly disabled.
+    # decide_handoff falls back to deterministic rules if the LLM is unavailable.
     manual_map = params.get("manual_continuity") or {}
     manual_decision = manual_map.get(shot_no) if isinstance(manual_map, dict) else None
     if isinstance(manual_decision, dict):
@@ -1229,7 +1229,7 @@ def _gen_video_task_continuity(pid, batch, task, params):
         try:
             tail_info = continuity.extract_tail_frame(pid, shot_no, out["filepath"])
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[Continuity] {shot_no} 灏惧抚鎶藉彇澶辫触: {e}")
+            logger.warning(f"[Continuity] {shot_no} 尾帧抽取失败: {e}")
 
     # auto mode: AI continuity review gate (best-effort; surfaced on the task)
     review = None
@@ -1273,7 +1273,7 @@ def _gen_video_task_continuity(pid, batch, task, params):
 _GENERATORS: dict[str, Callable] = {"image": _gen_image_task, "video": _gen_video_task}
 
 
-# 鈹€鈹€ runner 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# Runner
 def _run_one(pid, batch, task, gen, params, backoff):
     """Run one task with retry/error handling."""
     bid = batch["id"]
@@ -1342,15 +1342,15 @@ def _run_one(pid, batch, task, gen, params, backoff):
             if err_info["retryable"] and attempts < max_attempts:
                 time.sleep(backoff * attempts)  # progressive backoff
                 continue
-            break  # non-retryable 鈫?stop immediately (don't waste quota)
+            break  # non-retryable: stop immediately to avoid wasting quota
     # record the structured error and the number of attempts actually spent
     err_info = {**err_info, "attempts_used": attempts}
     batches.update_task(pid, bid, task["id"],
                         {"status": "error", "error": err_info, "attempts": attempts,
-                         "stage": "error", "stage_label": "澶辫触"})
+                         "stage": "error", "stage_label": "失败"})
     if err_info.get("abort_batch"):
         pause(bid)  # skip the remaining shots instead of failing each the same way
-        logger.warning(f"[Batch {bid}] 鑷村懡閿欒锛屽凡涓鍚庣画鐢熸垚: {err_info['message']}")
+        logger.warning(f"[Batch {bid}] 致命错误，已中止后续生成: {err_info['message']}")
         return "fatal"
     return "error"
 
@@ -1421,7 +1421,7 @@ def run_batch(pid: str, bid: str, *, on_progress: Optional[Callable[[int, int], 
                             "status": "error",
                             "error": {**err_info, "attempts_used": t.get("attempts", 0)},
                             "stage": "error",
-                            "stage_label": "澶辫触",
+                            "stage_label": "失败",
                         })
                         logger.exception("[Batch %s] worker crashed for task %s", bid, t.get("shot_no") or t.get("id"))
                         outcome = "error"
