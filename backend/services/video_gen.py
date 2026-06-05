@@ -97,7 +97,8 @@ def _detect_provider(base_url: str, provider: str) -> str:
     p = (provider or "").strip().lower()
     if p in ("seedance", "openai"):
         return p
-    if "seedance" in (base_url or "").lower():
+    base = (base_url or "").lower()
+    if "seedance" in base or "119.45.252.34:8618" in base:
         return "seedance"
     return "openai"
 
@@ -434,7 +435,14 @@ def _poll(api_base, task_id, key, timeout, interval, on_progress, on_stage=None)
 #            {Id} -> {data:{Status,VideoUrl,Message,...}} (Status 0/1/2/3).
 _SEEDANCE_ASPECTS = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
 _SEEDANCE_RES = {"480p", "720p", "1080p"}
-_SEEDANCE_DEFAULT_MODEL = "doubao-seedance-2-0-fast-260128"
+SEEDANCE_MODELS = [
+    "doubao-seedance-2-0-fast-260128",
+    "doubao-seedance-2-0-260128",
+    "doubao-seedance-2-0-260128-1",
+    "doubao-seedance-2-0-260128-2",
+    "doubao-seedance-2-0-260128-3",
+]
+_SEEDANCE_DEFAULT_MODEL = SEEDANCE_MODELS[0]
 
 
 def _seedance_root(api_base: str) -> str:
@@ -455,6 +463,8 @@ def _generate_seedance(
     dur = max(4, min(15, int(duration or 5)))          # Seedance allows 4-15s
     aspect = aspect_ratio if aspect_ratio in _SEEDANCE_ASPECTS else "16:9"
     res = resolution if resolution in _SEEDANCE_RES else "720p"
+    if not ref_images_b64:
+        raise VideoError("Seedance 图生视频接口要求至少上传 1 张参考图；当前未拿到可上传图片，已停止请求。")
 
     form = {
         "model": model,
@@ -462,7 +472,6 @@ def _generate_seedance(
         "duration": str(dur),
         "aspect_ratio": aspect,
         "resolution": res,
-        "size": _video_size(aspect, res),
         "generate_audio": "true" if generate_audio else "false",
         "watermark": "true" if watermark else "false",
     }

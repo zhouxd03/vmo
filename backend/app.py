@@ -19,15 +19,6 @@ from .services import llm, video_gen
 
 logger = setup_logging()
 
-SEEDANCE_MODELS = [
-    "doubao-seedance-2-0-fast-260128",
-    "doubao-seedance-2-0-260128",
-    "doubao-seedance-2-0-260128-1",
-    "doubao-seedance-2-0-260128-2",
-    "doubao-seedance-2-0-260128-3",
-]
-
-
 def _openai_model_list(base_url: str, api_key: str) -> list[str]:
     base = (base_url or "").strip().rstrip("/")
     key = (api_key or "").strip()
@@ -196,7 +187,7 @@ def create_app() -> Flask:
             if category == "video":
                 provider = video_gen._detect_provider(body.get("base_url") or "", body.get("provider", ""))
                 if provider == "seedance":
-                    return jsonify({"models": SEEDANCE_MODELS, "builtin": True})
+                    return jsonify({"models": video_gen.SEEDANCE_MODELS, "builtin": True})
             if category in ("image", "video"):
                 return jsonify({"models": _openai_model_list(body.get("base_url"), api_key)})
             return jsonify({"models": []})
