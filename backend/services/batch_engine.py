@@ -1024,6 +1024,9 @@ def _gen_video_task(pid, batch, task, params):
         "video_url": out.get("video_url", ""),
         "reference_image_urls": out.get("reference_image_urls", []),
         "reference_image_mapping": out.get("reference_image_mapping", []),
+        "reference_transport": out.get("reference_transport", ""),
+        "seedance_status": out.get("seedance_status", {}),
+        "seedance_usage": out.get("seedance_usage", {}),
     }
 
 
@@ -1238,6 +1241,9 @@ def _gen_video_task_continuity(pid, batch, task, params):
         "video_url": out.get("video_url", ""),
         "reference_image_urls": out.get("reference_image_urls", []),
         "reference_image_mapping": out.get("reference_image_mapping", []),
+        "reference_transport": out.get("reference_transport", ""),
+        "seedance_status": out.get("seedance_status", {}),
+        "seedance_usage": out.get("seedance_usage", {}),
         "src_text": snapshot["src_text"],
         "decision": snapshot["decision"],
         "continuity_strategy": snapshot["continuity_strategy"],

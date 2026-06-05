@@ -469,6 +469,7 @@ def _poll(api_base, task_id, key, timeout, interval, on_progress, on_stage=None)
 #            {Id} -> {data:{Status,VideoUrl,Message,...}} (Status 0/1/2/3).
 _SEEDANCE_ASPECTS = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
 _SEEDANCE_RES = {"480p", "720p", "1080p"}
+_SEEDANCE_MAX_IMAGES = 9
 SEEDANCE_MODELS = [
     "doubao-seedance-2-0-fast-260128",
     "doubao-seedance-2-0-260128",
@@ -500,6 +501,13 @@ def _generate_seedance(
     res = resolution if resolution in _SEEDANCE_RES else "720p"
     if not ref_images_b64:
         raise VideoError("Seedance 图生视频接口要求至少上传 1 张参考图；当前未拿到可上传图片，已停止请求。")
+    if len(ref_images_b64) > _SEEDANCE_MAX_IMAGES:
+        raise VideoError(
+            f"Seedance 接口文档限制最多 {_SEEDANCE_MAX_IMAGES} 张参考图，当前准备上传 {len(ref_images_b64)} 张；"
+            "请在设置中降低单镜参考图上限或取消部分连续性/资产引用，系统不会自动丢图提交。",
+            code="too_many_reference_images",
+            err_type="seedance",
+        )
 
     form = {
         "model": model,
@@ -563,12 +571,15 @@ def _generate_seedance(
         on_progress(5)
     if on_stage:
         on_stage("waiting", "等待中", 10)
-    video_url = _poll_seedance(root, task_id, key, timeout, poll_interval, on_progress, on_stage)
+    poll_result = _poll_seedance(root, task_id, key, timeout, poll_interval, on_progress, on_stage)
+    video_url = poll_result["video_url"]
     if on_progress:
         on_progress(99)
     if on_stage:
         on_stage("downloading", "下载视频中", 99)
     out = _download(video_url, model, dur, save_dir, filename_prefix)
+    out["seedance_status"] = poll_result.get("status_data") or {}
+    out["seedance_usage"] = poll_result.get("usage") or {}
     if ref_mapping:
         out["reference_image_mapping"] = ref_mapping
         out["reference_image_urls"] = []
@@ -605,7 +616,7 @@ def seedance_user_info(base_url: str, api_key: str) -> dict:
     return (_seedance_json(resp, "閴存潈").get("data") or {})
 
 
-def _poll_seedance(root, task_id, key, timeout, interval, on_progress, on_stage=None) -> str:
+def _poll_seedance(root, task_id, key, timeout, interval, on_progress, on_stage=None) -> dict:
     query_url = f"{root}/seedanceapi/user/DataIndex"
     headers = {"token": key, "Content-Type": "application/json"}
     elapsed = 0
@@ -617,20 +628,47 @@ def _poll_seedance(root, task_id, key, timeout, interval, on_progress, on_stage=
             r = http.post(query_url, json={"Id": task_id}, headers=headers, timeout=30)
             if r.status_code >= 400:
                 continue
-            data = (r.json() or {}).get("data") or {}
+            body = _seedance_json(r, "轮询")
+            data = (body.get("data") or {}) if isinstance(body, dict) else {}
             status = data.get("Status")
-            logger.info(f"[Video][Seedance] 杞 {elapsed}s: status={status} ({data.get('StatusText','')})")
+            status_text = str(data.get("StatusText") or "")
+            message = str(data.get("Message") or "")
+            logger.info(
+                "[Video][Seedance] poll %ss: status=%s (%s) token=%s deduct=%s duration=%s message=%s",
+                elapsed, status, status_text, data.get("UseToken"), data.get("DeductToken"),
+                data.get("UseDuration"), message,
+            )
             if status == 2:                              # 宸插畬鎴?
                 url = data.get("VideoUrl") or ""
                 if url:
-                    return url
+                    return {
+                        "video_url": url,
+                        "status_data": data,
+                        "usage": {
+                            "UseToken": data.get("UseToken"),
+                            "DeductToken": data.get("DeductToken"),
+                            "UseDuration": data.get("UseDuration"),
+                        },
+                    }
+                raise VideoError(
+                    "Seedance 任务已完成，但接口没有返回 VideoUrl",
+                    code="missing_video_url",
+                    err_type="seedance",
+                    raw=_stringify_upstream(data),
+                )
             elif status == 3:                            # 澶辫触
-                raise VideoError(data.get("Message") or "Seedance 鐢熸垚澶辫触", raw=str(data)[:500])
+                raise VideoError(
+                    message or status_text or "Seedance 生成失败",
+                    code=str(body.get("code") or ""),
+                    err_type="seedance",
+                    raw=_stringify_upstream(data),
+                )
             else:                                        # 0 寰呭鐞?/ 1 澶勭悊涓?
                 if on_progress:
                     on_progress(40 if status == 1 else 15)
                 if on_stage:
-                    on_stage("polling", "生成中" if status == 1 else "等待中", 40 if status == 1 else 15)
+                    label = status_text or ("生成中" if status == 1 else "等待中")
+                    on_stage("polling", label, 40 if status == 1 else 15)
         except VideoError:
             raise
         except Exception as e:  # noqa: BLE001
