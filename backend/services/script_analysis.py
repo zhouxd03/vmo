@@ -24,6 +24,15 @@ logger = logging.getLogger("batch_studio")
 DEFAULT_CHUNK_CHARS = 2800
 # For stage-1, if the full text is huge, condense by sampling head/middle/tail.
 STAGE1_MAX_CHARS = 24000
+_SCENE_TIME_WORDS = (
+    "凌晨", "清晨", "早晨", "上午", "中午", "午后", "下午", "傍晚", "黄昏",
+    "晚上", "夜晚", "深夜", "午夜", "黎明", "雨夜", "雪夜", "白天", "夜间",
+)
+_SCENE_TIME_RE = re.compile(
+    r"(?:^|[_\-·｜|、\s])(" + "|".join(map(re.escape, _SCENE_TIME_WORDS)) + r")(?:$|[_\-·｜|、\s])"
+)
+_SCENE_TIME_PREFIX_RE = re.compile(r"^(" + "|".join(map(re.escape, _SCENE_TIME_WORDS)) + r")")
+_SCENE_TIME_SUFFIX_RE = re.compile(r"(" + "|".join(map(re.escape, _SCENE_TIME_WORDS)) + r")$")
 
 
 def _condense_for_global(text: str, segments: list[dict]) -> str:
@@ -86,12 +95,52 @@ def _normalize_bible(bible: dict) -> dict:
             elif str(it).strip():
                 items.append({"name": str(it).strip()})
         out[key] = items
+    out["scenes"] = _normalize_scenes(out.get("scenes") or [])
     out["continuity_constraints"] = [
         str(x).strip() for x in _as_list(out.get("continuity_constraints")) if str(x).strip()
     ]
     if not (out["characters"] or out["scenes"] or out["props"] or out.get("style")):
         raise llm.LLMError("全局分析结果缺少人物/场景/道具/风格等有效信息，请换模型或调整原文后重试")
     return out
+
+
+def _clean_scene_name(name: str) -> tuple[str, list[str]]:
+    raw = str(name or "").strip().lstrip("#").strip()
+    found: list[str] = []
+    for word in _SCENE_TIME_WORDS:
+        if word in raw:
+            found.append(word)
+    s = raw
+    s = _SCENE_TIME_RE.sub(" ", s)
+    s = _SCENE_TIME_PREFIX_RE.sub("", s)
+    s = _SCENE_TIME_SUFFIX_RE.sub("", s)
+    s = re.sub(r"[_\-·｜|、\s]+", "", s).strip()
+    return (s or raw), list(dict.fromkeys(found))
+
+
+def _normalize_scenes(scenes: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        item = dict(scene)
+        base_name, time_words = _clean_scene_name(item.get("name") or "")
+        item["name"] = base_name
+        desc = str(item.get("desc") or "").strip()
+        if time_words:
+            note = "可变时段/光线条件：" + "、".join(time_words)
+            if note not in desc:
+                desc = (desc + "；" + note).strip("；")
+        item["desc"] = desc
+        cur = merged.get(base_name)
+        if not cur:
+            merged[base_name] = item
+            continue
+        for key in ("desc", "note"):
+            extra = str(item.get(key) or "").strip()
+            if extra and extra not in str(cur.get(key) or ""):
+                cur[key] = (str(cur.get(key) or "").rstrip("；") + "；" + extra).strip("；")
+    return list(merged.values())
 
 
 def _clean_text(v) -> str:
@@ -108,6 +157,10 @@ def _normalize_shot(raw: dict, *, chunk_seqs: list, shot_idx: int) -> dict:
         raise llm.LLMError(f"第 {shot_idx + 1} 个分镜不是 JSON 对象")
     sh = dict(raw)
     sh["scene"] = _clean_text(sh.get("scene"))
+    if sh["scene"]:
+        prefix = "#" if sh["scene"].lstrip().startswith("#") else ""
+        scene_name, _time_words = _clean_scene_name(sh["scene"])
+        sh["scene"] = prefix + scene_name if scene_name else sh["scene"]
     sh["characters"] = _normalize_names(sh.get("characters"))
     sh["props"] = _normalize_names(sh.get("props"))
     sh["action"] = _clean_text(sh.get("action"))
@@ -176,6 +229,18 @@ def _chunk_segments(segments: list[dict], chunk_chars: int) -> list[list[dict]]:
     return chunks
 
 
+def _segment_prompt_line(seg: dict) -> str:
+    text = seg.get("text", "")
+    marker_type = seg.get("marker_type")
+    marker_no = _coerce_int(seg.get("marker_no"))
+    marker = ""
+    if marker_type == "shot" and marker_no is not None:
+        marker = f" <<<分镜标记{marker_no}>>>"
+    elif marker_type == "episode" and marker_no is not None:
+        marker = f" <<<分集标记{marker_no}>>>"
+    return f"[{seg.get('seq')}]{marker} {text}"
+
+
 def _relevant(items: list[dict], chunk_text: str, prev_handoff: str) -> list[dict]:
     """Keep only entities actually referenced in this chunk (or carried over via
     the previous handoff). Prevents dumping the whole novel-level cast/scene/prop
@@ -228,6 +293,42 @@ def _src_text_for_seqs(chunk: list[dict], seqs: list) -> str:
         s.get("text") or "" for s in chunk
         if s.get("seq") in wanted and (s.get("text") or "").strip()
     ).strip()
+
+
+def _shot_marker_index(chunk: list[dict]) -> dict[int, dict]:
+    return {
+        int(s["marker_no"]): s
+        for s in chunk
+        if s.get("marker_type") == "shot" and _coerce_int(s.get("marker_no")) is not None
+    }
+
+
+def _shot_marker_source(shot: dict, chunk: list[dict], shot_idx: int) -> tuple | None:
+    """Prefer explicit <<<分镜标记N>>> blocks over fuzzy source matching."""
+    index = _shot_marker_index(chunk)
+    if not index:
+        return None
+    wanted = _coerce_int(shot.get("marker_no") or shot.get("shot_marker"))
+    if wanted in index:
+        seg = index[wanted]
+    else:
+        seq = _coerce_int(shot.get("seq"))
+        seg = next(
+            (
+                s for s in chunk
+                if s.get("seq") == seq and s.get("marker_type") == "shot"
+            ),
+            None,
+        )
+    if seg is None:
+        shot_markers = [s for s in chunk if s.get("marker_type") == "shot"]
+        if 0 <= shot_idx < len(shot_markers):
+            seg = shot_markers[shot_idx]
+        else:
+            return None
+    seq = seg.get("seq")
+    marker_no = _coerce_int(seg.get("marker_no"))
+    return seq, [seq] if seq is not None else [], seg.get("text", "").strip(), True, marker_no
 
 
 def _contiguous_seq_range(chunk_seqs: list, start, end=None) -> list:
@@ -302,9 +403,13 @@ def _match_source_range(shot: dict, chunk: list[dict]) -> tuple:
 def _source_span_from_shot(shot: dict, chunk: list[dict], chunk_seqs: list,
                            seq_set: set, shot_idx: int, n_shots: int) -> tuple:
     """Return (start_seq, src_seq_list, src_text, is_content_match)."""
+    marker_source = _shot_marker_source(shot, chunk, shot_idx)
+    if marker_source:
+        return marker_source
+
     matched_seqs, matched_text = _match_source_range(shot, chunk)
     if matched_seqs and matched_text:
-        return matched_seqs[0], matched_seqs, matched_text, True
+        return matched_seqs[0], matched_seqs, matched_text, True, None
 
     start = _resolve_src_seq(shot.get("seq"), seq_set, chunk_seqs, shot_idx, n_shots)
     raw_end = shot.get("seq_end") or shot.get("end_seq") or shot.get("src_seq_end")
@@ -313,7 +418,7 @@ def _source_span_from_shot(shot: dict, chunk: list[dict], chunk_seqs: list,
         seqs = _contiguous_seq_range(chunk_seqs, start, end)
     else:
         seqs = [start] if start is not None else []
-    return start, seqs, _src_text_for_seqs(chunk, seqs), False
+    return start, seqs, _src_text_for_seqs(chunk, seqs), False, None
 
 
 def _fill_missing_source_ranges(shots_in_chunk: list[dict], chunk: list[dict],
@@ -340,6 +445,135 @@ def _fill_missing_source_ranges(shots_in_chunk: list[dict], chunk: list[dict],
         if len(expanded) > len(cur):
             sh["src_seq"] = expanded
             sh["src_text"] = _src_text_for_seqs(chunk, expanded)
+
+
+def _as_duration(v, fallback: int) -> int:
+    try:
+        return int(round(float(v)))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _strip_trigger(name: str) -> str:
+    return str(name or "").strip().lstrip("@#$").strip()
+
+
+def _same_scene(a: dict, b: dict) -> bool:
+    sa = _strip_trigger(a.get("scene"))
+    sb = _strip_trigger(b.get("scene"))
+    return bool(sa and sb and sa == sb)
+
+
+def _merge_names(a, b) -> list[str]:
+    out: list[str] = []
+    for item in _as_list(a) + _as_list(b):
+        text = str(item or "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _merge_seq_values(a, b) -> list:
+    out: list = []
+    for item in _as_list(a) + _as_list(b):
+        if item is not None and item not in out:
+            out.append(item)
+    return out
+
+
+def _seqs_are_adjacent(a: dict, b: dict) -> bool:
+    left = [x for x in _as_list(a.get("src_seq")) if x is not None]
+    right = [x for x in _as_list(b.get("src_seq")) if x is not None]
+    if not left or not right:
+        return True
+    try:
+        return int(right[0]) <= int(left[-1]) + 1
+    except (TypeError, ValueError):
+        return True
+
+
+def _is_hard_cut_boundary(a: dict, b: dict) -> bool:
+    text = "\n".join([
+        str(a.get("camera") or ""),
+        str(a.get("handoff") or ""),
+        str(b.get("camera") or ""),
+        str(b.get("action") or ""),
+    ])
+    hard_words = (
+        "转场", "闪回", "梦境", "时间跳跃", "多年后", "与此同时", "另一边",
+        "切至", "切到", "场景转换", "时空", "强切", "黑场",
+    )
+    if any(w in text for w in hard_words):
+        return True
+    ma = a.get("src_marker")
+    mb = b.get("src_marker")
+    return bool(ma and mb and ma != mb)
+
+
+def _merge_shots_for_pacing(shots_in_chunk: list[dict], shot_target: int) -> list[dict]:
+    """Merge obviously tiny neighboring shots so each shot can fill target time.
+
+    LLMs often over-segment dialogue beats or micro-actions. For a 15s target,
+    a 5-7s shot usually does not contain enough dramatic material for a full
+    generated clip. This pass only merges safe neighbors: same scene, adjacent
+    source text, no explicit hard cut / marker boundary.
+    """
+    if len(shots_in_chunk) < 2:
+        return shots_in_chunk
+    min_useful = max(pacing.MIN_SEC + 1, int(round(shot_target * 0.65)))
+    desired = max(pacing.MIN_SEC, min(pacing.MAX_SEC, int(shot_target)))
+    out: list[dict] = []
+    i = 0
+    while i < len(shots_in_chunk):
+        cur = dict(shots_in_chunk[i])
+        while i + 1 < len(shots_in_chunk):
+            nxt = shots_in_chunk[i + 1]
+            cur_dur = _as_duration(cur.get("duration"), desired)
+            nxt_dur = _as_duration(nxt.get("duration"), desired)
+            if cur_dur >= min_useful:
+                break
+            if cur_dur + nxt_dur > pacing.MAX_SEC:
+                break
+            if not _same_scene(cur, nxt):
+                break
+            if not _seqs_are_adjacent(cur, nxt):
+                break
+            if _is_hard_cut_boundary(cur, nxt):
+                break
+            cur["characters"] = _merge_names(cur.get("characters"), nxt.get("characters"))
+            cur["props"] = _merge_names(cur.get("props"), nxt.get("props"))
+            cur["action"] = "；".join(x for x in [cur.get("action"), nxt.get("action")] if x)
+            cur["dialogue"] = "；".join(x for x in [cur.get("dialogue"), nxt.get("dialogue")] if x)
+            cur["emotion"] = cur.get("emotion") or nxt.get("emotion")
+            cur["key_elements"] = "；".join(x for x in [cur.get("key_elements"), nxt.get("key_elements")] if x)
+            cur["handoff"] = nxt.get("handoff") or cur.get("handoff")
+            cur["duration"] = min(pacing.MAX_SEC, max(desired, cur_dur + nxt_dur))
+            cur["src_seq"] = _merge_seq_values(cur.get("src_seq"), nxt.get("src_seq"))
+            cur["src_text"] = "\n".join(x for x in [cur.get("src_text"), nxt.get("src_text")] if x)
+            if nxt.get("seq_end") is not None:
+                cur["seq_end"] = nxt.get("seq_end")
+            i += 1
+        out.append(cur)
+        i += 1
+    if len(out) != len(shots_in_chunk):
+        logger.info(
+            "[Analysis] Stage2 pacing merge: %d -> %d shots (target=%ss)",
+            len(shots_in_chunk), len(out), shot_target,
+        )
+    return out
+
+
+def _normalize_duration_for_target(shot: dict, shot_target: int) -> None:
+    target = max(pacing.MIN_SEC, min(pacing.MAX_SEC, int(shot_target or pacing.MAX_SEC)))
+    current = _as_duration(shot.get("duration"), target)
+    if current < int(round(target * 0.75)):
+        estimated = pacing.estimate_shot_seconds(
+            shot.get("dialogue", ""), shot.get("action", ""),
+            shot.get("emotion") or shot.get("mood") or "",
+            target_seconds=target)
+        shot["duration"] = max(current, estimated, int(round(target * 0.75)))
+    else:
+        shot["duration"] = max(pacing.MIN_SEC, min(pacing.MAX_SEC, current))
 
 
 def _bible_summary(bible: dict, chunk_text: str = "", prev_handoff: str = "") -> str:
@@ -413,7 +647,7 @@ def run_decompose(
 
     for ci in range(start_chunk, total):
         chunk = chunks[ci]
-        chunk_text = "\n".join(f"[{s.get('seq')}] {s.get('text','')}" for s in chunk)
+        chunk_text = "\n".join(_segment_prompt_line(s) for s in chunk)
         prompt = tpl.render(body, {
             "story_bible": _bible_summary(bible, chunk_text, prev_handoff),
             "prev_handoff": prev_handoff,
@@ -436,19 +670,18 @@ def run_decompose(
         chunk_seqs = [s.get("seq") for s in chunk if s.get("seq") is not None]
         seq_set = set(chunk_seqs)
         n_shots = len(chunk_shots)
-        block_shot_nos = []
         chunk_out: list[dict] = []
         for si, raw_sh in enumerate(chunk_shots):
             sh = _normalize_shot(raw_sh, chunk_seqs=chunk_seqs, shot_idx=si)
-            counter += 1
-            sh["shot_no"] = f"S{episode_no:02d}-C{counter:03d}"
             # 原文映射：保存完整 src_seq/src_text。一个分镜可能由多个连续源段合并，
             # 不能只显示起始 seq 的单段原文，否则工作台「原文」会看起来被截断。
-            start_seq, src_seq, src_text, src_matched = _source_span_from_shot(
+            start_seq, src_seq, src_text, src_matched, src_marker_no = _source_span_from_shot(
                 sh, chunk, chunk_seqs, seq_set, si, n_shots)
             sh["seq"] = start_seq
             sh["src_seq"] = src_seq
             sh["src_text"] = src_text
+            if src_marker_no is not None:
+                sh["src_marker"] = f"分镜标记{src_marker_no}"
             sh["_src_content_match"] = src_matched
             # 按台词体量 + 情绪估算单镜时长（正常 5 字/秒，急/怒更快、悲/沉更慢），
             # 钳制到 [3,15] 秒（视频模型单条上限 15s）。LLM 已给时则尊重其值。
@@ -458,9 +691,15 @@ def run_decompose(
                     sh.get("emotion") or sh.get("mood") or "",
                     target_seconds=shot_target)
             chunk_out.append(sh)
-            block_shot_nos.append(sh["shot_no"])
             prev_handoff = sh.get("handoff") or prev_handoff
         _fill_missing_source_ranges(chunk_out, chunk, chunk_seqs)
+        chunk_out = _merge_shots_for_pacing(chunk_out, shot_target)
+        block_shot_nos = []
+        for sh in chunk_out:
+            _normalize_duration_for_target(sh, shot_target)
+            counter += 1
+            sh["shot_no"] = f"S{episode_no:02d}-C{counter:03d}"
+            block_shot_nos.append(sh["shot_no"])
         shots.extend(chunk_out)
         blocks.append({"index": ci, "chunk_seq": [s.get("seq") for s in chunk], "shot_nos": block_shot_nos})
         if on_progress:
@@ -523,6 +762,7 @@ def run_decompose_manual(
                 sh.get("dialogue", ""), sh.get("action", ""),
                 sh.get("emotion") or sh.get("mood") or "",
                 target_seconds=shot_target)
+        _normalize_duration_for_target(sh, shot_target)
         shots.append(sh)
         block_shot_nos.append(sh["shot_no"])
         prev_handoff = sh.get("handoff") or prev_handoff

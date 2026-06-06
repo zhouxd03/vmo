@@ -19,16 +19,32 @@ const CATEGORIES = [
 ]
 
 const videoProviderOptions = [
+  { label: 'Vidu (fixed web API, Cookie)', value: 'vidu' },
   { label: 'OpenAI 兼容 (/v1/videos)', value: '' },
   { label: 'Seedance · doubao-seedance (multipart + token)', value: 'seedance' },
+  { label: 'Seedance 网页端 (/user/Data + DataIndex)', value: 'seedance_web' },
 ]
+const imageProviderOptions = [
+  { label: 'OpenAI compatible (/v1/images)', value: '' },
+  { label: 'Vidu (fixed web API, Cookie)', value: 'vidu' },
+]
+
 const SEEDANCE_MODELS = [
-  'doubao-seedance-2-0-fast-260128',
   'doubao-seedance-2-0-260128',
+  'doubao-seedance-2-0-fast-260128',
   'doubao-seedance-2-0-260128-1',
   'doubao-seedance-2-0-260128-2',
   'doubao-seedance-2-0-260128-3',
 ].map((v) => ({ label: v, value: v }))
+const VIDU_IMAGE_MODELS = [
+  { label: '全能 Image', value: 'auto:3.2_image_2' },
+  { label: '全能 Image - 文生图', value: 'text2image:3.2_image_2' },
+  { label: '全能 Image - 参考生图', value: 'reference2image:3.2_image_2' },
+]
+const VIDU_VIDEO_MODELS = [
+  { label: 'VIDU Q3', value: '3.2' },
+  { label: 'Vidu 3.1', value: '3.1' },
+]
 
 const data = ref({ image: [], video: [], llm: [], image_host: [] })
 const loading = ref(false)
@@ -38,6 +54,8 @@ const editing = ref(null) // { category, entry }
 const form = ref({})
 const saving = ref(false)
 const testing = ref(false)
+const userInfoLoading = ref(false)
+const userInfo = ref(null)
 const modelLoading = ref(false)
 const modelOptions = ref([])
 
@@ -57,6 +75,7 @@ function openAdd(category) {
   editing.value = { category, isNew: true }
   form.value = { alias: '', base_url: '', api_key: '', model: '', provider: '', enabled: true, is_default: false, note: '' }
   modelOptions.value = []
+  userInfo.value = null
   showModal.value = true
 }
 
@@ -74,12 +93,27 @@ function openEdit(category, entry) {
     note: entry.note,
   }
   modelOptions.value = entry.model ? [{ label: entry.model, value: entry.model }] : []
+  userInfo.value = null
   showModal.value = true
 }
 
 const currentCat = computed(() => CATEGORIES.find((c) => c.key === editing.value?.category) || {})
+const isSeedanceProvider = computed(() =>
+  form.value.provider === 'seedance' || form.value.provider === 'seedance_web')
+const isViduProvider = computed(() => form.value.provider === 'vidu')
+const needsBaseUrl = computed(() =>
+  editing.value?.category !== 'image_host' && !isViduProvider.value)
 const effectiveModelOptions = computed(() =>
-  form.value.provider === 'seedance' ? SEEDANCE_MODELS : modelOptions.value)
+  isViduProvider.value
+    ? (editing.value?.category === 'image' ? VIDU_IMAGE_MODELS : VIDU_VIDEO_MODELS)
+    : isSeedanceProvider.value ? SEEDANCE_MODELS : modelOptions.value)
+
+function normalizeModels(models) {
+  return (models || []).map((m) => {
+    if (typeof m === 'string') return { label: m, value: m }
+    return { label: m.label || m.value || String(m), value: m.value || m.label || String(m) }
+  })
+}
 
 async function fetchModels() {
   modelLoading.value = true
@@ -90,7 +124,7 @@ async function fetchModels() {
       api_key: form.value.api_key,
       provider: form.value.provider,
     })
-    modelOptions.value = (resp.models || []).map((m) => ({ label: m, value: m }))
+    modelOptions.value = normalizeModels(resp.models)
     message.success(`${resp.builtin ? '已载入内置候选' : '拉取到'} ${modelOptions.value.length} 个模型`)
   } catch (e) {
     message.error('获取模型失败: ' + e.message)
@@ -112,7 +146,7 @@ async function testConn() {
       if (resp.info) extra = `，余额 满血:${resp.info.Token ?? '-'} / 快速:${resp.info.FastToken ?? '-'} / 国际版:${resp.info.SdDuration ?? '-'}s`
       else if (resp.models?.length) extra = `，发现 ${resp.models.length} 个模型`
       message.success('连接成功' + extra)
-      if (resp.models?.length) modelOptions.value = resp.models.map((m) => ({ label: m, value: m }))
+      if (resp.models?.length) modelOptions.value = normalizeModels(resp.models)
     } else {
       message.error('连接失败: ' + (resp.error || '未知错误'))
     }
@@ -123,8 +157,30 @@ async function testConn() {
   }
 }
 
+async function queryUserInfo() {
+  userInfoLoading.value = true
+  try {
+    const resp = await api.credentialUserInfo(editing.value.category, {
+      id: form.value.id,
+      base_url: form.value.base_url,
+      api_key: form.value.api_key,
+      provider: form.value.provider,
+    })
+    if (resp.ok) {
+      userInfo.value = resp.info || {}
+      message.success('用户首页信息已更新')
+    } else {
+      message.error('查询失败: ' + (resp.error || '未知错误'))
+    }
+  } catch (e) {
+    message.error('查询失败: ' + e.message)
+  } finally {
+    userInfoLoading.value = false
+  }
+}
+
 async function save() {
-  if (!form.value.base_url && editing.value.category !== 'image_host') {
+  if (!form.value.base_url && needsBaseUrl.value) {
     message.warning('请填写 API 地址')
     return
   }
@@ -227,8 +283,14 @@ async function makeDefault(category, id) {
         <n-form-item v-if="editing?.category === 'video'" label="接口类型 (provider)">
           <n-select v-model:value="form.provider" :options="videoProviderOptions" />
         </n-form-item>
-        <n-form-item v-if="editing?.category !== 'image_host'" label="API 地址 (base_url)">
-          <n-input v-model:value="form.base_url" :placeholder="form.provider === 'seedance' ? 'http://119.45.252.34:8618' : 'https://your-relay.example.com/v1'" />
+        <n-form-item v-if="editing?.category === 'image'" label="Provider">
+          <n-select v-model:value="form.provider" :options="imageProviderOptions" />
+        </n-form-item>
+        <n-form-item v-if="isViduProvider" label="Vidu fixed base_url">
+          <div class="fixed-provider-url">https://service.vidu.cn/vidu/v1</div>
+        </n-form-item>
+        <n-form-item v-else-if="editing?.category !== 'image_host'" label="API 地址 (base_url)">
+          <n-input v-model:value="form.base_url" :placeholder="isSeedanceProvider ? 'http://119.45.252.34:8618 或 http://119.45.158.223:8618' : 'https://your-relay.example.com/v1'" />
         </n-form-item>
         <n-form-item label="API Key">
           <n-input v-model:value="form.api_key" type="password" show-password-on="click" placeholder="留空则保留原值（编辑时）" />
@@ -244,9 +306,29 @@ async function makeDefault(category, id) {
             />
             <n-button size="small" :loading="modelLoading" @click="fetchModels">
               <template #icon><n-icon :component="FlashOutline" /></template>
-              {{ form.provider === 'seedance' ? '载入 Seedance 模型' : '获取模型列表' }}
+              {{ isViduProvider ? 'Load Vidu models' : isSeedanceProvider ? '载入 Seedance 模型' : '获取模型列表' }}
             </n-button>
           </n-space>
+        </n-form-item>
+        <n-form-item v-if="editing?.category === 'video' && isSeedanceProvider" label="用户首页信息">
+          <div class="seedance-info">
+            <div class="seedance-info-head">
+              <span>飞书 Seedance 用户首页接口（UserIndex）</span>
+              <n-button size="tiny" :loading="userInfoLoading" @click="queryUserInfo">
+                <template #icon><n-icon :component="FlashOutline" /></template>
+                查询
+              </n-button>
+            </div>
+            <div v-if="userInfo" class="seedance-info-grid">
+              <div><span>用户 ID</span><b>{{ userInfo.Id ?? '-' }}</b></div>
+              <div><span>普通 Token</span><b>{{ userInfo.Token ?? '-' }}</b></div>
+              <div><span>快速 Token</span><b>{{ userInfo.FastToken ?? '-' }}</b></div>
+              <div><span>国际版时长</span><b>{{ userInfo.SdDuration ?? '-' }}s</b></div>
+              <div><span>创建时间</span><b>{{ userInfo.CreatedAt || '-' }}</b></div>
+              <div><span>更新时间</span><b>{{ userInfo.UpdatedAt || '-' }}</b></div>
+            </div>
+            <div v-else class="seedance-info-empty">查询后会在这里显示账号额度与首页信息。</div>
+          </div>
         </n-form-item>
         <n-space>
           <n-form-item label="启用">
@@ -262,11 +344,19 @@ async function makeDefault(category, id) {
       </n-form>
       <template #footer>
         <n-space justify="space-between">
-          <n-button v-if="editing?.category !== 'image_host'" :loading="testing" @click="testConn">
-            <template #icon><n-icon :component="FlashOutline" /></template>
-            连通性测试
-          </n-button>
-          <span v-else />
+          <n-space>
+            <n-button v-if="editing?.category !== 'image_host'" :loading="testing" @click="testConn">
+              <template #icon><n-icon :component="FlashOutline" /></template>
+              连通性测试
+            </n-button>
+            <n-button
+              v-if="editing?.category === 'video' && isSeedanceProvider"
+              :loading="userInfoLoading"
+              @click="queryUserInfo"
+            >
+              用户首页查询
+            </n-button>
+          </n-space>
           <n-space>
             <n-button @click="showModal = false">取消</n-button>
             <n-button type="primary" :loading="saving" @click="save">保存</n-button>
@@ -339,5 +429,58 @@ async function makeDefault(category, id) {
 }
 .entry-model {
   color: var(--app-accent-alt);
+}
+.fixed-provider-url {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+  color: var(--app-text-muted);
+  background: var(--app-bg-soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+}
+.seedance-info {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: var(--app-bg-soft);
+}
+.seedance-info-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--app-text-muted);
+  margin-bottom: 10px;
+}
+.seedance-info-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.seedance-info-grid div {
+  min-width: 0;
+  padding: 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--app-surface) 78%, transparent);
+}
+.seedance-info-grid span {
+  display: block;
+  color: var(--app-text-muted);
+  font-size: 11px;
+}
+.seedance-info-grid b {
+  display: block;
+  margin-top: 3px;
+  font-size: 12px;
+  font-weight: 650;
+  word-break: break-all;
+}
+.seedance-info-empty {
+  color: var(--app-text-muted);
+  font-size: 12px;
 }
 </style>

@@ -1,6 +1,11 @@
 <script setup>
+import { computed } from 'vue'
 import { RemoveOutline, SquareOutline, CloseOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
+import { useHealthStore } from '../stores/health'
+
+const healthStore = useHealthStore()
+const healthTitle = computed(() => `${healthStore.label}${healthStore.detail ? `：${healthStore.detail}` : ''}`)
 
 function call(method) {
   const api = window.pywebview && window.pywebview.api
@@ -26,6 +31,10 @@ function onDragStart(e) {
       <span class="brand-sub">Batch Anime Studio</span>
     </div>
     <div class="spacer" />
+    <button class="health-pill" :class="healthStore.status" :title="healthTitle" @mousedown.stop @click="healthStore.check()">
+      <span />
+      {{ healthStore.status === 'online' ? '已连接' : (healthStore.checking ? '检查中' : '连接异常') }}
+    </button>
     <div class="win-controls" @mousedown.stop @dblclick.stop>
       <button class="win-btn" title="最小化" @click="call('minimize')">
         <n-icon :component="RemoveOutline" />
@@ -74,6 +83,39 @@ function onDragStart(e) {
 }
 .spacer {
   flex: 1;
+}
+.health-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 9px;
+  margin-right: 8px;
+  border: 1px solid var(--app-border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--app-surface-2) 78%, transparent);
+  color: var(--app-text-muted);
+  cursor: pointer;
+  font-size: 11px;
+}
+.health-pill span {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #ffc24b;
+  box-shadow: 0 0 8px color-mix(in srgb, #ffc24b 70%, transparent);
+}
+.health-pill.online span {
+  background: var(--app-accent);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--app-accent) 70%, transparent);
+}
+.health-pill.offline {
+  color: #ffd8d8;
+  border-color: color-mix(in srgb, #ff5d6c 42%, var(--app-border));
+}
+.health-pill.offline span {
+  background: #ff5d6c;
+  box-shadow: 0 0 8px color-mix(in srgb, #ff5d6c 70%, transparent);
 }
 .win-controls {
   display: flex;

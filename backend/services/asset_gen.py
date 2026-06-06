@@ -38,9 +38,11 @@ def _asset_variables(project: dict, asset: dict) -> dict:
     bible = project.get("story_bible") or {}
     style = bible.get("style") or "中国现代，3D动漫风格"
     return {
+        "name": asset.get("name") or "",
         "style": style,
         "appearance": asset.get("appearance") or asset.get("desc") or asset["name"],
         "desc": asset.get("desc") or asset.get("appearance") or asset["name"],
+        "voice": asset.get("voice") or "",
     }
 
 
@@ -49,14 +51,8 @@ def build_prompt(project: dict, asset: dict) -> str:
     return tpl.render(tpl.get_template_body(key), _asset_variables(project, asset))
 
 
-def build_aerial_prompt(project: dict, asset: dict) -> str:
-    """场景鸟瞰图提示词（仅 scene 资产）。"""
-    return tpl.render(tpl.get_template_body("scene_aerial"),
-                      _asset_variables(project, asset))
-
-
 def generate_ref_image(pid: str, asset_id: str, *, model: Optional[str] = None,
-                       size: str = "1024x1024", with_aerial: bool = False) -> dict:
+                       size: str = "1024x1024") -> dict:
     project = projects.get_project(pid)
     if not project:
         raise image_gen.GenerationError("项目不存在")
@@ -65,6 +61,11 @@ def generate_ref_image(pid: str, asset_id: str, *, model: Optional[str] = None,
         raise image_gen.GenerationError("资产不存在")
 
     prompt = build_prompt(project, asset)
+    logger.info(
+        "[Assets] generate ref image %s%s type=%s model=%s size=%s",
+        asset.get("trigger", ""), asset.get("name", ""), asset.get("type"),
+        model or "default", size,
+    )
     result = image_gen.generate_image(
         prompt,
         model=model,
@@ -74,21 +75,6 @@ def generate_ref_image(pid: str, asset_id: str, *, model: Optional[str] = None,
     )
     patch = {"ref_image": result["filename"]}
     out = {"asset_id": asset_id, "filename": result["filename"], "prompt": prompt}
-
-    # 场景资产额外生成一张「鸟瞰图」用于固定空间位置（best-effort，不影响主图落库）。
-    if with_aerial and asset.get("type") == "scene":
-        try:
-            aerial = image_gen.generate_image(
-                build_aerial_prompt(project, asset),
-                model=model,
-                size=size,
-                save_dir=_asset_dir(pid),
-                filename_prefix=f"scene_{asset_id}_aerial",
-            )
-            patch["aerial_image"] = aerial["filename"]
-            out["aerial_image"] = aerial["filename"]
-        except Exception as e:  # noqa: BLE001 — 主图已成功，鸟瞰图失败不阻断
-            logger.warning("[Assets] 场景鸟瞰图生成失败 %s: %s", asset.get("name"), e)
 
     assets_core.update_asset(pid, asset_id, patch)
     return out
@@ -122,6 +108,45 @@ def import_ref_image(pid: str, asset_id: str, src_path: str,
     shutil.copyfile(src, dest)
     assets_core.update_asset(pid, asset_id, {"ref_image": fname, "ref_source": "import"})
     return {"asset_id": asset_id, "filename": fname}
+
+
+def import_ref_image_from_asset(pid: str, asset_id: str, source_pid: str,
+                                source_asset_id: str) -> dict:
+    """Copy a reference image from another project's asset into this asset.
+
+    The image is copied, not linked, so the current project remains self-contained
+    even if the source project is renamed or deleted later.
+    """
+    target_project = projects.get_project(pid)
+    source_project = projects.get_project(source_pid)
+    if not target_project or not source_project:
+        raise image_gen.GenerationError("项目不存在")
+    target = next((a for a in target_project.get("assets", []) if a["id"] == asset_id), None)
+    source = next((a for a in source_project.get("assets", []) if a["id"] == source_asset_id), None)
+    if not target:
+        raise image_gen.GenerationError("目标资产不存在")
+    if not source:
+        raise image_gen.GenerationError("素材库资产不存在")
+    ref = source.get("ref_image")
+    if not ref:
+        raise image_gen.GenerationError("素材库资产没有参考图")
+    src = _asset_dir(source_pid) / ref
+    if not src.is_file():
+        raise image_gen.GenerationError("素材库参考图文件不存在")
+    ext = src.suffix.lower() or ".png"
+    fname = f"{target['type']}_{asset_id}_library_{uuid.uuid4().hex[:6]}{ext}"
+    dest = _asset_dir(pid) / fname
+    shutil.copyfile(src, dest)
+    assets_core.update_asset(pid, asset_id, {
+        "ref_image": fname,
+        "ref_source": "library",
+    })
+    return {
+        "asset_id": asset_id,
+        "filename": fname,
+        "source_project_id": source_pid,
+        "source_asset_id": source_asset_id,
+    }
 
 
 def _concurrency(override: Optional[int] = None) -> int:

@@ -12,16 +12,16 @@ const SCHEMA = [
   {
     group: '生图默认参数',
     fields: [
-      { key: 'image_size', label: '默认尺寸', type: 'select', options: ['1024x1024', '1536x1024', '1024x1536', '2048x2048'] },
+      { key: 'image_size', label: '默认尺寸', type: 'select', options: ['1024x1024', '1536x1024', '1024x1536', '2048x2048', '16:9@1080p', '16:9@2K', '16:9@4K', '9:16@1080p', '9:16@2K', '9:16@4K', '1:1@1080p', '1:1@2K', '1:1@4K', '4:3@1080p', '4:3@2K', '4:3@4K', '3:4@1080p', '3:4@2K', '3:4@4K'] },
       { key: 'image_quality', label: '质量', type: 'select', options: ['auto', 'low', 'medium', 'high'] },
-      { key: 'image_timeout', label: '超时(秒)', type: 'number', min: 30, max: 600 },
+      { key: 'image_timeout', label: '超时(秒)', type: 'number', min: 30, max: 1800 },
     ],
   },
   {
     group: '生视频默认参数',
     fields: [
-      { key: 'video_aspect_ratio', label: '画幅', type: 'select', options: ['16:9', '9:16', '1:1', '4:3'] },
-      { key: 'video_resolution', label: '分辨率', type: 'select', options: ['480p', '720p', '1080p'] },
+      { key: 'video_aspect_ratio', label: '画幅', type: 'select', options: ['16:9', '9:16', '1:1', '4:3', '3:4'] },
+      { key: 'video_resolution', label: '分辨率', type: 'select', options: ['480p', '720p', '1080p', '2K', '4K'] },
       { key: 'video_duration', label: '时长(秒)', type: 'number', min: 1, max: 60 },
       { key: 'video_timeout', label: '超时(秒)', type: 'number', min: 60, max: 1800 },
     ],

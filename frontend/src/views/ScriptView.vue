@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import {
   NSelect, NButton, NIcon, NCard, NTag, NEmpty, NSpace, NProgress, NSpin,
   NCollapse, NCollapseItem, NDataTable, NAlert, NInput, NRadioGroup, NRadioButton,
-  NTooltip, useMessage,
+  NTooltip, NPopconfirm, useMessage,
 } from 'naive-ui'
 import {
   SparklesOutline, GitBranchOutline, PersonOutline, LocationOutline, CubeOutline,
@@ -24,7 +24,9 @@ const tasks = useTasksStore()
 // stay live across tab switches (§8.2). These are derived views of store state.
 const analyzing = computed(() => tasks.isAnalyzing(store.currentId, store.currentEpisodeId))
 const decomposing = computed(() => tasks.isDecomposing(store.currentId, store.currentEpisodeId))
+const stageBusy = computed(() => analyzing.value || decomposing.value)
 const progressPct = computed(() => tasks.decomposePercent)
+const analyzeIntent = ref('initial')
 
 // ── 阶段二：分镜模式（自动/手动）+ 分镜模式预设（按剧本类型，可在「提示词模板」新增）──
 const decomposeMode = ref('auto')        // 'auto' | 'manual'
@@ -79,12 +81,16 @@ onMounted(async () => {
 watch(() => tasks.decomposeStatus, (s, prev) => {
   if (prev !== 'running' || tasks.decomposeProjectId !== store.currentId) return
   if (s === 'done') message.success(`分批拆解完成，共 ${shots.value.length} 个分镜`)
-  else if (s === 'error') message.error('拆解失败: ' + tasks.decomposeError)
+  else if (s === 'error') message.error(formatStageError(tasks.decomposeError, '分镜拆解'))
 })
 watch(() => tasks.analyzeStatus, (s, prev) => {
   if (prev !== 'running' || tasks.analyzeProjectId !== store.currentId) return
-  if (s === 'done') message.success('全局分析完成，已并入小说级故事圣经（全集共享）')
-  else if (s === 'error') message.error('全局分析失败: ' + tasks.analyzeError)
+  if (s === 'done') {
+    if (analyzeIntent.value === 'replace') message.success('全局分析完成，已覆盖本集分析并清空旧分镜，请重新拆解')
+    else if (analyzeIntent.value === 'append') message.success('本集分析完成，已接入长线故事圣经')
+    else message.success('全局分析完成，已建立故事圣经')
+  }
+  else if (s === 'error') message.error(formatStageError(tasks.analyzeError, '全局分析'))
 })
 
 const projectOptions = computed(() =>
@@ -96,6 +102,62 @@ async function onSelect(pid) {
 
 const bible = computed(() => store.current?.story_bible)
 const shots = computed(() => store.currentEpisode?.shots || [])
+const currentEpisode = computed(() => store.currentEpisode)
+const episodeStage = computed(() => currentEpisode.value?.stage || 'imported')
+const episodeAnalyzed = computed(() =>
+  ['analyzed', 'decomposed'].includes(episodeStage.value)
+  || !!currentEpisode.value?.story_bible
+  || shots.value.length > 0)
+const hasSharedBible = computed(() => !!bible.value)
+const analyzeButtonText = computed(() => {
+  if (episodeAnalyzed.value) return '重新分析本集'
+  return hasSharedBible.value ? '分析本集并接入长线圣经' : '开始全局分析'
+})
+const analyzeDesc = computed(() => {
+  if (episodeAnalyzed.value) return '覆盖本集分析结果，并清空本集旧分镜与连续性缓存。'
+  if (hasSharedBible.value) return '作为续集首次分析：提取本集新增角色/场景/道具，并并入全集共享故事圣经。'
+  return '首集/首轮分析：建立全集共享故事圣经，作为后续分集和资产库的基础。'
+})
+const canDecompose = computed(() => !!hasSharedBible.value && !!episodeAnalyzed.value && !stageBusy.value)
+const decomposeDisabledReason = computed(() => {
+  if (analyzing.value) return '全局分析进行中，完成后再拆解。'
+  if (!hasSharedBible.value) return '请先完成全局分析，建立故事圣经。'
+  if (!episodeAnalyzed.value) return '当前分集尚未分析。续集需要先分析本集，再拆解。'
+  return ''
+})
+function formatStageError(raw, stage) {
+  const text = String(raw || '').trim()
+  if (!text) return ''
+  if (/请先分析当前分集|尚未分析|先分析/.test(text)) {
+    return '当前分集还没有接入故事圣经。请先执行「分析本集」，完成后再拆解分镜。'
+  }
+  if (/请先完成全局分析|story_bible|StoryBible|Stage 1/i.test(text)) {
+    return '项目还没有故事圣经。请先完成阶段一全局分析。'
+  }
+  if (/manual|手动|分镜片段|segment/i.test(text)) {
+    return '手动分镜内容为空或格式不正确。请用空行分隔每个分镜片段。'
+  }
+  if (/Failed to fetch|NetworkError|Load failed|timeout|超时/i.test(text)) {
+    return '请求没有成功到达后端或等待超时。请确认后端服务仍在运行，再重试。'
+  }
+  return `${stage}失败：${text}`
+}
+const analyzeErrorDetail = computed(() =>
+  tasks.analyzeStatus === 'error' && tasks.analyzeProjectId === store.currentId
+    ? formatStageError(tasks.analyzeError, '全局分析')
+    : '')
+const decomposeErrorDetail = computed(() =>
+  tasks.decomposeStatus === 'error' && tasks.decomposeProjectId === store.currentId
+    ? formatStageError(tasks.decomposeError, '分镜拆解')
+    : '')
+const stageErrorDetail = computed(() => analyzeErrorDetail.value || decomposeErrorDetail.value)
+
+function clearStageError() {
+  if (tasks.analyzeStatus === 'error') tasks.analyzeStatus = 'idle'
+  if (tasks.decomposeStatus === 'error') tasks.decomposeStatus = 'idle'
+  tasks.analyzeError = ''
+  tasks.decomposeError = ''
+}
 
 const characterQuery = ref('')
 const showAllCharacters = ref(false)
@@ -140,11 +202,22 @@ async function saveStyle() {
 
 async function runAnalyze() {
   if (!store.current) return
+  if (analyzing.value) return
+  if (decomposing.value) {
+    message.warning('分批拆解进行中，完成后再重新分析')
+    return
+  }
+  analyzeIntent.value = episodeAnalyzed.value ? 'replace' : (hasSharedBible.value ? 'append' : 'initial')
   await tasks.runAnalyze(store.current.id, store.currentEpisodeId)
 }
 
 async function runDecompose() {
   if (!store.current) return
+  if (decomposing.value) return
+  if (!canDecompose.value) {
+    message.warning(decomposeDisabledReason.value || '当前状态不能拆解')
+    return
+  }
   if (decomposeMode.value === 'manual') {
     if (!manualSegments.value.length) {
       message.warning('请先在下方文本框用「空行」分隔出至少一个分镜片段')
@@ -200,12 +273,37 @@ const shotColumns = [
           <div class="stage-head">
             <div>
               <div class="stage-title">阶段一 · 全局分析</div>
-              <div class="stage-desc">通读全篇 → 故事圣经（角色/场景/道具/风格/连续性约束）</div>
+              <div class="stage-desc">{{ analyzeDesc }}</div>
             </div>
-            <n-button type="primary" :loading="analyzing" @click="runAnalyze">
+            <n-popconfirm
+              v-if="episodeAnalyzed"
+              positive-text="覆盖分析"
+              negative-text="取消"
+              @positive-click="runAnalyze"
+            >
+              <template #trigger>
+                <n-button type="primary" :loading="analyzing" :disabled="stageBusy">
+                  <template #icon><n-icon :component="SparklesOutline" /></template>
+                  {{ analyzeButtonText }}
+                </n-button>
+              </template>
+              会覆盖当前集分析结果，并清空本集旧分镜与连续性缓存；其他分集不受影响。
+            </n-popconfirm>
+            <n-button v-else type="primary" :loading="analyzing" :disabled="stageBusy" @click="runAnalyze">
               <template #icon><n-icon :component="SparklesOutline" /></template>
-              {{ bible ? '重新分析' : '开始全局分析' }}
+              {{ analyzeButtonText }}
             </n-button>
+          </div>
+          <div class="stage-note" :class="{ warn: episodeAnalyzed }">
+            <template v-if="episodeAnalyzed">
+              当前集已分析：再次执行会替换本集对故事圣经的贡献，并要求重新拆解本集分镜。
+            </template>
+            <template v-else-if="hasSharedBible">
+              续集首次分析：不会清空其他集分镜，只会把本集新增信息接入长线故事圣经。
+            </template>
+            <template v-else>
+              尚未建立故事圣经：请先完成本阶段，再进入分批拆解。
+            </template>
           </div>
         </n-card>
 
@@ -215,11 +313,32 @@ const shotColumns = [
               <div class="stage-title">阶段二 · 分批拆解</div>
               <div class="stage-desc">自动＝强制 LLM 按分镜模式拆解；手动＝人工切段、LLM 逐段填结构</div>
             </div>
-            <n-button type="primary" :disabled="!bible" :loading="decomposing" @click="runDecompose">
+            <n-popconfirm
+              v-if="shots.length"
+              positive-text="覆盖拆解"
+              negative-text="取消"
+              @positive-click="runDecompose"
+            >
+              <template #trigger>
+                <n-button type="primary" :disabled="!canDecompose || stageBusy" :loading="decomposing">
+                  <template #icon><n-icon :component="GitBranchOutline" /></template>
+                  {{ decomposeMode === 'manual' ? '按手动分镜结构化' : '重新拆解' }}
+                </n-button>
+              </template>
+              会覆盖当前集分镜结构，并清空本集连续性决策、站位图、导演图与尾帧缓存。
+            </n-popconfirm>
+            <n-button
+              v-else
+              type="primary"
+              :disabled="!canDecompose || stageBusy"
+              :loading="decomposing"
+              @click="runDecompose"
+            >
               <template #icon><n-icon :component="GitBranchOutline" /></template>
-              {{ decomposeMode === 'manual' ? '按手动分镜结构化' : (shots.length ? '重新拆解' : '开始拆解') }}
+              {{ decomposeMode === 'manual' ? '按手动分镜结构化' : '开始拆解' }}
             </n-button>
           </div>
+          <div v-if="decomposeDisabledReason" class="stage-note warn">{{ decomposeDisabledReason }}</div>
 
           <div class="stage-controls">
             <n-radio-group v-model:value="decomposeMode" size="small">
@@ -263,6 +382,19 @@ const shotColumns = [
           />
         </n-card>
       </div>
+
+      <n-alert
+        v-if="stageErrorDetail"
+        type="error"
+        :bordered="false"
+        class="stage-error"
+        title="阶段任务失败"
+      >
+        <div class="stage-error-body">
+          <span>{{ stageErrorDetail }}</span>
+          <n-button size="tiny" quaternary @click="clearStageError">清除提示</n-button>
+        </div>
+      </n-alert>
 
       <!-- StoryBible -->
       <n-card v-if="bible" title="故事圣经 (StoryBible)" :bordered="false" class="panel">
@@ -364,12 +496,43 @@ const shotColumns = [
 }
 .stage-title { font-weight: 700; font-size: 15px; }
 .stage-desc { color: var(--app-text-muted); font-size: 12px; margin-top: 4px; }
+.stage-note {
+  margin-top: 14px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--app-border);
+  color: var(--app-text-secondary);
+  background: color-mix(in srgb, var(--app-surface-2) 72%, transparent);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.stage-note.warn {
+  border-color: color-mix(in srgb, #f59e0b 42%, var(--app-border));
+  color: color-mix(in srgb, #fbbf24 82%, var(--app-text-secondary));
+  background: color-mix(in srgb, #f59e0b 10%, transparent);
+}
 .stage-controls {
   display: flex;
   align-items: center;
   gap: 12px;
   margin-top: 14px;
   flex-wrap: wrap;
+}
+.stage-error {
+  margin: -4px 0 18px;
+}
+.stage-error-body {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  line-height: 1.6;
+}
+@media (max-width: 700px) {
+  .stage-error-body {
+    align-items: flex-start;
+    flex-direction: column;
+  }
 }
 .manual-box { margin-top: 12px; }
 .manual-hint {

@@ -32,7 +32,6 @@ ROLE_RANK = {
     "staging": 0,       # 站位图
     "character": 1,     # 角色图（主角）
     "scene": 2,         # 背景 / 场景图
-    "scene_aerial": 2,  # 场景鸟瞰图（紧随主场景图，稳定排序保证主图在前）
     "support": 3,       # 配角图
     "prop": 4,          # 道具图
 }
@@ -43,7 +42,6 @@ ROLE_LABEL = {
     "staging": "站位图（作为参考）",
     "character": "角色参考",
     "scene": "场景参考",
-    "scene_aerial": "场景鸟瞰图（固定空间位置）",
     "support": "配角参考",
     "prop": "道具参考",
 }
@@ -136,8 +134,6 @@ def token_for(it: dict) -> str:
         return "@导演图"
     if role == "staging":
         return "@站位图"
-    if role == "scene_aerial":
-        return "@场景鸟瞰图"
     name = (it.get("name") or "").strip()
     return ("@" + name) if name else "@参考"
 
@@ -151,8 +147,6 @@ def _sentence_for(role: str, token: str, kind: str) -> str:
         return f"{token} 是配角"
     if role == "scene":
         return f"{token} 是背景/场景"
-    if role == "scene_aerial":
-        return f"{token} 是场景鸟瞰俯视图，用于固定场景空间位置与机位布局"
     if role == "prop":
         return f"{token} 是道具"
     if role == "director":
@@ -191,9 +185,6 @@ def _definition_desc(it: dict, kind: str) -> str:
         return "是上一镜尾帧，作为本镜视频首帧画面，从该画面自然运动起势"
     if role == "scene":
         return f"是 {name}" if name else "是 背景/场景"
-    if role == "scene_aerial":
-        base = f"是 {name} 的鸟瞰俯视图" if name else "是场景鸟瞰俯视图"
-        return base + "，用于固定场景空间位置与机位布局，请保持与场景一致"
     if role == "prop":
         return f"是 {name}" if name else "是 道具"
     if role == "support":
@@ -204,7 +195,7 @@ def _definition_desc(it: dict, kind: str) -> str:
     return base + (f"（音色为：{voice}）" if voice else "")
 
 
-_DEF_HEAD = "【画面定义】（@图N 按 reference_image_urls 数组顺序编号；仅说明随附参考图的对应关系，不作为画面内容/文字输出）"
+_DEF_HEAD = "【画面定义】"
 _DEF_TAIL = "务必严格保持各 @图 对象的形象/服装/场景/道具与参考图一致。"
 # 用于幂等：识别并剥离已存在于文本开头的【画面定义】块（含其后的空行）。
 _DEF_BLOCK_RE = re.compile(
@@ -213,6 +204,16 @@ _DEF_BLOCK_RE = re.compile(
 )
 _DEF_FALLBACK_RE = re.compile(
     r"^\s*【画面定义】[^\n]*(?:\n@图\d+[^\n]*)*(?:\n" + re.escape(_DEF_TAIL) + r")?\s*",
+    re.DOTALL,
+)
+_DEF_GENERIC_RE = re.compile(
+    r"^\s*【画面定义】[^\n]*(?:\n@(?:图|image)\d+[^\n]*)*"
+    r"(?:\n务必严格保持[^\n]*)?\s*",
+    re.DOTALL,
+)
+_DEF_ANYWHERE_RE = re.compile(
+    r"\s*【画面定义】[^\n]*(?:\n@(?:图|image)\d+[^\n]*)*"
+    r"(?:\n务必严格保持[^\n]*)?\s*",
     re.DOTALL,
 )
 
@@ -225,7 +226,23 @@ def strip_definition_block(text: str) -> str:
     stripped = _DEF_BLOCK_RE.sub("", text, count=1)
     if stripped != text:
         return stripped
-    return _DEF_FALLBACK_RE.sub("", text, count=1)
+    stripped = _DEF_FALLBACK_RE.sub("", text, count=1)
+    if stripped != text:
+        return stripped
+    stripped = _DEF_GENERIC_RE.sub("", text, count=1)
+    if stripped != text:
+        return stripped
+    return _DEF_ANYWHERE_RE.sub("\n", text, count=1)
+
+
+def _clean_dialogue_speaker_refs(text: str) -> str:
+    if not text:
+        return text or ""
+    return re.sub(
+        r"(【台词/旁白】[^\n]*?对白)@(?=[\w\u4e00-\u9fff])",
+        r"\1",
+        text,
+    )
 
 
 def build_definition_block(kept: list, kind: str = "video",
@@ -272,6 +289,54 @@ def compose_prompt(base_text: str, materials: list, kept: list,
             drop_repl[ph] = m.get("name") or ph.lstrip("@")
     for ph in sorted(drop_repl, key=len, reverse=True):
         text = text.replace(ph, drop_repl[ph])
+
+    # AI inference may invent soft tags such as @闪回 or @情绪 that are not backed
+    # by any uploaded reference image. Keep @ only for references that will be
+    # attached in this request; otherwise turn it back into plain text so the
+    # provider does not try to bind a missing image.
+    allowed_tags = set()
+    for it in kept or []:
+        if it.get("asset_id"):
+            for m in materials or []:
+                if m.get("asset_id") == it.get("asset_id") and m.get("placeholder"):
+                    allowed_tags.add(m.get("placeholder"))
+        role = it.get("role")
+        if role == "first_frame":
+            allowed_tags.add("@首帧")
+        elif role == "staging":
+            allowed_tags.add("@站位图")
+        elif role == "director":
+            allowed_tags.add("@导演图")
+
+    protected_tags = {}
+    for idx, tag in enumerate(sorted(allowed_tags, key=len, reverse=True)):
+        sentinel = f"\x00REF{idx}\x00"
+        protected_tags[sentinel] = tag
+        text = text.replace(tag, sentinel)
+
+    def _strip_unbound(match):
+        tag = match.group(0)
+        return tag if tag in allowed_tags else tag[1:]
+
+    text = re.sub(
+        r"@(?!(?:图(?:N|\d+)?|image(?:N|\d+)?)\b)([\u4e00-\u9fffA-Za-z_][\w\u4e00-\u9fff·-]{0,40})",
+        _strip_unbound,
+        text,
+    )
+    for sentinel, tag in protected_tags.items():
+        text = text.replace(sentinel, tag)
+    for tag in sorted(allowed_tags, key=len, reverse=True):
+        text = re.sub(
+            re.escape(tag) + r"(?=[\u4e00-\u9fffA-Za-z_])",
+            tag + " ",
+            text,
+        )
+    text = re.sub(
+        r"(?<![\w\u4e00-\u9fff])([#$])([\u4e00-\u9fffA-Za-z_][\w\u4e00-\u9fff·-]{0,40})",
+        lambda m: m.group(2),
+        text,
+    )
+    text = _clean_dialogue_speaker_refs(text)
 
     head = build_definition_block(kept, kind)
     if not head:

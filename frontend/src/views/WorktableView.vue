@@ -53,7 +53,6 @@ const tb = reactive({
   model: '',
   continuity: false,
   continuityMode: 'auto',
-  directorBoardOnly: false,
   aiReview: true,
   decisionLlm: true,  // 默认直接开启 LLM 升级决策（无凭据时后端自动回退规则）
   batchPollMaxMinutes: 30,
@@ -67,12 +66,13 @@ function continuityStorageKey(pid = store.currentId, eid = store.currentEpisodeI
 const CONTINUITY_DEFAULTS = {
   continuity: false,
   continuityMode: 'auto',
-  directorBoardOnly: false,
   aiReview: true,
   decisionLlm: true,
 }
+let settingsHydrating = false
 function saveTb() {
   try {
+    if (settingsHydrating) return
     if (!store.currentId) return
     localStorage.setItem(tbStorageKey(), JSON.stringify({
       imageSize: tb.imageSize,
@@ -80,6 +80,10 @@ function saveTb() {
       resolution: tb.resolution,
       aspect: tb.aspect,
       model: tb.model,
+      continuity: tb.continuity,
+      continuityMode: tb.continuityMode,
+      aiReview: tb.aiReview,
+      decisionLlm: tb.decisionLlm,
       batchPollMaxMinutes: tb.batchPollMaxMinutes,
     }))
   } catch { /* ignore */ }
@@ -92,7 +96,6 @@ function projectContinuityFallback(pid = store.currentId) {
     return {
       continuity: data.continuity !== undefined ? !!data.continuity : CONTINUITY_DEFAULTS.continuity,
       continuityMode: data.continuityMode || CONTINUITY_DEFAULTS.continuityMode,
-      directorBoardOnly: data.directorBoardOnly !== undefined ? !!data.directorBoardOnly : CONTINUITY_DEFAULTS.directorBoardOnly,
       aiReview: data.aiReview !== undefined ? !!data.aiReview : CONTINUITY_DEFAULTS.aiReview,
       decisionLlm: data.decisionLlm !== undefined ? !!data.decisionLlm : CONTINUITY_DEFAULTS.decisionLlm,
     }
@@ -106,7 +109,6 @@ function loadContinuitySettings(pid = store.currentId, eid = store.currentEpisod
     Object.assign(tb, {
       continuity: data?.continuity !== undefined ? !!data.continuity : base.continuity,
       continuityMode: data?.continuityMode || base.continuityMode,
-      directorBoardOnly: data?.directorBoardOnly !== undefined ? !!data.directorBoardOnly : base.directorBoardOnly,
       aiReview: data?.aiReview !== undefined ? !!data.aiReview : base.aiReview,
       decisionLlm: data?.decisionLlm !== undefined ? !!data.decisionLlm : base.decisionLlm,
     })
@@ -114,17 +116,18 @@ function loadContinuitySettings(pid = store.currentId, eid = store.currentEpisod
 }
 function saveContinuitySettings() {
   try {
+    if (settingsHydrating) return
     if (!store.currentId || !store.currentEpisodeId) return
     localStorage.setItem(continuityStorageKey(), JSON.stringify({
       continuity: tb.continuity,
       continuityMode: tb.continuityMode,
-      directorBoardOnly: tb.directorBoardOnly,
       aiReview: tb.aiReview,
       decisionLlm: tb.decisionLlm,
     }))
   } catch { /* ignore */ }
 }
 async function loadTb() {
+  settingsHydrating = true
   try {
     const defaults = await api.getSettings().catch(() => null)
     if (defaults) {
@@ -148,7 +151,10 @@ async function loadTb() {
       batchPollMaxMinutes: Number.isFinite(Number(data.batchPollMaxMinutes)) ? Number(data.batchPollMaxMinutes) : tb.batchPollMaxMinutes,
     })
   } catch { /* ignore */ }
-  loadContinuitySettings()
+  finally {
+    loadContinuitySettings()
+    settingsHydrating = false
+  }
 }
 function resetTb() {
   Object.assign(tb, {
@@ -244,9 +250,17 @@ function restoreMaterialSelections() {
   if (changed) saveMaterialSelections()
 }
 
-const sizeOptions = ['1024x1024', '1280x720', '720x1280'].map((v) => ({ label: v, value: v }))
-const resOptions = ['720p', '1080p'].map((v) => ({ label: v, value: v }))
-const aspectOptions = ['16:9', '9:16', '1:1'].map((v) => ({ label: v, value: v }))
+const viduImageSizes = ['16:9', '9:16', '1:1', '4:3', '3:4']
+  .flatMap((aspect) => ['1080p', '2K', '4K'].map((res) => ({
+    label: `Vidu ${aspect} ${res}`,
+    value: `${aspect}@${res}`,
+  })))
+const sizeOptions = [
+  ...['1024x1024', '1280x720', '720x1280'].map((v) => ({ label: v, value: v })),
+  ...viduImageSizes,
+]
+const resOptions = ['720p', '1080p', '2K', '4K'].map((v) => ({ label: v, value: v }))
+const aspectOptions = ['16:9', '9:16', '1:1', '4:3', '3:4'].map((v) => ({ label: v, value: v }))
 const imageModelOptions = [
   { label: '默认模型', value: '' }, { label: 'gpt-image-2', value: 'gpt-image-2' }, { label: 'jimeng-4.6', value: 'jimeng-4.6' },
 ]
@@ -270,8 +284,20 @@ onMounted(async () => {
   await reload()
 })
 
-watch(() => store.currentId, () => { loadTb(); loadContinuitySettings(); loadManualBridge(); loadMaterialSelections() })
-watch(() => store.currentEpisodeId, () => { loadLocks(); loadContinuitySettings(); loadManualBridge(); loadMaterialSelections(); reload() })
+watch(() => store.currentId, async () => {
+  await loadTb()
+  loadManualBridge()
+  loadMaterialSelections()
+})
+watch(() => store.currentEpisodeId, () => {
+  settingsHydrating = true
+  loadLocks()
+  loadContinuitySettings()
+  settingsHydrating = false
+  loadManualBridge()
+  loadMaterialSelections()
+  reload()
+})
 watch(tb, () => { saveTb(); saveContinuitySettings() }, { deep: true })
 watch(() => tb.continuity, () => {
   if (store.current && shots.value.length) refreshVideoPrompts(shots.value.map((s) => s.shot_no))
@@ -367,7 +393,6 @@ function refRoleLabel(role) {
   if (role === 'first_frame') return '上一镜尾帧'
   if (role === 'staging') return '站位图'
   if (role === 'director') return '导演图'
-  if (role === 'scene_aerial') return '鸟瞰图'
   if (role === 'scene') return '场景'
   if (role === 'prop') return '道具'
   return '角色'
@@ -897,39 +922,10 @@ function continuityImg(filename) {
   const v = encodeURIComponent(continuityState.value?.updated_at || Date.now())
   return `${api.continuityImageUrl(store.current.id, filename)}?v=${v}`
 }
-function complexDirectorShot(s) {
-  const text = [s?.scene, s?.action, s?.camera, s?.handoff, s?.dialogue].filter(Boolean).join(' ').toLowerCase()
-  const kws = ['打斗', '战斗', '搏斗', '追逐', '枪战', '刀战', '爆炸', '复杂运镜', '长镜头', '环绕', '跟拍', '多机位', '复杂剧情', '多线', '反转', '关键转折', '多人对峙', '群像', 'fight', 'battle', 'chase', 'orbit', 'tracking']
-  if (kws.some((kw) => text.includes(kw.toLowerCase()))) return true
-  const chars = Array.isArray(s?.characters) ? s.characters.length : 0
-  const props = Array.isArray(s?.props) ? s.props.length : 0
-  return chars >= 4 || (chars >= 3 && props >= 2)
-}
 function bridgeKey(prev, next) { return `${prev?.shot_no || 'none'}>${next?.shot_no || 'none'}` }
 function bridgeDecision(nextNo) {
-  const d = manualBridge[nextNo]
+  return manualBridge[nextNo]
     || (tb.continuityMode === 'manual' ? defaultBridgeDecision() : (snap(nextNo)?.decision || statusByShot[nextNo]?.decision || null))
-  if (!tb.directorBoardOnly || !d) return d
-  if (!complexDirectorShot(shots.value.find((s) => s.shot_no === nextNo))) {
-    return {
-      ...d,
-      scene_cut: false,
-      use_tail_frame: false,
-      use_staging: true,
-      use_director_board: false,
-      strategy: 'staging',
-      reason: '非复杂镜头不使用导演图，改用站位图+资产图',
-    }
-  }
-  return {
-    ...d,
-    scene_cut: false,
-    use_tail_frame: false,
-    use_staging: false,
-    use_director_board: true,
-    strategy: 'director_board',
-    reason: '复杂镜头导演图：导演图作为参考图之一参与视频引导',
-  }
 }
 function bridgeSelected(nextNo, key) {
   const d = bridgeDecision(nextNo)
@@ -1193,6 +1189,8 @@ function sourceSeqs(s) {
   return []
 }
 function sourceSeqLabel(s) {
+  const marker = (s.src_marker && String(s.src_marker).trim()) || ''
+  if (marker) return marker
   const seqs = sourceSeqs(s)
   if (!seqs.length) return ''
   if (seqs.length === 1) return String(seqs[0])
@@ -1220,7 +1218,7 @@ function buildParams(kind) {
   if (kind === 'video' && tb.continuity) {
     Object.assign(p, {
       continuity: true, mode: tb.continuityMode, ai_review: tb.aiReview,
-      decision_llm: tb.decisionLlm, director_board_only: tb.directorBoardOnly,
+      decision_llm: tb.decisionLlm,
     })
     const manualPayload = manualContinuityPayload()
     if (Object.keys(manualPayload).length) p.manual_continuity = manualPayload
@@ -1233,20 +1231,6 @@ function manualContinuityPayload() {
   for (const s of shots.value) {
     const d = manualBridge[s.shot_no]
     if (!d) continue
-    if (tb.directorBoardOnly) {
-      const complex = complexDirectorShot(s)
-      out[s.shot_no] = {
-        ...defaultBridgeDecision(),
-        ...d,
-        use_tail_frame: false,
-        use_staging: !complex,
-        use_director_board: complex,
-        scene_cut: false,
-        strategy: complex ? 'director_board' : 'staging',
-        source: 'manual',
-      }
-      continue
-    }
     const clean = sanitizeManualBridgeDecision(d)
     out[s.shot_no] = {
       ...defaultBridgeDecision(),
@@ -1900,12 +1884,11 @@ async function exportJianying() {
               <button :class="{ on: tb.continuityMode === 'manual' }" @click="setContinuityMode('manual')">手动决策</button>
             </div>
             <div class="cd-toggles">
-              <label><span>复杂镜头导演图</span><n-switch size="small" v-model:value="tb.directorBoardOnly" /></label>
               <label><span>LLM升级决策</span><n-switch size="small" v-model:value="tb.decisionLlm" /></label>
               <label><span>AI复核闸门</span><n-switch size="small" v-model:value="tb.aiReview" /></label>
             </div>
             <div class="cd-note">
-              自动模式会按剧情和上一镜状态分析尾帧、站位图、导演图；复杂镜头导演图开启后，仅打斗、复杂运镜、复杂剧情等镜头使用导演图，普通镜头使用站位图+资产图。
+              自动模式会按剧情和上一镜状态分析尾帧、站位图、导演图；导演图作为策略内的复杂镜头方案，仅用于打斗、复杂运镜、多人调度、关键转折等需要预先统一构图和调度的镜头。
             </div>
           </div>
 

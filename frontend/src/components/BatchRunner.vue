@@ -26,6 +26,19 @@ const current = ref(null)
 const jobId = ref(null)
 let poll = null
 
+const viduImageSizeOptions = ['16:9', '9:16', '1:1', '4:3', '3:4']
+  .flatMap((aspect) => ['1080p', '2K', '4K'].map((res) => ({
+    label: `Vidu ${aspect} ${res}`,
+    value: `${aspect}@${res}`,
+  })))
+const batchImageSizeOptions = [
+  { label: '1024x1024', value: '1024x1024' },
+  { label: '1024x1536', value: '1024x1536' },
+  { label: '1536x1024', value: '1536x1024' },
+  ...viduImageSizeOptions,
+]
+const aspectOptions = ['16:9', '9:16', '1:1', '4:3', '3:4'].map((v) => ({ label: v, value: v }))
+
 // ── create form ──
 const form = ref({
   name: '', source: 'shots', concurrency: 2, max_attempts: 3,
@@ -193,7 +206,7 @@ function thumbUrl(t) {
               </div>
               <div class="field"><label>画幅</label>
                 <n-select v-model:value="form.aspect_ratio" size="small"
-                  :options="[{label:'16:9',value:'16:9'},{label:'9:16',value:'9:16'},{label:'1:1',value:'1:1'}]" />
+                  :options="aspectOptions" />
               </div>
             </div>
             <div class="field continuity-box">
@@ -219,7 +232,7 @@ function thumbUrl(t) {
           </template>
           <div v-else class="field"><label>尺寸</label>
             <n-select v-model:value="form.size" size="small"
-              :options="[{label:'1024x1024',value:'1024x1024'},{label:'1024x1536',value:'1024x1536'},{label:'1536x1024',value:'1536x1024'}]" />
+              :options="batchImageSizeOptions" />
           </div>
 
           <n-button type="primary" block @click="createBatch">

@@ -5,6 +5,7 @@ import { NConfigProvider, NMessageProvider, NDialogProvider, NLoadingBarProvider
 import { zhCN, dateZhCN } from 'naive-ui'
 import { darkTheme, lightTheme, buildThemeOverrides } from './theme'
 import { useThemeStore } from './stores/theme'
+import { useHealthStore } from './stores/health'
 import TitleBar from './layouts/TitleBar.vue'
 import SideBar from './layouts/SideBar.vue'
 import GenTabs from './layouts/GenTabs.vue'
@@ -14,6 +15,7 @@ const route = useRoute()
 const fullBleed = computed(() => !!route.meta.fullBleed)
 
 const themeStore = useThemeStore()
+const healthStore = useHealthStore()
 const naiveTheme = computed(() => (themeStore.mode === 'light' ? lightTheme : darkTheme))
 const naiveOverrides = computed(() => buildThemeOverrides(themeStore.theme))
 const viewError = ref('')
@@ -22,7 +24,10 @@ onErrorCaptured((err) => {
   console.error(err)
   return false
 })
-onMounted(() => themeStore.init())
+onMounted(() => {
+  themeStore.init()
+  healthStore.start()
+})
 </script>
 
 <template>
@@ -34,6 +39,15 @@ onMounted(() => themeStore.init())
           <ResizeHandles />
           <div class="app-root">
             <TitleBar />
+            <div v-if="healthStore.showBanner" class="health-banner" :class="healthStore.status">
+              <div>
+                <strong>{{ healthStore.label }}</strong>
+                <span>{{ healthStore.detail }}</span>
+              </div>
+              <button :disabled="healthStore.checking" @click="healthStore.check()">
+                {{ healthStore.checking ? '检查中' : '重新连接' }}
+              </button>
+            </div>
             <div class="app-body">
               <SideBar v-if="!fullBleed" />
               <main class="app-main" :class="{ bleed: fullBleed }">
@@ -66,6 +80,41 @@ onMounted(() => themeStore.init())
   flex: 1;
   display: flex;
   min-height: 0;
+}
+.health-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px;
+  border-bottom: 1px solid color-mix(in srgb, #ff5d6c 34%, var(--app-border));
+  background: color-mix(in srgb, #ff5d6c 12%, var(--app-surface));
+  color: var(--app-text-primary);
+  font-size: 12px;
+}
+.health-banner div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.health-banner span {
+  color: var(--app-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.health-banner button {
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: var(--app-surface-2);
+  color: var(--app-text-primary);
+  cursor: pointer;
+  padding: 4px 10px;
+}
+.health-banner button:disabled {
+  cursor: wait;
+  opacity: .65;
 }
 .app-main {
   flex: 1;

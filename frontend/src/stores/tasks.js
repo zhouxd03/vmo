@@ -16,6 +16,8 @@ import { useProjectStore } from './project'
 let batchTimer = null
 let batchClock = null
 let decomposeTimer = null
+let assetMissingTimer = null
+const assetTimers = new Map()
 let batchPollStart = 0
 let batchRefreshing = false
 
@@ -25,6 +27,7 @@ const BATCH_POLL_INITIAL_DELAY = 4_000
 const BATCH_POLL_INTERVAL = 20_000
 const BATCH_POLL_MAX_MINUTES_DEFAULT = 30
 const DECOMPOSE_POLL_INTERVAL = 1_000
+const ASSET_POLL_INTERVAL = 1_500
 
 export const useTasksStore = defineStore('tasks', {
   state: () => ({
@@ -51,6 +54,13 @@ export const useTasksStore = defineStore('tasks', {
     analyzeEpisodeId: null,
     analyzeStatus: 'idle', // idle | running | done | error
     analyzeError: '',
+
+    // asset reference image generation (AssetsView)
+    assetProjectId: null,
+    assetBatchGen: {
+      running: false, done: 0, total: 0, failed: [], message: '', startedAt: null, jobId: '',
+    },
+    assetJobs: {},
   }),
   getters: {
     decomposePercent: (s) =>
@@ -171,6 +181,7 @@ export const useTasksStore = defineStore('tasks', {
         this.decomposeJobId = job_id
         this._startDecomposeTimer()
       } catch (e) {
+        this._stopDecomposeTimer()
         this.decomposeStatus = 'error'
         this.decomposeError = e.message || String(e)
       }
@@ -219,6 +230,173 @@ export const useTasksStore = defineStore('tasks', {
       } catch (e) {
         this.analyzeStatus = 'error'
         this.analyzeError = e.message || String(e)
+      }
+    },
+
+    async startMissingAssetRefs(pid, payload, totalHint = 0) {
+      this.assetProjectId = pid
+      this.assetBatchGen = {
+        running: true,
+        done: 0,
+        total: totalHint || 0,
+        failed: [],
+        message: `提交中 · ${payload?.model || '默认模型'} · ${payload?.size || '默认尺寸'}`,
+        startedAt: Date.now(),
+        jobId: '',
+      }
+      try {
+        const r = await api.startMissingAssets(pid, payload || {})
+        this.assetBatchGen = {
+          ...this.assetBatchGen,
+          jobId: r.job_id,
+          total: r.total || totalHint || 0,
+          message: '已提交，等待生成服务响应',
+        }
+        this._startAssetMissingTimer()
+        await this._pollMissingAssetRefs()
+      } catch (e) {
+        this._stopAssetMissingTimer()
+        this.assetBatchGen = { ...this.assetBatchGen, running: false, message: e.message || String(e) }
+      }
+    },
+
+    _startAssetMissingTimer() {
+      if (assetMissingTimer) return
+      assetMissingTimer = setInterval(() => this._pollMissingAssetRefs(), ASSET_POLL_INTERVAL)
+    },
+
+    _stopAssetMissingTimer() {
+      if (assetMissingTimer) { clearInterval(assetMissingTimer); assetMissingTimer = null }
+    },
+
+    async _pollMissingAssetRefs() {
+      const jobId = this.assetBatchGen.jobId
+      if (!jobId) return
+      let job
+      try {
+        job = await api.getJob(jobId)
+      } catch (e) {
+        this.assetBatchGen = { ...this.assetBatchGen, message: e.message || String(e) }
+        return
+      }
+      this.assetBatchGen = {
+        ...this.assetBatchGen,
+        done: job.progress || 0,
+        total: job.total || this.assetBatchGen.total,
+        message: job.message || this.assetBatchGen.message,
+      }
+      if (job.status === 'done') {
+        this._stopAssetMissingTimer()
+        const r = job.result || {}
+        this.assetBatchGen = {
+          ...this.assetBatchGen,
+          running: false,
+          done: r.generated || job.progress || 0,
+          total: r.total || job.total || 0,
+          failed: r.failed || [],
+          message: '参考图补全完成',
+        }
+        await this._reloadIfCurrent(this.assetProjectId)
+      } else if (job.status === 'error') {
+        this._stopAssetMissingTimer()
+        this.assetBatchGen = {
+          ...this.assetBatchGen,
+          running: false,
+          message: job.error || '生成失败',
+        }
+      }
+    },
+
+    assetJob(assetId) {
+      return this.assetJobs[assetId] || null
+    },
+
+    _setAssetJob(assetId, patch) {
+      this.assetJobs = {
+        ...this.assetJobs,
+        [assetId]: { ...(this.assetJobs[assetId] || {}), ...patch },
+      }
+    },
+
+    async startAssetRef(pid, asset, payload) {
+      if (!asset?.id) return
+      const assetId = asset.id
+      const label = `${asset.trigger || ''}${asset.name || ''}`
+      this.assetProjectId = pid
+      this._setAssetJob(assetId, {
+        running: true,
+        status: 'starting',
+        message: `提交中 · ${payload?.model || '默认模型'} · ${payload?.size || '默认尺寸'}`,
+        model: payload?.model || '默认模型',
+        size: payload?.size,
+        startedAt: Date.now(),
+        progress: 0,
+        total: 1,
+        error: '',
+        assetName: label,
+      })
+      try {
+        const r = await api.startAssetRefImage(pid, assetId, payload || {})
+        this._setAssetJob(assetId, { jobId: r.job_id, message: '已提交，等待生成服务响应' })
+        this._startAssetTimer(r.job_id, assetId)
+        await this._pollAssetRef(r.job_id, assetId)
+      } catch (e) {
+        this._setAssetJob(assetId, {
+          running: false,
+          status: 'error',
+          message: e.message || String(e),
+          error: e.message || String(e),
+          finishedAt: Date.now(),
+        })
+      }
+    },
+
+    _startAssetTimer(jobId, assetId) {
+      this._stopAssetTimerByJob(jobId)
+      const timer = setInterval(() => this._pollAssetRef(jobId, assetId), ASSET_POLL_INTERVAL)
+      assetTimers.set(jobId, timer)
+    },
+
+    _stopAssetTimerByJob(jobId) {
+      const timer = assetTimers.get(jobId)
+      if (timer) clearInterval(timer)
+      assetTimers.delete(jobId)
+    },
+
+    async _pollAssetRef(jobId, assetId) {
+      if (!jobId || !assetId) return
+      let job
+      try {
+        job = await api.getJob(jobId)
+      } catch (e) {
+        this._setAssetJob(assetId, { message: e.message || String(e) })
+        return
+      }
+      this._setAssetJob(assetId, {
+        jobId,
+        status: job.status,
+        message: job.message || (job.status === 'running' ? '生成中' : ''),
+        progress: job.progress || 0,
+        total: job.total || 1,
+      })
+      if (job.status === 'done') {
+        this._stopAssetTimerByJob(jobId)
+        this._setAssetJob(assetId, {
+          running: false,
+          status: 'done',
+          message: '参考图已更新',
+          finishedAt: Date.now(),
+        })
+        await this._reloadIfCurrent(this.assetProjectId)
+      } else if (job.status === 'error') {
+        this._stopAssetTimerByJob(jobId)
+        this._setAssetJob(assetId, {
+          running: false,
+          status: 'error',
+          message: job.error || '生成失败',
+          error: job.error || '生成失败',
+          finishedAt: Date.now(),
+        })
       }
     },
 

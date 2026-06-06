@@ -12,13 +12,14 @@ import PageHeader from '../components/PageHeader.vue'
 import { api } from '../api'
 import { useThemeStore } from '../stores/theme'
 import { useProjectStore } from '../stores/project'
+import { useHealthStore } from '../stores/health'
 
 const router = useRouter()
 const message = useMessage()
 const dialog = useDialog()
 const themeStore = useThemeStore()
 const projectStore = useProjectStore()
-const health = ref(null)
+const healthStore = useHealthStore()
 const credCount = ref(0)
 
 const stageLabel = { imported: '已导入', analyzed: '已分析', decomposed: '已拆解' }
@@ -39,11 +40,11 @@ const steps = [
 
 onMounted(async () => {
   try {
-    health.value = await api.health()
+    await healthStore.check()
     const creds = await api.listCredentials()
     credCount.value = Object.values(creds).reduce((a, list) => a + list.length, 0)
   } catch (e) {
-    health.value = { ok: false, error: String(e) }
+    credCount.value = 0
   }
   await projectStore.refreshList()
 })
@@ -140,9 +141,9 @@ function removeProject(p) {
       subtitle="剧本 → 动漫 的连续性批量创作工具 · 单机运行"
     >
       <template #actions>
-        <n-tag v-if="health && health.ok" type="success" round :bordered="false">
+        <n-tag v-if="healthStore.online" type="success" round :bordered="false">
           <template #icon><n-icon :component="CheckmarkCircle" /></template>
-          后端已连接 · {{ health.version }}
+          后端已连接 · {{ healthStore.info?.version }}
         </n-tag>
         <n-tag v-else type="error" round :bordered="false">
           <template #icon><n-icon :component="AlertCircle" /></template>

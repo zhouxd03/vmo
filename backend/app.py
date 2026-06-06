@@ -7,6 +7,9 @@ browser for development.
 """
 
 import logging
+import os
+import sys
+import time
 
 import requests as http
 from flask import Flask, Response, jsonify, request, send_from_directory
@@ -14,10 +17,12 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 from . import routes_projects
 from .core import credentials, settings
 from .core.logbus import clear_logs, export_text, get_logs, setup_logging
-from .core.paths import STATIC_DIR, ensure_dirs
-from .services import llm, video_gen
+from .core.paths import APP_DIR, DATA_DIR, OUTPUT_DIR, PROJECTS_DIR, STATIC_DIR, ensure_dirs
+from .services import llm, video_gen, vidu_gen
 
 logger = setup_logging()
+STARTED_AT = time.time()
+APP_VERSION = "1.0.1"
 
 def _openai_model_list(base_url: str, api_key: str) -> list[str]:
     base = (base_url or "").strip().rstrip("/")
@@ -52,6 +57,19 @@ def _credential_api_key(category: str, body: dict) -> str:
     return (default or {}).get("api_key", "")
 
 
+def _credential_base_url(category: str, body: dict) -> str:
+    base_url = (body.get("base_url") or "").strip()
+    if base_url:
+        return base_url
+    entry_id = body.get("id")
+    if entry_id:
+        for entry in credentials.load_raw().get(category, []):
+            if entry.get("id") == entry_id:
+                return credentials._resolve_entry(entry).get("base_url", "")
+    default = credentials.get_default(category)
+    return (default or {}).get("base_url", "")
+
+
 def create_app() -> Flask:
     ensure_dirs()
     app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/assets_static")
@@ -84,9 +102,29 @@ def create_app() -> Flask:
     # ── health / meta ──
     @app.route("/api/health")
     def health():
-        return jsonify({"ok": True, "service": "batch-studio", "version": "1.0.1"})
-
-    APP_VERSION = "1.0.1"
+        return jsonify({
+            "ok": True,
+            "service": "batch-studio",
+            "version": APP_VERSION,
+            "time": time.time(),
+            "uptime_sec": round(time.time() - STARTED_AT, 2),
+            "pid": os.getpid(),
+            "python": sys.version.split()[0],
+            "paths": {
+                "app": str(APP_DIR),
+                "data": str(DATA_DIR),
+                "projects": str(PROJECTS_DIR),
+                "output": str(OUTPUT_DIR),
+                "static": str(STATIC_DIR),
+            },
+            "checks": {
+                "data_dir": DATA_DIR.exists(),
+                "projects_dir": PROJECTS_DIR.exists(),
+                "output_dir": OUTPUT_DIR.exists(),
+                "static_dir": STATIC_DIR.exists(),
+                "index_html": (STATIC_DIR / "index.html").exists(),
+            },
+        })
 
     @app.route("/api/logs")
     def logs():
@@ -153,7 +191,11 @@ def create_app() -> Flask:
                 return jsonify({"ok": True, "models": models[:200]})
             if category == "video":
                 provider = video_gen._detect_provider(base_url or "", body.get("provider", ""))
-                if provider == "seedance":
+                if provider == "vidu":
+                    api_key = api_key or _credential_api_key(category, body)
+                    info = vidu_gen.test_cookie("", api_key)
+                    return jsonify({"ok": True, "models": vidu_gen.VIDU_VIDEO_MODEL_OPTIONS, "info": info.get("user")})
+                if provider in ("seedance", "seedance_web"):
                     # resolve stored key if the form sent a masked placeholder
                     b, k, _m, _p = video_gen._resolve_creds(base_url, api_key)
                     info = video_gen.seedance_user_info(b, k)
@@ -161,10 +203,34 @@ def create_app() -> Flask:
                         "Token": info.get("Token"), "FastToken": info.get("FastToken"),
                         "SdDuration": info.get("SdDuration"),
                     }})
+            if category == "image" and (body.get("provider", "").strip().lower() == "vidu"):
+                api_key = api_key or _credential_api_key(category, body)
+                info = vidu_gen.test_cookie("", api_key)
+                return jsonify({"ok": True, "models": vidu_gen.VIDU_IMAGE_MODEL_OPTIONS, "info": info.get("user")})
             # image/image_host (and OpenAI-style video): lightweight reachability
             return jsonify({"ok": True, "models": []})
         except Exception as e:  # noqa: BLE001
             return jsonify({"ok": False, "error": str(e)}), 200
+
+    @app.route("/api/credentials/<category>/user-info", methods=["POST"])
+    def credential_user_info(category):
+        body = request.json or {}
+        try:
+            if category != "video":
+                return jsonify({"error": "当前只有生视频 Seedance 接口支持用户首页信息查询"}), 400
+            base_url = _credential_base_url(category, body)
+            api_key = _credential_api_key(category, body)
+            provider = video_gen._detect_provider(base_url or "", body.get("provider", ""))
+            if provider not in ("seedance", "seedance_web"):
+                return jsonify({"error": "该查询仅适用于 Seedance / 飞书文档中的 seedanceapi 用户首页接口"}), 400
+            info = video_gen.seedance_user_info(base_url, api_key)
+            logger.info(
+                "[Seedance][UserIndex] queried user info: token=%s fast=%s sd_duration=%s",
+                info.get("Token"), info.get("FastToken"), info.get("SdDuration"),
+            )
+            return jsonify({"ok": True, "info": info})
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"ok": False, "error": str(e)}), 502
 
     @app.route("/api/llm/models", methods=["POST"])
     def llm_models():
@@ -186,8 +252,12 @@ def create_app() -> Flask:
                 return jsonify({"models": llm.list_models(base_url=body.get("base_url"), api_key=api_key)})
             if category == "video":
                 provider = video_gen._detect_provider(body.get("base_url") or "", body.get("provider", ""))
-                if provider == "seedance":
+                if provider == "vidu":
+                    return jsonify({"models": vidu_gen.VIDU_VIDEO_MODEL_OPTIONS, "builtin": True})
+                if provider in ("seedance", "seedance_web"):
                     return jsonify({"models": video_gen.SEEDANCE_MODELS, "builtin": True})
+            if category == "image" and (body.get("provider", "").strip().lower() == "vidu"):
+                return jsonify({"models": vidu_gen.VIDU_IMAGE_MODEL_OPTIONS, "builtin": True})
             if category in ("image", "video"):
                 return jsonify({"models": _openai_model_list(body.get("base_url"), api_key)})
             return jsonify({"models": []})

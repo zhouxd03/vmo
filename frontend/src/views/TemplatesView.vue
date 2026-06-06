@@ -234,7 +234,7 @@ async function confirmDialog() {
                 <n-button size="tiny" quaternary @click="openRename">
                   <template #icon><n-icon :component="CreateOutline" /></template>重命名
                 </n-button>
-                <n-popconfirm v-if="active.has_default && activePreset?.is_builtin" @positive-click="resetToDefault">
+                <n-popconfirm v-if="active.has_default && activePreset?.id === 'default'" @positive-click="resetToDefault">
                   <template #trigger>
                     <n-button size="tiny" quaternary>
                       <template #icon><n-icon :component="RefreshOutline" /></template>恢复默认
@@ -242,7 +242,7 @@ async function confirmDialog() {
                   </template>
                   恢复内置默认方案？当前编辑内容将被覆盖。
                 </n-popconfirm>
-                <n-popconfirm v-if="presets.length > 1" @positive-click="removePreset(activePreset)">
+                <n-popconfirm v-if="presets.length > 1 && !activePreset?.is_builtin" @positive-click="removePreset(activePreset)">
                   <template #trigger>
                     <n-button size="tiny" quaternary type="error">
                       <template #icon><n-icon :component="TrashOutline" /></template>删除

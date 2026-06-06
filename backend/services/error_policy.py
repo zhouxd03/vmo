@@ -36,6 +36,7 @@ _FATAL_KEYS = (
     "permission", "forbidden", "insufficient_quota", "insufficient quota",
     "insufficient_balance", "insufficient balance", "exceeded your current quota",
     "insufficient_user_quota", "quota", "billing", "no balance", "out of credit", "account",
+    "token不足", "token 不足", "insufficient token", "insufficient tokens",
     "密钥", "鉴权", "未授权", "无权限", "额度", "余额", "欠费", "配额",
 )
 _TRANSIENT_KEYS = (
@@ -106,7 +107,9 @@ def classify(exc: Exception) -> dict:
     text = _text_of(exc)
 
     # 1) hard network-layer exceptions → always transient
-    if isinstance(exc, (http.Timeout, http.ConnectionError)):
+    if "seedance_timeout" in text:
+        category = "transient"
+    elif isinstance(exc, (http.Timeout, http.ConnectionError)):
         category = "transient"
     else:
         # 2) keyword wins over status (a 400 can be a content rejection)
@@ -150,8 +153,12 @@ _CATEGORY_LABEL = {
 
 def _friendly_message(category: str, code: str, detail: str) -> str:
     text = " ".join(str(x or "") for x in (code, detail)).lower()
-    if _match(text, _FATAL_KEYS) and any(k in text for k in ("quota", "balance", "余额", "额度")):
-        return "[额度不足] 视频服务预扣费失败或账户余额不足；请充值/更换视频凭据后重试。"
+    if "seedance_timeout" in text:
+        return "[Seedance 排队超时] 上游任务一直处于待处理，软件已停止等待；这不是 token/余额不足。请稍后重试，或切换到 Seedance 网页端接口后重新提交。"
+    if "unbound_reference_tags" in text:
+        return "[图生视频引用未绑定] 视频提示词里仍有未随请求上传的 @对象；请调高「总参考图上限」或删除对应引用后重试。"
+    if _match(text, _FATAL_KEYS) and any(k in text for k in ("quota", "balance", "token不足", "insufficient token", "余额", "额度")):
+        return "[额度不足] 视频服务 token/余额不足；请充值/更换视频凭据后重试。"
     if "missing_video_url" in text:
         return "[视频结果链接缺失] 上游显示生成完成，但没有返回可下载视频链接；已停止等待，请查看错误详情中的原始返回。"
     if _match(text, _PARAM_KEYS):

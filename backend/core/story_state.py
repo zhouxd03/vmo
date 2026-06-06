@@ -158,6 +158,26 @@ def set_director_board(pid: str, shot_no: str, filename: str) -> dict:
     return _update_shot_field(pid, shot_no, "director_board", filename)
 
 
+def clear_episode(pid: str, episode_no: int) -> dict:
+    """Drop cached continuity decisions/images for one episode's shot numbers.
+
+    Re-analysis/re-decomposition reuses shot numbers such as S01-C001. Keeping
+    old continuity snapshots would make the new shots inherit stale staging /
+    director / tail-frame decisions, so clear by episode prefix.
+    """
+    prefix = f"S{int(episode_no):02d}-"
+    with continuity_lock(pid):
+        st = get_state(pid)
+        shots = st.get("shots") or {}
+        st["shots"] = {
+            no: snap for no, snap in shots.items()
+            if not str(no).startswith(prefix)
+        }
+        if str((st.get("current") or {}).get("shot_no") or "").startswith(prefix):
+            st["current"] = _empty_current()
+        return _save(pid, st)
+
+
 def reset(pid: str) -> dict:
     with continuity_lock(pid):
         st = {"pid": pid, "current": _empty_current(), "shots": {}, "updated_at": time.time()}

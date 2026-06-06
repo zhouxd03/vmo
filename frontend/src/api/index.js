@@ -1,12 +1,35 @@
 // Thin fetch wrapper around the Flask JSON API.
+const DEFAULT_TIMEOUT_MS = 30_000
+const HEALTH_TIMEOUT_MS = 4_000
 
-async function req(method, path, body) {
+function apiError(message, detail = {}) {
+  const err = new Error(message)
+  Object.assign(err, detail)
+  return err
+}
+
+async function fetchWithTimeout(path, opts = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(path, { ...opts, signal: controller.signal })
+  } catch (e) {
+    if (e?.name === 'AbortError') {
+      throw apiError('请求超时，后端可能繁忙或未响应', { code: 'timeout', path })
+    }
+    throw apiError('无法连接后端服务，请确认软件后端仍在运行', { code: 'connection', path, cause: e })
+  } finally {
+    window.clearTimeout(timer)
+  }
+}
+
+async function req(method, path, body, options = {}) {
   const opts = { method, headers: {} }
   if (body !== undefined) {
     opts.headers['Content-Type'] = 'application/json'
     opts.body = JSON.stringify(body)
   }
-  const resp = await fetch(path, opts)
+  const resp = await fetchWithTimeout(path, opts, options.timeoutMs)
   const text = await resp.text()
   let data
   try {
@@ -15,7 +38,7 @@ async function req(method, path, body) {
     data = { error: text }
   }
   if (!resp.ok) {
-    throw new Error(data.error || `HTTP ${resp.status}`)
+    throw apiError(data.error || `HTTP ${resp.status}`, { code: 'http', status: resp.status, path, data })
   }
   return data
 }
@@ -28,11 +51,11 @@ async function downloadBlob(method, path, body) {
     opts.headers['Content-Type'] = 'application/json'
     opts.body = JSON.stringify(body)
   }
-  const resp = await fetch(path, opts)
+  const resp = await fetchWithTimeout(path, opts, DEFAULT_TIMEOUT_MS)
   if (!resp.ok) {
     let msg = `HTTP ${resp.status}`
     try { msg = (await resp.json()).error || msg } catch { /* ignore */ }
-    throw new Error(msg)
+    throw apiError(msg, { code: 'http', status: resp.status, path })
   }
   const blob = await resp.blob()
   const dispo = resp.headers.get('Content-Disposition') || ''
@@ -55,11 +78,11 @@ async function downloadBlob(method, path, body) {
 
 // POST a multipart/form-data body (file upload). Returns parsed JSON.
 async function upload(path, formData) {
-  const resp = await fetch(path, { method: 'POST', body: formData })
+  const resp = await fetchWithTimeout(path, { method: 'POST', body: formData }, DEFAULT_TIMEOUT_MS)
   const text = await resp.text()
   let data
   try { data = text ? JSON.parse(text) : {} } catch { data = { error: text } }
-  if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)
+  if (!resp.ok) throw apiError(data.error || `HTTP ${resp.status}`, { code: 'http', status: resp.status, path, data })
   return data
 }
 
@@ -68,7 +91,7 @@ export const api = {
   post: (p, b) => req('POST', p, b),
   del: (p) => req('DELETE', p),
 
-  health: () => req('GET', '/api/health'),
+  health: () => req('GET', '/api/health', undefined, { timeoutMs: HEALTH_TIMEOUT_MS }),
   logs: (sinceId = 0) => req('GET', `/api/logs?since_id=${sinceId}`),
   exportLogs: () => downloadBlob('GET', '/api/logs/export'),
   clearLogs: () => req('POST', '/api/logs/clear'),
@@ -81,6 +104,7 @@ export const api = {
   deleteCredential: (category, id) => req('DELETE', `/api/credentials/${category}/${id}`),
   setDefaultCredential: (category, id) => req('POST', `/api/credentials/${category}/${id}/default`),
   testCredential: (category, body) => req('POST', `/api/credentials/${category}/test`, body),
+  credentialUserInfo: (category, body) => req('POST', `/api/credentials/${category}/user-info`, body),
   credentialModels: (category, body) => req('POST', `/api/credentials/${category}/models`, body),
   llmModels: (body) => req('POST', '/api/llm/models', body),
 
@@ -107,17 +131,21 @@ export const api = {
 
   // assets (Phase 3)
   listAssets: (pid) => req('GET', `/api/projects/${pid}/assets`),
+  listAssetLibrary: (excludeProjectId) => req('GET', `/api/assets/library${excludeProjectId ? `?exclude_project=${encodeURIComponent(excludeProjectId)}` : ''}`),
   addAsset: (pid, body) => req('POST', `/api/projects/${pid}/assets`, body),
   updateAsset: (pid, aid, body) => req('POST', `/api/projects/${pid}/assets/${aid}`, body),
   deleteAsset: (pid, aid) => req('DELETE', `/api/projects/${pid}/assets/${aid}`),
   seedAssets: (pid) => req('POST', `/api/projects/${pid}/assets/seed`),
   genAssetRefImage: (pid, aid, body) => req('POST', `/api/projects/${pid}/assets/${aid}/refimage`, body),
+  startAssetRefImage: (pid, aid, body) => req('POST', `/api/projects/${pid}/assets/${aid}/refimage/start`, body),
   genMissingAssets: (pid, body) => req('POST', `/api/projects/${pid}/assets/generate-missing`, body || {}),
+  startMissingAssets: (pid, body) => req('POST', `/api/projects/${pid}/assets/generate-missing/start`, body || {}),
   importAssetImage: (pid, aid, file) => {
     const fd = new FormData()
     fd.append('file', file)
     return upload(`/api/projects/${pid}/assets/${aid}/import-image`, fd)
   },
+  importAssetFromLibrary: (pid, aid, body) => req('POST', `/api/projects/${pid}/assets/${aid}/import-library`, body),
   assetImageUrl: (pid, filename) => `/api/projects/${pid}/asset-image/${filename}`,
   resolveMentions: (pid, text) => req('POST', `/api/projects/${pid}/resolve`, { text }),
 

@@ -72,17 +72,90 @@ def _is_long_take(shot: dict) -> bool:
 
 
 _DIRECTOR_FIGHT_KW = (
-    "打斗", "战斗", "搏斗", "追逐", "追击", "枪战", "刀战", "爆炸", "冲突", "混战", "群战",
+    "打斗", "战斗", "搏斗", "追逐", "追击", "枪战", "刀战", "爆炸", "混战", "群战",
     "fight", "battle", "combat", "chase", "explosion",
 )
 _DIRECTOR_CAMERA_KW = (
-    "复杂运镜", "长镜头", "环绕", "绕拍", "跟拍", "推拉摇移", "快速切换", "多机位", "俯冲", "旋转",
-    "穿梭", "大幅调度", "复杂调度", "one take", "long take", "tracking", "orbit", "dolly", "crane",
+    "复杂运镜", "一镜到底", "环绕", "绕拍", "推拉摇移", "快速切换", "多机位",
+    "穿梭", "大幅调度", "复杂调度", "one take", "oner", "orbit", "crane shot",
 )
 _DIRECTOR_PLOT_KW = (
-    "复杂剧情", "多线", "反转", "关键转折", "信息量", "仪式", "审判", "谈判", "多人对峙", "群像",
-    "多人物", "调度复杂", "空间关系复杂", "关键动作", "关键画面",
+    "复杂剧情", "多线并行", "关键反转", "关键转折", "信息量爆发", "审判", "多人谈判", "多人对峙", "群像调度",
+    "调度复杂", "空间关系复杂",
 )
+_DIRECTOR_BLOCKING_KW = (
+    "多人调度", "群体调度", "交叉运动", "同时发生", "多层动作", "多组人物",
+    "复杂站位", "复杂遮挡", "动作路线交叉", "调度路线", "关键道具转移",
+)
+_DIRECTOR_WEAK_KW = (
+    "长镜头", "跟拍", "俯冲", "旋转", "tracking", "dolly", "crane",
+    "冲突", "仪式", "谈判", "多人物", "关键动作", "关键画面",
+    "前后景", "纵深", "遮挡关系", "运动路径", "动作路线",
+)
+
+
+def director_board_evidence(shot: dict) -> dict:
+    """Return auditable evidence for deciding whether a director board is needed.
+
+    The threshold is intentionally conservative. A simple turn, close-up, or
+    angle change should not become a director-board shot just because it mentions
+    camera direction or eyeline.
+    """
+    shot = shot or {}
+    text = " ".join(str(shot.get(k, "") or "") for k in ("scene", "action", "camera", "handoff", "dialogue"))
+    lowered = text.lower()
+    chars = _names(shot.get("characters"))
+    props = _names(shot.get("props"))
+    dialogue = str(shot.get("dialogue", "") or "").strip()
+    action = str(shot.get("action", "") or "").strip()
+    camera = str(shot.get("camera", "") or "").strip()
+
+    strong = []
+    for label, kws in (
+        ("动作强信号", _DIRECTOR_FIGHT_KW),
+        ("复杂运镜强信号", _DIRECTOR_CAMERA_KW),
+        ("剧情/调度强信号", _DIRECTOR_PLOT_KW),
+        ("复杂站位强信号", _DIRECTOR_BLOCKING_KW),
+    ):
+        hits = [kw for kw in kws if kw.lower() in lowered]
+        if hits:
+            strong.append({"type": label, "hits": hits[:4]})
+
+    weak_hits = [kw for kw in _DIRECTOR_WEAK_KW if kw.lower() in lowered]
+    spatial_hits = [kw for kw in _STAGING_SPATIAL_KW if kw.lower() in lowered]
+    factors = []
+    if len(chars) >= 5:
+        factors.append(f"显性角色数={len(chars)}")
+    if len(chars) >= 4 and (weak_hits or len(props) >= 1 or len(action) >= 80):
+        factors.append(f"四人以上且存在调度/道具/长动作：角色{len(chars)}，道具{len(props)}，动作{len(action)}字")
+    if len(chars) >= 3 and len(props) >= 2 and (weak_hits or len(action) >= 80):
+        factors.append(f"三人以上+多道具+动作负担：角色{len(chars)}，道具{len(props)}")
+    if len(chars) >= 3 and dialogue and len(action) >= 100 and weak_hits:
+        factors.append("三人以上且台词/动作同时承载")
+    if len(chars) >= 3 and camera and len(spatial_hits) >= 3 and weak_hits:
+        factors.append(f"三人以上+机位+多空间关系：{', '.join(spatial_hits[:4])}")
+
+    score = len(strong) * 3 + len(factors) * 2
+    sufficient = bool(strong or factors)
+    if sufficient:
+        verdict = "证据足够：启用导演图"
+    else:
+        verdict = "证据不足：不启用导演图"
+    summary_parts = []
+    if strong:
+        summary_parts.extend(f"{s['type']}({ '、'.join(s['hits']) })" for s in strong[:2])
+    if factors:
+        summary_parts.extend(factors[:2])
+    return {
+        "sufficient": sufficient,
+        "score": score,
+        "strong_signals": strong,
+        "weak_signals": weak_hits[:8],
+        "spatial_signals": spatial_hits[:8],
+        "count_factors": factors,
+        "verdict": verdict,
+        "summary": "；".join(summary_parts) if summary_parts else "未发现打斗、复杂运镜、多人调度或关键转折等足够证据",
+    }
 
 
 def needs_director_board(shot: dict) -> bool:
@@ -92,17 +165,7 @@ def needs_director_board(shot: dict) -> bool:
     reserved for fights, complex camera movement, complex plot beats, or dense
     multi-character blocking.
     """
-    text = " ".join(str(shot.get(k, "") or "") for k in ("scene", "action", "camera", "handoff", "dialogue"))
-    lowered = text.lower()
-    if any(kw.lower() in lowered for kw in _DIRECTOR_FIGHT_KW):
-        return True
-    if any(kw.lower() in lowered for kw in _DIRECTOR_CAMERA_KW):
-        return True
-    if any(kw.lower() in lowered for kw in _DIRECTOR_PLOT_KW):
-        return True
-    chars = _names(shot.get("characters"))
-    props = _names(shot.get("props"))
-    return len(chars) >= 4 or (len(chars) >= 3 and len(props) >= 2)
+    return director_board_evidence(shot).get("sufficient", False)
 
 
 _STAGING_SPATIAL_KW = (
@@ -137,17 +200,45 @@ def _needs_staging(shot: dict, prev_state: dict, *, scene_cut: bool, overlap: bo
 
 
 def enforce_director_policy(decision: dict, shot: dict) -> dict:
-    if not decision.get("use_director_board") or needs_director_board(shot):
+    source = str((decision or {}).get("source") or "").lower()
+    if source == "manual":
+        return decision
+    evidence = director_board_evidence(shot)
+    complex_shot = bool(evidence.get("sufficient"))
+    if complex_shot and not decision.get("use_director_board") and not decision.get("use_tail_frame"):
+        out = {
+            **decision,
+            "scene_cut": False,
+            "use_staging": False,
+            "use_director_board": True,
+            "prefer_cut": True,
+            "long_take": False,
+            "strategy": "director_board",
+            "director_evidence": evidence,
+            "reason": (
+                f"策略判定为复杂镜头，证据：{evidence.get('summary', '')}；自动使用导演图统一构图、运动路径与人物调度；"
+                f"原判定: {decision.get('reason', '')}"
+            ),
+        }
+        return out
+    if not decision.get("use_director_board") or complex_shot:
+        if decision.get("use_director_board"):
+            reason = str(decision.get("reason") or "")
+            summary = str(evidence.get("summary") or "")
+            if summary and "证据" not in reason:
+                reason = f"{reason}｜导演图证据：{summary}" if reason else f"导演图证据：{summary}"
+            decision = {**decision, "director_evidence": evidence, "reason": reason}
         return decision
     scene_cut = bool(decision.get("scene_cut"))
     use_staging = False if scene_cut else bool(decision.get("use_staging"))
     out = {
         **decision,
         "use_director_board": False,
+        "director_evidence": evidence,
         "use_staging": use_staging,
         "strategy": "staging" if use_staging else "scene_cut",
         "reason": (
-            "导演图仅用于打斗/复杂运镜/复杂剧情等复杂画面；"
+            f"导演图证据不足（{evidence.get('summary', '')}）；"
             + ("本镜保留站位图辅助空间关系。" if use_staging else "本镜改为普通切镜头/景别切换。")
             + f"原判定: {decision.get('reason', '')}"
         ),
@@ -182,6 +273,10 @@ def normalize_decision(decision: dict, rule: dict | None = None) -> dict:
     out.setdefault("prefer_cut", not out.get("use_tail_frame"))
     out["camera_hint"] = str(out.get("camera_hint") or rule.get("camera_hint") or "").strip()
     out["reason"] = str(out.get("reason") or rule.get("reason") or "").strip()
+    if isinstance(out.get("director_evidence"), dict):
+        pass
+    elif isinstance(rule.get("director_evidence"), dict):
+        out["director_evidence"] = rule["director_evidence"]
     if out.get("use_tail_frame"):
         out["strategy"] = "tail_frame"
     elif out.get("use_director_board"):
@@ -210,6 +305,7 @@ def build_bridge_data(decision: dict, shot: dict, prev_state: dict) -> dict:
     camera = (shot.get("camera") or "").strip() or "(unset camera)"
     handoff = (shot.get("handoff") or "").strip()
     hint = (decision.get("camera_hint") or "").strip()
+    director_evidence = decision.get("director_evidence") if isinstance(decision.get("director_evidence"), dict) else {}
 
     if decision.get("use_tail_frame"):
         strategy_key = "tail_frame"
@@ -251,6 +347,7 @@ def build_bridge_data(decision: dict, shot: dict, prev_state: dict) -> dict:
         "carry": carry,
         "avoid": avoid,
         "camera_hint": hint,
+        "director_evidence": director_evidence,
         "next_variable": handoff,
         "selected_refs": {
             "tail_frame": bool(decision.get("use_tail_frame")),
@@ -268,6 +365,7 @@ def render_bridge_context(bridge_data: dict, *, purpose: str = "full") -> str:
     avoid = [str(x).strip() for x in (data.get("avoid") or []) if str(x).strip()]
     strategy = data.get("strategy") or ""
     camera_hint = data.get("camera_hint") or ""
+    director_evidence = data.get("director_evidence") if isinstance(data.get("director_evidence"), dict) else {}
     next_var = data.get("next_variable") or ""
 
     if purpose == "video":
@@ -276,6 +374,8 @@ def render_bridge_context(bridge_data: dict, *, purpose: str = "full") -> str:
             lines.append(f"承接重点：{'、'.join(carry[:4])}")
         if camera_hint:
             lines.append(f"镜头提示：{camera_hint}")
+        if data.get("strategy_key") == "director_board" and director_evidence:
+            lines.append(f"导演图证据：{director_evidence.get('summary') or director_evidence.get('verdict') or ''}")
         if next_var:
             lines.append(f"本镜收尾变量：{next_var}")
         return "；".join(lines)
@@ -296,6 +396,8 @@ def render_bridge_context(bridge_data: dict, *, purpose: str = "full") -> str:
         ]
         if camera_hint:
             lines.append(f"镜头提示：{camera_hint}")
+        if director_evidence:
+            lines.append(f"启用证据：{director_evidence.get('summary') or director_evidence.get('verdict') or ''}")
         if avoid:
             lines.append(f"禁止：{'、'.join(avoid[:2])}")
         return "\n".join(x for x in lines if x)
@@ -323,6 +425,8 @@ def render_bridge_context(bridge_data: dict, *, purpose: str = "full") -> str:
         lines.append(f"禁止误用：{'、'.join(avoid)}")
     if camera_hint:
         lines.append(f"镜头提示：{camera_hint}")
+    if data.get("strategy_key") == "director_board" and director_evidence:
+        lines.append(f"导演图证据：{director_evidence.get('summary') or director_evidence.get('verdict') or ''}")
     if next_var:
         lines.append(f"本镜交给下一镜的收尾变量：{next_var}")
     return "\n".join(x for x in lines if x)
@@ -365,7 +469,8 @@ def decide_handoff_rule(shot: dict, prev_state: dict) -> dict:
     long_take = _is_long_take(shot)
     # 默认不承接尾帧；只有「同场景 + 有尾帧 + 明确长镜头」才承接
     use_tail = (not scene_cut) and has_tail and long_take
-    use_director = bool(needs_director_board(shot) and not use_tail)
+    director_evidence = director_board_evidence(shot)
+    use_director = bool(director_evidence.get("sufficient") and not use_tail)
     use_staging = (not use_director) and _needs_staging(
         shot, prev_state, scene_cut=scene_cut, overlap=overlap)
     prefer_cut = has_prev and not use_tail  # 用切镜头/景别切换衔接
@@ -380,7 +485,7 @@ def decide_handoff_rule(shot: dict, prev_state: dict) -> dict:
         reason = "必须连续的长镜头：承接上一镜尾帧，运动与构图自然延续、不跳切"
         camera_hint = "长镜头连续承接上一镜，运动、构图与光线自然延续，避免跳切。"
     elif use_director:
-        reason = "本镜涉及复杂动作/运镜/多人调度，需要导演图先统一构图、运动路径与调度重点。"
+        reason = f"导演图证据足够：{director_evidence.get('summary', '')}；需要先统一构图、运动路径与调度重点。"
         camera_hint = "以导演图作为构图蓝本：先建立动作路线和人物层次，再按本镜景别推进剧情重点。"
     else:
         who = "、".join(sorted(prev_chars & cur_chars))
@@ -399,6 +504,7 @@ def decide_handoff_rule(shot: dict, prev_state: dict) -> dict:
         "prefer_cut": prefer_cut,
         "camera_hint": camera_hint,
         "reason": reason,
+        "director_evidence": director_evidence,
         "source": "rule",
     }
 
@@ -556,8 +662,8 @@ def _shot_asset_refs(pid: str, shot: dict, assets: Optional[list]) -> list:
     return [it["b64"] for it in reference_set.cap(items, _max_refs())]
 
 
-def _scene_aerial_ref(pid: str, shot: dict, assets: Optional[list]) -> Optional[str]:
-    """Use a scene aerial image as the staging diagram base map only.
+def _scene_reference_ref(pid: str, shot: dict, assets: Optional[list]) -> Optional[str]:
+    """Use the matched scene reference image as the staging diagram context.
 
     It is intentionally not returned by video reference assembly, so it will not
     receive an @图N number or be uploaded as a standalone video reference.
@@ -572,7 +678,7 @@ def _scene_aerial_ref(pid: str, shot: dict, assets: Optional[list]) -> Optional[
             continue
         if str(asset.get("name") or "").strip() != scene:
             continue
-        fn = asset.get("aerial_image")
+        fn = asset.get("ref_image")
         if not fn:
             return None
         path = PROJECTS_DIR / pid / "assets" / fn
@@ -587,7 +693,7 @@ def generate_staging(pid: str, shot: dict, prev_state: dict, *,
                      size: str = "1024x1024", assets: Optional[list] = None,
                      bridge_context: str = "") -> dict:
     body = tpl.get_template_body("staging_diagram")
-    aerial = _scene_aerial_ref(pid, shot, assets)
+    scene_ref = _scene_reference_ref(pid, shot, assets)
     prompt = tpl.render(body, {
         "style": style,
         "scene": shot.get("scene", ""),
@@ -596,18 +702,18 @@ def generate_staging(pid: str, shot: dict, prev_state: dict, *,
         "bridge_context": bridge_context or build_bridge_context({}, shot, prev_state, purpose="staging"),
         "props": "、".join(sorted(_names(shot.get("props")))) or "（无）",
     })
-    if aerial:
-        prompt += "\n\n参考图说明：随附的场景鸟瞰图仅作为站位图底图/空间坐标参考，请在其空间关系上绘制本镜角色站位、视线方向、移动箭头与关键道具位置；不要把鸟瞰图当作最终视频画面风格或单独背景图。"
-    timeout = int(settings_store.load_settings().get("image_timeout", 180) or 180)
+    if scene_ref:
+        prompt += "\n\n参考图说明：随附的场景参考图仅作为站位图的场景空间、建筑/陈设位置、材质与气氛参考；请基于该场景提炼本镜角色站位、视线方向、移动箭头与关键道具位置，不要生成鸟瞰底图，不要照抄参考图视角。"
+    timeout = int(settings_store.load_settings().get("image_timeout", 300) or 300)
     logger.info(
         "[Continuity] %s generating staging image: size=%s timeout=%ss",
         shot.get("shot_no", "shot"), size, timeout,
     )
     ref_images = []
-    if aerial:
-        ref_images.append(aerial)
+    if scene_ref:
+        ref_images.append(scene_ref)
         logger.info(
-            "[Continuity] %s staging uses scene aerial image as base map",
+            "[Continuity] %s staging uses scene reference image as context",
             shot.get("shot_no", "shot"),
         )
     prev_staging = _read_b64(pid, (prev_state or {}).get("staging_image"))
@@ -645,7 +751,7 @@ def generate_director_board(pid: str, shot: dict, prev_state: dict, *,
         "bridge_context": bridge_context or build_bridge_context({}, shot, prev_state, purpose="director"),
         "action": shot.get("action", ""),
     })
-    timeout = int(settings_store.load_settings().get("image_timeout", 180) or 180)
+    timeout = int(settings_store.load_settings().get("image_timeout", 300) or 300)
     logger.info(
         "[Continuity] %s generating director board: size=%s timeout=%ss",
         shot.get("shot_no", "shot"), size, timeout,

@@ -7,7 +7,7 @@ DEFAULTS = {
     # generation defaults
     "image_size": "1024x1024",
     "image_quality": "auto",
-    "image_timeout": 180,
+    "image_timeout": 300,
     "video_aspect_ratio": "16:9",
     "video_resolution": "720p",
     "video_duration": 10,

@@ -196,6 +196,14 @@ def _norm_refs(text: str, asset_list: list) -> str:
     return _STRAY_TAG_RE.sub("@", t)
 
 
+def _dialogue_text(task: dict) -> str:
+    """Dialogue speaker labels are audio metadata, not image-reference anchors."""
+    text = (task.get("dialogue_ref") or task.get("dialogue") or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"(?<=对白)@(?=[\w\u4e00-\u9fff])", "", text)
+
+
 _CONSISTENCY_GUARD = (
     "镜头运动自然流畅、画面无跳帧；保持人物外形、服装、场景与道具形制和参考图严格一致；"
     "物体保持刚性不变形/不融化，手与道具咬合自然，人物不随镜头平移滑步，重力方向真实；"
@@ -340,7 +348,7 @@ def _video_dynamics(task: dict) -> str:
     if ho:
         join.append(f"本镜收尾：{ho}")
     lines.append("｜".join(join))
-    dlg = (task.get("dialogue_ref") or task.get("dialogue") or "").strip()
+    dlg = _dialogue_text(task)
     if dlg:
         voice_note = "声画同步，不出字幕"
         if re.search(r"内心|心声|OS|os|吐槽", dlg):
@@ -390,7 +398,7 @@ def _video_prompt_vars(task: dict, image_prompt: str,
         "action": _ff_action(task),
         "emotion": (task.get("emotion") or "").strip(),
         "duration": dur,
-        "dialogue": (task.get("dialogue_ref") or task.get("dialogue") or "").strip(),
+        "dialogue": _dialogue_text(task),
         "scene": _ff_scene(task),
         "characters": _ff_chars(task),
         "props": "?".join(task.get("props", []) or []),
@@ -527,8 +535,6 @@ def _ref_preview_url(pid: Optional[str], item: dict) -> str:
     if item.get("asset_id"):
         try:
             asset = {a.get("id"): a for a in assets_core.list_assets(pid)}.get(item.get("asset_id")) or {}
-            if item.get("role") == "scene_aerial" and asset.get("aerial_image"):
-                return f"/api/projects/{pid}/asset-image/{asset.get('aerial_image')}"
             if asset.get("ref_image"):
                 return f"/api/projects/{pid}/asset-image/{asset.get('ref_image')}"
         except Exception:  # noqa: BLE001
@@ -673,7 +679,7 @@ def infer_shot_prompt(project: dict, shot_no, *, model: Optional[str] = None) ->
         "props": "、".join(target.get("props", []) or []),
         "action": _ff_action(target),
         "emotion": (target.get("emotion") or "").strip(),
-        "dialogue": (target.get("dialogue_ref") or target.get("dialogue") or "").strip(),
+        "dialogue": _dialogue_text(target),
         "prev_handoff": prev_ho or "（本镜为首镜，无上文）",
         "bridge_context": (
             continuity.render_bridge_context(target.get("_bridge_data") or {}, purpose="infer").strip()
@@ -739,6 +745,30 @@ def _shot_duration(task: dict, params: dict) -> int:
     except (TypeError, ValueError):
         d = 10
     return max(1, min(15, d))
+
+
+def _video_timeout(params: dict) -> int:
+    raw = (
+        params.get("timeout")
+        or params.get("video_timeout")
+        or params.get("poll_timeout")
+        or settings_store.load_settings().get("video_timeout", 300)
+        or 300
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 300
+    return max(60, min(3600, value))
+
+
+def _video_poll_interval(params: dict) -> int:
+    raw = params.get("poll_interval") or params.get("video_poll_interval") or 10
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 10
+    return max(10, min(60, value))
 
 
 # Reference-image assembly: asset materials to priority-capped base64
@@ -949,10 +979,10 @@ def _generate_video_with_refs(pid: str, batch: dict, task: dict, params: dict,
         for idx, it in enumerate(kept)
     ]
     logger.info(
-        "[Video][Request] build batch=%s task=%s shot=%s refs=%s ref_meta=%s prompt_chars=%s duration=%s aspect=%s resolution=%s",
+        "[Video][Request] build batch=%s task=%s shot=%s refs=%s ref_meta=%s prompt_chars=%s duration=%s aspect=%s resolution=%s timeout=%s poll_interval=%s",
         batch.get("id"), task.get("id"), task.get("shot_no") or filename_prefix,
         len(refs), ref_meta, len(prompt or ""), _shot_duration(task, params),
-        aspect_ratio, resolution,
+        aspect_ratio, resolution, _video_timeout(params), _video_poll_interval(params),
     )
     try:
         batches.update_task(pid, batch["id"], task["id"], {
@@ -1008,6 +1038,8 @@ def _generate_video_with_refs(pid: str, batch: dict, task: dict, params: dict,
         ref_images_b64=refs,
         save_dir=_out_dir(pid, batch["id"]),
         filename_prefix=filename_prefix,
+        timeout=_video_timeout(params),
+        poll_interval=_video_poll_interval(params),
         generate_audio=bool(params.get("generate_audio", False)),
         watermark=bool(params.get("watermark", False)),
         on_stage=stage_cb,
@@ -1137,32 +1169,6 @@ def _gen_video_task_continuity(pid, batch, task, params):
         use_llm = bool(params.get("decision_llm", True))
         decision = continuity.decide_handoff(shot, prev_state, use_llm=use_llm,
                                              model=params.get("llm_model"))
-    director_board_only = bool(params.get("director_board_only"))
-    if director_board_only:
-        if continuity.needs_director_board(shot):
-            decision = {
-                **decision,
-                "scene_cut": False,
-                "use_tail_frame": False,
-                "use_staging": False,
-                "use_director_board": True,
-                "prefer_cut": True,
-                "long_take": False,
-                "strategy": "director_board",
-                "reason": f"澶嶆潅闀滃ご瀵兼紨鍥炬ā寮忥細鎵撴枟/澶嶆潅杩愰暅/澶嶆潅鍓ф儏浣跨敤鏈暅瀵兼紨鍥撅綔鍘熷垽: {decision.get('reason', '')}",
-            }
-        else:
-            decision = {
-                **decision,
-                "scene_cut": False,
-                "use_tail_frame": False,
-                "use_staging": True,
-                "use_director_board": False,
-                "prefer_cut": True,
-                "long_take": False,
-                "strategy": "staging",
-                "reason": f"闈炲鏉傞暅澶翠笉浣跨敤瀵兼紨鍥撅紝鏀圭敤绔欎綅鍥?璧勪骇鍥撅綔鍘熷垽: {decision.get('reason', '')}",
-            }
     decision = continuity.ensure_bridge_context(
         continuity.enforce_director_policy(decision, shot), shot, prev_state)
     decision = _reconcile_tail_decision(decision, task)

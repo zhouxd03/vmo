@@ -25,11 +25,16 @@ _STRUCTURED_SHOT_HEADER_RE = re.compile(
 )
 _SHOT_PREFIX_RE = re.compile(r"^(?:镜头|分镜|画面|场景|旁白|字幕|第\d+|\d+[.、)\]】）])")
 # Fixed explicit separators override paragraph blank lines when the source
-# text has its own empty-line formatting. The project uses only two canonical
-# markers:
-#   - <<<分镜标记>>>  (shot boundary)
-#   - <<<分集标记>>>  (episode boundary)
-_EXPLICIT_SPLIT_RE = re.compile(r"(?:^|\n)\s*(?:<<<\s*分镜标记\s*>>>|<<<\s*分集标记\s*>>>)\s*(?:\n|$)")
+# text has its own empty-line formatting. Numbered markers make source mapping
+# deterministic after decomposition:
+#   - <<<分镜标记>>> / <<<分镜标记1>>> / <<<分镜标记 1>>>
+#   - <<<分集标记>>> / <<<分集标记1>>> / <<<分集标记 1>>>
+_EXPLICIT_MARKER_LINE_RE = re.compile(
+    r"^\s*<<<\s*(分镜标记|分集标记)\s*(\d+)?\s*>>>\s*$"
+)
+_EXPLICIT_SPLIT_RE = re.compile(
+    r"(?:^|\n)\s*<<<\s*(?:分镜标记|分集标记)\s*\d*\s*>>>\s*(?:\n|$)"
+)
 
 
 def _strip_markup(line: str) -> str:
@@ -88,13 +93,51 @@ def _split_by_explicit_markers(text: str) -> list[str]:
     return [p.strip() for p in parts if p and p.strip()]
 
 
+def _split_explicit_marker_segments(text: str) -> list[dict[str, Any]]:
+    """Return blocks cut by explicit markers, preserving marker metadata."""
+    blocks: list[dict[str, Any]] = []
+    buf: list[str] = []
+    current_type: str | None = None
+    current_no: int | None = None
+    current_episode: int | None = None
+
+    def flush() -> None:
+        nonlocal buf
+        block_text = "\n".join(buf).strip()
+        if not block_text:
+            buf = []
+            return
+        blocks.append({
+            "text": block_text,
+            "marker_type": current_type,
+            "marker_no": current_no,
+            "episode_marker": current_episode,
+        })
+        buf = []
+
+    for raw in (text or "").splitlines():
+        m = _EXPLICIT_MARKER_LINE_RE.match(raw)
+        if m:
+            flush()
+            label, no_raw = m.groups()
+            no = int(no_raw) if no_raw else None
+            current_type = "shot" if label == "分镜标记" else "episode"
+            current_no = no
+            if current_type == "episode":
+                current_episode = no
+            continue
+        buf.append(raw.rstrip())
+    flush()
+    return [b for b in blocks if b.get("text")]
+
+
 def _parse_txt(text: str) -> list[str]:
     norm = _normalize(text)
     structured = _split_structured(norm)
     if len(structured) > 1:
         return structured
     explicit = _split_by_explicit_markers(norm)
-    if len(explicit) > 1:
+    if explicit and has_explicit_markers(norm):
         return explicit
     blocks = [b.strip() for b in norm.split("\n\n") if b.strip()]
     if len(blocks) > 1:
@@ -113,6 +156,28 @@ def _parse_txt(text: str) -> list[str]:
     if buf:
         merged.append(" ".join(buf).strip())
     return [m for m in merged if m]
+
+
+def _parse_txt_segments(text: str) -> list[dict[str, Any]]:
+    norm = _normalize(text)
+    explicit = _split_explicit_marker_segments(norm)
+    if explicit and has_explicit_markers(norm):
+        segments: list[dict[str, Any]] = []
+        for i, block in enumerate(explicit):
+            if _is_placeholder(block.get("text", "")):
+                continue
+            seg = {"seq": len(segments) + 1, "text": block["text"]}
+            for key in ("marker_type", "marker_no", "episode_marker"):
+                if block.get(key) is not None:
+                    seg[key] = block[key]
+            segments.append(seg)
+        return segments
+    raw = [b for b in _parse_txt(text) if not _is_placeholder(b)]
+    return [{"seq": i + 1, "text": b} for i, b in enumerate(raw)]
+
+
+def has_explicit_markers(text: str) -> bool:
+    return bool(_EXPLICIT_SPLIT_RE.search(_normalize(text or "")))
 
 
 # ── SRT ──────────────────────────────────────────────────────────────────
@@ -160,8 +225,7 @@ def parse_script(text: str, file_type: str) -> dict[str, Any]:
         if not segments:  # fallback: treat as txt
             file_type = "txt"
     if file_type != "srt":
-        raw = [b for b in _parse_txt(text) if not _is_placeholder(b)]
-        segments = [{"seq": i + 1, "text": b} for i, b in enumerate(raw)]
+        segments = _parse_txt_segments(text)
         source_type = "txt"
     else:
         source_type = "srt"

@@ -31,9 +31,11 @@ TARGET_CHARS = 1440
 # 末集若小于该阈值则并回上一集，避免出现极短的尾集。
 MIN_TAIL_CHARS = 480
 
-# 集/章标记：第<数字>集|章|回|话|幕，或 EP/Episode/Chapter <数字>。
+# 集/章标记：<<<分集标记n>>>，第<数字>集|章|回|话|幕，或 EP/Episode/Chapter <数字>。
 _EP_HEADER_RE = re.compile(
     r"^\s*(?:"
+    r"<<<\s*分集标记\s*\d+\s*>>>"
+    r"|"
     r"第\s*[0-9〇零一二三四五六七八九十百千两]+\s*(?:集|章|回|话|幕)"
     r"|(?:ep|episode|chapter)\s*\.?\s*\d+"
     r")",
@@ -42,6 +44,7 @@ _EP_HEADER_RE = re.compile(
 # 集标题行一般较短（"第一集 弃子"）；过长的行更可能是把"第三回合…"写进正文的句子，
 # 不当作分集标记，避免误切。
 _EP_HEADER_MAX_LEN = 30
+_EXPLICIT_EP_MARKER_LINE_RE = re.compile(r"^\s*<<<\s*分集标记\s*(\d+)\s*>>>\s*$")
 
 
 def _first_line(text: str) -> str:
@@ -62,6 +65,43 @@ def _is_ep_header_line(line: str) -> bool:
 
 def _is_ep_header(seg_text: str) -> bool:
     return _is_ep_header_line(_first_line(seg_text))
+
+
+def _split_text_by_explicit_episode_markers(text: str) -> Optional[list[tuple[str, str]]]:
+    """Split only on the new exact <<<分集标记n>>> lines."""
+    lines = (text or "").split("\n")
+    hits: list[tuple[int, int]] = []
+    for i, ln in enumerate(lines):
+        m = _EXPLICIT_EP_MARKER_LINE_RE.match(ln)
+        if m:
+            hits.append((i, int(m.group(1))))
+    if len(hits) < 2:
+        return None
+    chunks: list[tuple[str, str]] = []
+    for k, (idx, no) in enumerate(hits):
+        end = hits[k + 1][0] if k + 1 < len(hits) else len(lines)
+        body = "\n".join(lines[idx + 1:end]).strip()
+        chunks.append((f"第{no}集", body))
+    preface = "\n".join(lines[:hits[0][0]]).strip()
+    if preface:
+        t0, b0 = chunks[0]
+        chunks[0] = (t0, (preface + "\n\n" + b0).strip() if b0 else preface)
+    return chunks
+
+
+def _is_ep_marker_segment(seg: dict) -> bool:
+    return seg.get("marker_type") == "episode" or _is_ep_header(seg.get("text", ""))
+
+
+def _episode_marker_name(seg: dict) -> str:
+    if seg.get("marker_type") == "episode" and seg.get("marker_no") is not None:
+        return f"第{seg.get('marker_no')}集"
+    return _first_line(seg.get("text", ""))
+
+
+def _episode_no_from_title(title: str, fallback: int) -> int:
+    m = re.search(r"第\s*(\d+)\s*集", title or "")
+    return int(m.group(1)) if m else fallback
 
 
 def _split_text_by_headers(text: str) -> Optional[list[tuple[str, str]]]:
@@ -93,10 +133,10 @@ def _split_by_markers(segments: list[dict]) -> list[tuple[Optional[str], list[di
     cur_name: Optional[str] = None
     cur: list[dict] = []
     for seg in segments:
-        if _is_ep_header(seg.get("text", "")):
+        if _is_ep_marker_segment(seg):
             if cur:
                 groups.append((cur_name, cur))
-            cur_name = _first_line(seg.get("text", ""))
+            cur_name = _episode_marker_name(seg)
             cur = [seg]
         else:
             cur.append(seg)
@@ -202,6 +242,9 @@ def _build_episode(name: str, segs: list[dict], source_type: str) -> dict:
         ns = {"seq": j, "text": s.get("text", "")}
         if s.get("time"):
             ns["time"] = s["time"]
+        for key in ("marker_type", "marker_no", "episode_marker"):
+            if s.get(key) is not None:
+                ns[key] = s[key]
         ep_segs.append(ns)
     raw = "\n\n".join(s.get("text", "") for s in segs)
     char_count = sum(len(s.get("text", "")) for s in segs)
@@ -233,12 +276,15 @@ def split_into_episodes(
     ``{"method": "markers|llm|volume", "episodes": N}`` 供前端提示。"""
     # ① 原始文本行级扫描分集标记（最可靠，不受解析器分段影响）。命中则每集
     #    单独解析为分镜片段。
-    header_chunks = _split_text_by_headers(text)
+    header_chunks = _split_text_by_explicit_episode_markers(text) or _split_text_by_headers(text)
     if header_chunks:
         episodes: list[dict] = []
         for i, (title, body) in enumerate(header_chunks, start=1):
             p = script_parser.parse_script(body, file_type)
             segs = p.get("segments", [])
+            ep_no = _episode_no_from_title(title, i)
+            for seg in segs:
+                seg.setdefault("episode_marker", ep_no)
             stype = p.get("source_type", "txt")
             episodes.append(_build_episode(title or f"第{i}集", segs, stype))
         if meta is not None:
@@ -253,7 +299,7 @@ def split_into_episodes(
         return []
 
     # ② 段级标记兜底；③ LLM 自适应；④ 体量切分。
-    marker_count = sum(1 for s in segments if _is_ep_header(s.get("text", "")))
+    marker_count = sum(1 for s in segments if _is_ep_marker_segment(s))
     method = "volume"
     if marker_count >= 2:
         groups = _split_by_markers(segments)
@@ -268,24 +314,7 @@ def split_into_episodes(
 
     episodes = []
     for i, (name, segs) in enumerate(groups, start=1):
-        ep_segs = []
-        for j, s in enumerate(segs, start=1):
-            ns = {"seq": j, "text": s.get("text", "")}
-            if s.get("time"):
-                ns["time"] = s["time"]
-            ep_segs.append(ns)
-        raw = "\n\n".join(s.get("text", "") for s in segs)
-        char_count = sum(len(s.get("text", "")) for s in segs)
-        episodes.append({
-            "name": name or f"第{i}集",
-            "source_type": source_type,
-            "raw_text": raw,
-            "parsed": {
-                "source_type": source_type,
-                "segments": ep_segs,
-                "char_count": char_count,
-            },
-        })
+        episodes.append(_build_episode(name or f"第{i}集", segs, source_type))
     if meta is not None:
         meta["method"] = method
         meta["episodes"] = len(episodes)
