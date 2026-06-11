@@ -32,10 +32,12 @@ node_modules/
 frontend/dist/
 frontend/.vite/
 .DS_Store
+.vs/
 
 # ---- packaging artifacts ----
 build/
 dist/
+dist_new/
 *.spec
 # keep the desktop packaging spec under version control
 !desktop.spec
