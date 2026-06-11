@@ -12,6 +12,12 @@ _*.json
 _*.txt
 *-report-*.md
 PHASE*-test-report.md
+nuitka-crash-report.xml
+token-result.json
+tmp_*/
+tmp_*.png
+tmp_*.json
+_inspect_app_asar/
 
 # ---- python ----
 __pycache__/
@@ -35,3 +41,6 @@ dist/
 !desktop.spec
 # intermediate; only app.ico is used by the build
 desktop_assets/app.png
+
+# ---- bundled/local browser runtime ----
+resources/doubao-browser/chrome_bin/

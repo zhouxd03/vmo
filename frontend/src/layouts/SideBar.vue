@@ -5,7 +5,7 @@ import { NIcon } from 'naive-ui'
 import {
   GridOutline, CloudUploadOutline, DocumentTextOutline, CubeOutline,
   ImageOutline, VideocamOutline, GitNetworkOutline, AlbumsOutline,
-  ColorWandOutline, SettingsOutline, GridSharp, BugOutline,
+  ColorWandOutline, SettingsOutline, GridSharp, BugOutline, KeyOutline,
 } from '@vicons/ionicons5'
 
 const route = useRoute()
@@ -22,6 +22,7 @@ const iconMap = {
   pipeline: GitNetworkOutline,
   library: AlbumsOutline,
   templates: ColorWandOutline,
+  doubaoPool: KeyOutline,
   settings: SettingsOutline,
   logs: BugOutline,
 }
@@ -38,7 +39,7 @@ const items = computed(() =>
 const groups = computed(() => [
   { label: '工作流', names: ['home', 'import', 'script', 'assets'] },
   { label: '批量生成', names: ['worktable'] },
-  { label: '资源 / 配置', names: ['library', 'templates', 'settings', 'logs'] },
+  { label: '资源 / 配置', names: ['library', 'templates', 'doubaoPool', 'settings', 'logs'] },
 ])
 
 function itemsOf(names) {
@@ -64,7 +65,7 @@ function itemsOf(names) {
       </div>
     </nav>
     <div class="sidebar-foot">
-      <span class="ver">v0.1.0 · 单机版</span>
+      <span class="ver">vmo studio · v1.0.7</span>
     </div>
   </aside>
 </template>

@@ -39,6 +39,7 @@ def _condense_for_global(text: str, segments: list[dict]) -> str:
     if len(text) <= STAGE1_MAX_CHARS:
         return text
     # Sample evenly across segments to preserve whole-arc coverage.
+    segments = [s for s in (segments or []) if isinstance(s, dict)]
     joined = "\n".join(f"[{s.get('seq')}] {s.get('text','')}" for s in segments)
     if len(joined) <= STAGE1_MAX_CHARS:
         return joined
@@ -54,7 +55,7 @@ def run_global_analysis(
 ) -> dict:
     """Stage 1 -> StoryBible dict."""
     text = project.get("raw_text", "")
-    segments = project.get("segments", [])
+    segments = project.get("segments") or []
     body = tpl.get_template_body("global_analysis")
     prompt = tpl.render(body, {
         "source_type": project.get("source_type", "txt"),
@@ -152,6 +153,45 @@ def _normalize_names(v) -> list[str]:
     return [_clean_text(x) for x in raw if _clean_text(x)]
 
 
+_BARE_DIALOGUE_RE = re.compile(r"^(对白|对话)\s*[：:]\s*(.+)$")
+_SOURCED_DIALOGUE_RE = re.compile(r"^(对白|对话|画外旁白|旁白|内心OS|吐槽)\s*[-—]\s*@[^：:]+[：:]")
+
+
+def _normalize_dialogue_speakers(dialogue: str, characters: list[str]) -> tuple[str, list[str]]:
+    """Ensure spoken dialogue carries an explicit @speaker marker.
+
+    LLMs sometimes return bare lines like "对白：下一场是谁？". Downstream video
+    prompts need stable speaker attribution, so repair the common bare form by
+    assigning the first present character; if there is no character context,
+    use @未知说话人 and add it to the shot characters.
+    """
+    text = _clean_text(dialogue)
+    if not text:
+        return "", characters
+    chars = list(characters or [])
+    speaker = chars[0] if chars else "@未知说话人"
+    if not speaker.startswith("@"):
+        speaker = "@" + speaker.lstrip("@")
+    if not chars:
+        chars.append(speaker)
+    parts = re.split(r"(\n+|；)", text)
+    out: list[str] = []
+    for part in parts:
+        if part in ("\n", "；") or not part.strip():
+            out.append(part)
+            continue
+        line = part.strip()
+        if _SOURCED_DIALOGUE_RE.match(line):
+            out.append(line)
+            continue
+        m = _BARE_DIALOGUE_RE.match(line)
+        if m:
+            out.append(f"{m.group(1)}-{speaker}：{m.group(2).strip()}")
+        else:
+            out.append(line)
+    return "".join(out), chars
+
+
 def _normalize_shot(raw: dict, *, chunk_seqs: list, shot_idx: int) -> dict:
     if not isinstance(raw, dict):
         raise llm.LLMError(f"第 {shot_idx + 1} 个分镜不是 JSON 对象")
@@ -165,7 +205,8 @@ def _normalize_shot(raw: dict, *, chunk_seqs: list, shot_idx: int) -> dict:
     sh["props"] = _normalize_names(sh.get("props"))
     sh["action"] = _clean_text(sh.get("action"))
     sh["camera"] = _clean_text(sh.get("camera"))
-    sh["dialogue"] = _clean_text(sh.get("dialogue"))
+    sh["dialogue"], sh["characters"] = _normalize_dialogue_speakers(
+        sh.get("dialogue"), sh["characters"])
     sh["emotion"] = _clean_text(sh.get("emotion") or sh.get("mood"))
     sh["key_elements"] = _clean_text(sh.get("key_elements"))
     sh["handoff"] = _clean_text(sh.get("handoff"))
@@ -192,15 +233,19 @@ def merge_bible(base: Optional[dict], add: dict) -> dict:
     """
     base = base or {"characters": [], "scenes": [], "props": [],
                     "continuity_constraints": []}
+    add = add or {}
     for key in ("characters", "scenes", "props"):
-        have = {_entity_name(e).strip() for e in base.get(key, [])}
-        for e in add.get(key, []) or []:
+        base_items = _as_list(base.get(key))
+        have = {_entity_name(e).strip() for e in base_items}
+        base[key] = base_items
+        for e in _as_list(add.get(key)):
             nm = _entity_name(e).strip()
             if nm and nm not in have:
                 base.setdefault(key, []).append(e)
                 have.add(nm)
-    cc = base.setdefault("continuity_constraints", [])
-    for c in add.get("continuity_constraints", []) or []:
+    cc = _as_list(base.get("continuity_constraints"))
+    base["continuity_constraints"] = cc
+    for c in _as_list(add.get("continuity_constraints")):
         if c not in cc:
             cc.append(c)
     # Novel-level scalar fields: keep the first non-empty value so they survive
@@ -216,7 +261,9 @@ def _chunk_segments(segments: list[dict], chunk_chars: int) -> list[list[dict]]:
     chunks: list[list[dict]] = []
     cur: list[dict] = []
     size = 0
-    for seg in segments:
+    for seg in (segments or []):
+        if not isinstance(seg, dict):
+            continue
         t = seg.get("text", "")
         if cur and size + len(t) > chunk_chars:
             chunks.append(cur)
@@ -248,7 +295,13 @@ def _relevant(items: list[dict], chunk_text: str, prev_handoff: str) -> list[dic
     model (信息过载/内容堆叠). Cross-episode sharing is preserved: an entity reused
     in a later chunk still matches by name."""
     hay = (chunk_text or "") + "\n" + (prev_handoff or "")
-    out = [e for e in items if e.get("name") and e["name"] in hay]
+    normalized = []
+    for e in items or []:
+        if isinstance(e, dict):
+            normalized.append(e)
+        elif str(e or "").strip():
+            normalized.append({"name": str(e).strip()})
+    out = [e for e in normalized if e.get("name") and e["name"] in hay]
     return out
 
 
@@ -293,6 +346,14 @@ def _src_text_for_seqs(chunk: list[dict], seqs: list) -> str:
         s.get("text") or "" for s in chunk
         if s.get("seq") in wanted and (s.get("text") or "").strip()
     ).strip()
+
+
+def _field_text(value) -> str:
+    if isinstance(value, list):
+        return "；".join(_field_text(x) for x in value if x is not None)
+    if isinstance(value, dict):
+        return "；".join(_field_text(v) for v in value.values() if v is not None)
+    return str(value or "")
 
 
 def _shot_marker_index(chunk: list[dict]) -> dict[int, dict]:
@@ -371,6 +432,68 @@ def _coverage(shot_t: str, seg_t: str) -> float:
     return len(a & b) / len(a)
 
 
+def _window_score(target: str, source: str) -> float:
+    norm_source = _norm_match(source)
+    if not target or not norm_source:
+        return 0.0
+    if target in norm_source:
+        return 1.15
+    if norm_source in target:
+        return 0.72
+    # Asymmetric coverage catches a concise LLM action contained in a longer
+    # source paragraph; reverse coverage prevents tiny accidental overlaps from
+    # winning when the LLM text is broad.
+    forward = _coverage(target, norm_source)
+    reverse = _coverage(norm_source, target)
+    return forward * 0.78 + reverse * 0.22
+
+
+def _shot_match_text(shot: dict) -> str:
+    parts = [
+        _field_text(shot.get("action")),
+        _field_text(shot.get("dialogue")),
+        _field_text(shot.get("scene")),
+        _field_text(shot.get("key_elements")),
+        _field_text(shot.get("characters")),
+        _field_text(shot.get("props")),
+    ]
+    return "；".join(p for p in parts if p.strip())
+
+
+def _explicit_source_range(shot: dict, chunk_seqs: list, seq_set: set) -> list:
+    raw_values = []
+    for key in ("src_seq", "source_seq", "source_seqs"):
+        value = shot.get(key)
+        if isinstance(value, str):
+            nums = [_coerce_int(x) for x in re.split(r"[,，、;\s]+", value) if x.strip()]
+            range_match = re.match(r"^\s*(\d+)\s*[-~至到]\s*(\d+)\s*$", value)
+            if range_match:
+                start, end = int(range_match.group(1)), int(range_match.group(2))
+                if start <= end:
+                    nums.extend(range(start, end + 1))
+            raw_values.extend(nums)
+        else:
+            raw_values.extend(_as_list(value))
+    valid = [_coerce_int(v) for v in raw_values]
+    valid = [v for v in valid if v in seq_set]
+    if valid:
+        idx = _seq_index(chunk_seqs)
+        lo = min(idx[v] for v in valid)
+        hi = max(idx[v] for v in valid)
+        return chunk_seqs[lo:hi + 1]
+
+    start = _coerce_int(shot.get("seq") or shot.get("src_seq_start") or shot.get("source_seq_start"))
+    end = _coerce_int(
+        shot.get("seq_end")
+        or shot.get("end_seq")
+        or shot.get("src_seq_end")
+        or shot.get("source_seq_end")
+    )
+    if start in seq_set:
+        return _contiguous_seq_range(chunk_seqs, start, end if end in seq_set else None)
+    return []
+
+
 def _match_source_range(shot: dict, chunk: list[dict]) -> tuple:
     """Locate the contiguous source segment range a shot derives from.
 
@@ -378,22 +501,30 @@ def _match_source_range(shot: dict, chunk: list[dict]) -> tuple:
     only one seq makes the worktable "原文" look truncated, so we score short
     contiguous windows and keep the smallest confident range.
     """
-    core = (shot.get("action") or "") + (shot.get("dialogue") or "")
-    target = _norm_match(core) or _norm_match(shot.get("scene") or "")
+    if not isinstance(shot, dict):
+        return [], ""
+    chunk = [s for s in (chunk or []) if isinstance(s, dict)]
+    if not chunk:
+        return [], ""
+
+    target = _norm_match(_shot_match_text(shot))
     if not target:
         return [], ""
     best: tuple[float, int, int] | None = None
-    max_window = min(8, len(chunk))
-    for i in range(len(chunk)):
-        combined = ""
-        for j in range(i, min(len(chunk), i + max_window)):
-            combined = (combined + "\n" + (chunk[j].get("text") or "")).strip()
-            raw_score = _coverage(target, _norm_match(combined))
-            # Prefer compact ranges when coverage is otherwise similar.
-            score = raw_score - max(0, j - i) * 0.015
-            if best is None or score > best[0]:
-                best = (score, i, j)
-    if not best or best[0] < 0.18:
+    max_window = min(10, len(chunk))
+    try:
+        for i in range(len(chunk)):
+            combined = ""
+            for j in range(i, min(len(chunk), i + max_window)):
+                combined = (combined + "\n" + _field_text(chunk[j].get("text"))).strip()
+                # Prefer compact ranges when confidence is otherwise similar,
+                # but allow multi-paragraph windows for dialogue/action beats.
+                score = _window_score(target, combined) - max(0, j - i) * 0.012
+                if best is None or score > best[0]:
+                    best = (score, i, j)
+    except TypeError:
+        return [], ""
+    if not best or best[0] < 0.20:
         return [], ""
     _, i, j = best
     seqs = [s.get("seq") for s in chunk[i:j + 1] if s.get("seq") is not None]
@@ -406,6 +537,10 @@ def _source_span_from_shot(shot: dict, chunk: list[dict], chunk_seqs: list,
     marker_source = _shot_marker_source(shot, chunk, shot_idx)
     if marker_source:
         return marker_source
+
+    explicit_seqs = _explicit_source_range(shot, chunk_seqs, seq_set)
+    if explicit_seqs:
+        return explicit_seqs[0], explicit_seqs, _src_text_for_seqs(chunk, explicit_seqs), True, None
 
     matched_seqs, matched_text = _match_source_range(shot, chunk)
     if matched_seqs and matched_text:
@@ -584,7 +719,15 @@ def _bible_summary(bible: dict, chunk_text: str = "", prev_handoff: str = "") ->
     an ever-growing, irrelevant entity dump (item: 剔除与本集无关元素、避免堆叠).
     """
     def names(items, key="name"):
-        return "、".join(i.get(key, "") for i in items if i.get(key))
+        vals = []
+        for i in items or []:
+            if isinstance(i, dict):
+                val = i.get(key, "")
+            else:
+                val = str(i or "")
+            if str(val).strip():
+                vals.append(str(val).strip())
+        return "、".join(vals)
 
     chars = bible.get("characters", []) or []
     scenes = bible.get("scenes", []) or []
@@ -599,7 +742,7 @@ def _bible_summary(bible: dict, chunk_text: str = "", prev_handoff: str = "") ->
         f"场景: {names(scenes)}",
         f"道具: {names(props)}",
     ]
-    cons = bible.get("continuity_constraints", [])
+    cons = _as_list(bible.get("continuity_constraints"))
     if cons:
         parts.append("连续性约束: " + "；".join(cons))
     return "\n".join(parts)
@@ -625,9 +768,11 @@ def run_decompose(
     LLM 中转站 is configured (强制 LLM 介入, no silent deterministic fallback).
     """
     bible = project.get("story_bible") or {}
-    segments = project.get("segments", [])
+    segments = project.get("segments") or []
     chunks = _chunk_segments(segments, chunk_chars)
     total = len(chunks)
+    if total <= 0:
+        raise llm.LLMError("当前分集没有可拆解的原文段落，请重新导入或重新分析本集")
     body = tpl.get_template_body("batch_decompose", template_preset)
     # 「单镜目标时长」(设置) → 单镜承载字数（纯画面≈8字/秒）。拆解时按此控制每镜体量；
     # 对白多的镜由模板按≈5字/秒折算降低字数（避免对话过载）。

@@ -23,7 +23,7 @@ const activeId = computed(() => store.currentEpisodeId)
 const stageLabel = { imported: '已导入', analyzed: '已分析', decomposed: '已拆解' }
 
 // per-episode generation badge (concurrent multi-episode runs each show here)
-const genLabel = { running: '生成中', queued: '排队', error: '部分失败', done: '已完成' }
+const genLabel = { running: '生成中', queued: '排队', error: '部分失败', done: '已完成', manual: '待手动' }
 function genStat(ep) { return tasks.episodeStat(ep.id) }
 function shotCount(ep) { return ep.shot_count ?? (ep.shots ? ep.shots.length : 0) }
 function openErrors(ep, ev) {
@@ -129,7 +129,7 @@ async function move(ep, dir) {
           @click="openErrors(ep, $event)"
         >
           <span v-if="genStat(ep).status === 'running'" class="dot" />
-          {{ genLabel[genStat(ep).status] }} {{ genStat(ep).done }}/{{ genStat(ep).total }}
+          {{ genLabel[genStat(ep).status] }} {{ genStat(ep).status === 'manual' ? genStat(ep).skipped : genStat(ep).done }}/{{ genStat(ep).total }}
         </span>
         <span class="ep-ops" v-if="ep.id === activeId">
           <n-tooltip><template #trigger>
@@ -243,6 +243,7 @@ async function move(ep, dir) {
 .ep-gen[data-gen="running"] { background: color-mix(in srgb, var(--app-accent) 20%, transparent); color: var(--app-accent); }
 .ep-gen[data-gen="queued"] { background: color-mix(in srgb, var(--app-accent-alt) 18%, transparent); color: var(--app-accent-alt); }
 .ep-gen[data-gen="done"] { background: color-mix(in srgb, #22c55e 22%, transparent); color: #22c55e; }
+.ep-gen[data-gen="manual"] { background: color-mix(in srgb, #d97706 20%, transparent); color: #d97706; }
 .ep-gen[data-gen="error"] { background: color-mix(in srgb, #ef4444 22%, transparent); color: #ef4444; }
 .ep-gen.clickable { cursor: pointer; }
 .ep-gen.clickable:hover { box-shadow: 0 0 0 1px currentColor inset; }

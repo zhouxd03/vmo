@@ -12,6 +12,7 @@ pluggable so the engine mechanics can be tested without real API credentials.
 
 import base64
 import hashlib
+import json
 import logging
 import re
 import threading
@@ -26,6 +27,7 @@ from ..core import settings as settings_store
 from ..core import story_state
 from ..core.paths import OUTPUT_DIR, PROJECTS_DIR
 from . import continuity, error_policy, ffmpeg_util, image_gen, reference_set, video_gen
+from . import doubao_pool
 from . import llm
 
 logger = logging.getLogger("batch_studio")
@@ -35,6 +37,10 @@ _lock = threading.Lock()
 _global_slots_lock = threading.Lock()
 _global_slots: threading.BoundedSemaphore | None = None
 _global_slots_size = 0
+
+
+class BatchPaused(Exception):
+    """Internal cooperative stop signal for an in-flight batch task."""
 
 
 def _global_limit() -> int:
@@ -71,6 +77,27 @@ def _clear_pause(bid: str) -> None:
 def is_paused(bid: str) -> bool:
     with _lock:
         return _pause_flags.get(bid, False)
+
+
+def cancel_doubao_tasks(pid: str, bid: str, reason: str = "用户已停止") -> int:
+    batch = batches.get_batch(pid, bid)
+    if not batch:
+        return 0
+    count = 0
+    for task in batch.get("tasks", []):
+        task_ids = []
+        if task.get("doubao_task_id"):
+            task_ids.append(str(task.get("doubao_task_id")))
+        preflight = task.get("reference_preflight") or {}
+        if preflight.get("transport") == "doubao-pool" and preflight.get("video_task_id"):
+            task_ids.append(str(preflight.get("video_task_id")))
+        for task_id in set(task_ids):
+            try:
+                if doubao_pool.cancel_task(task_id, reason):
+                    count += 1
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[Batch %s] cancel doubao task %s failed: %s", bid, task_id, e)
+    return count
 
 
 # Task building from shots
@@ -201,7 +228,11 @@ def _dialogue_text(task: dict) -> str:
     text = (task.get("dialogue_ref") or task.get("dialogue") or "").strip()
     if not text:
         return ""
-    return re.sub(r"(?<=对白)@(?=[\w\u4e00-\u9fff])", "", text)
+    # Normalize older speaker forms while preserving the @speaker marker for
+    # voice/lip-sync attribution. Do not resolve it as an image reference here.
+    text = re.sub(r"(对白|对话)\s*@(?=[\w\u4e00-\u9fff])", r"\1-@", text)
+    text = re.sub(r"(画外旁白|旁白|内心OS|吐槽)\s*@(?=[\w\u4e00-\u9fff])", r"\1-@", text)
+    return text
 
 
 _CONSISTENCY_GUARD = (
@@ -338,6 +369,14 @@ def _video_dynamics(task: dict) -> str:
     tl = _action_timeline(task)
     if tl:
         lines.append(f"【动作过程·时间轴】{tl}")
+    dlg = _dialogue_text(task)
+    if dlg:
+        voice_note = "声画同步，不出字幕"
+        if re.search(r"内心|心声|OS|os|吐槽", dlg):
+            voice_note = "内心OS/吐槽音轨，不表现为嘴唇开合，不出字幕"
+        elif re.search(r"旁白|画外", dlg):
+            voice_note = "画外旁白音轨，不出字幕"
+        lines.append(f"【台词/旁白】{dlg}（{voice_note}）")
     prev = (task.get("_prev_handoff") or "").strip()
     head = f"承接上一镜（{prev}）；{_transition_of(task)}" if prev else _transition_of(task)
     join = [f"【衔接】{head}"]
@@ -348,14 +387,6 @@ def _video_dynamics(task: dict) -> str:
     if ho:
         join.append(f"本镜收尾：{ho}")
     lines.append("｜".join(join))
-    dlg = _dialogue_text(task)
-    if dlg:
-        voice_note = "声画同步，不出字幕"
-        if re.search(r"内心|心声|OS|os|吐槽", dlg):
-            voice_note = "内心OS/吐槽音轨，不表现为嘴唇开合，不出字幕"
-        elif re.search(r"旁白|画外", dlg):
-            voice_note = "画外旁白音轨，不出字幕"
-        lines.append(f"【台词/旁白】{dlg}（{voice_note}）")
     emo = (task.get("emotion") or "").strip()
     dur = _eff_dur(task)
     pace = [f"总时长{dur}秒"]
@@ -372,7 +403,7 @@ def _strip_style_prefix(text: str, style: str) -> str:
     style = (style or "").strip()
     if not text or not style:
         return text.rstrip("。，、 ")
-    for sep in ("?", ",", "?", "\n"):
+    for sep in ("，", ",", "、", "\n"):
         prefix = style + sep
         if text.startswith(prefix):
             return text[len(prefix):].strip().rstrip("。，、 ")
@@ -401,7 +432,7 @@ def _video_prompt_vars(task: dict, image_prompt: str,
         "dialogue": _dialogue_text(task),
         "scene": _ff_scene(task),
         "characters": _ff_chars(task),
-        "props": "?".join(task.get("props", []) or []),
+        "props": "、".join(task.get("props", []) or []),
         "bridge_context": _compact_bridge_context(task.get("_bridge_context") or ""),
         "consistency": _CONSISTENCY_GUARD,
     }
@@ -428,6 +459,191 @@ def _compose_llm_video_prompt(task: dict, image_prompt: str, video_prompt: str) 
     return _clean_generated_prompt(
         prompt_templates.render(body, _video_prompt_vars(task, image, dynamics_override=motion))
     )
+
+
+_TIMELINE_LINE_RE = re.compile(r"(?m)^(?P<prefix>\s*【动作过程[·\s]*时间轴】)(?P<body>[^\n]*)")
+_TIMELINE_SEGMENT_RE = re.compile(
+    r"(?P<start>\d+(?:\.\d+)?)\s*[-–—~至到]\s*(?P<end>\d+(?:\.\d+)?)\s*秒"
+    r"(?:\s*[（(](?P<label>[^）)]{1,24})[）)])?\s*[：:]?\s*(?P<text>.*?)(?="
+    r"\s*(?:[；;]\s*)?\d+(?:\.\d+)?\s*[-–—~至到]\s*\d+(?:\.\d+)?\s*秒|$)"
+)
+_TIMELINE_SHOT_RE = re.compile(
+    r"(?:^|[；;\n])\s*镜头(?P<num>\d+)\s*[：:]\s*(?P<body>.*?)(?=(?:[；;\n]\s*镜头\d+\s*[：:])|$)",
+    re.S,
+)
+_SHOT_SECONDS_RE = re.compile(r"(?<!\d)(?P<sec>\d+(?:\.\d+)?)\s*(?:s|秒)")
+
+
+def _extract_action_timeline(video_prompt: str) -> str:
+    """Return only the body after the action-timeline heading."""
+    m = _TIMELINE_LINE_RE.search(video_prompt or "")
+    return (m.group("body") if m else "").strip()
+
+
+def _replace_action_timeline(video_prompt: str, timeline: str) -> str:
+    """Replace only the action-timeline body, preserving every other section."""
+    timeline = (timeline or "").strip()
+    if not video_prompt or not timeline:
+        return video_prompt or ""
+    if _TIMELINE_LINE_RE.search(video_prompt):
+        return _TIMELINE_LINE_RE.sub(lambda m: f"{m.group('prefix')}{timeline}", video_prompt, count=1)
+    return (video_prompt.rstrip() + f"\n【动作过程·时间轴】{timeline}").strip()
+
+
+def _strip_timeline_heading(text: str) -> str:
+    text = _clean_generated_prompt(text or "")
+    text = re.sub(r"^\s*【动作过程[·\s]*时间轴】\s*", "", text).strip()
+    return text.strip(" \n\r\t\"'`")
+
+
+def _timeline_text_from_llm_raw(raw: str) -> str:
+    """Recover the timeline field from strict JSON, fenced JSON, or near-JSON."""
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1] if text.count("```") >= 2 else text
+        if text.lstrip().startswith("json"):
+            text = text.lstrip()[4:]
+        text = text.strip("`").strip()
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return str(data.get("timeline") or data.get("action_timeline") or data.get("video") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    start = text.find("{")
+    end = max(text.rfind("}"), text.rfind("]"))
+    if start != -1 and end != -1 and end > start:
+        try:
+            data = json.loads(text[start:end + 1])
+            if isinstance(data, dict):
+                return str(data.get("timeline") or data.get("action_timeline") or data.get("video") or "")
+        except Exception:  # noqa: BLE001
+            pass
+    m = re.search(
+        r'["“”]?(?:timeline|action_timeline|video)["“”]?\s*[:：]\s*(?P<value>[\s\S]+)',
+        text,
+        re.I,
+    )
+    if m:
+        value = m.group("value").strip()
+        value = re.sub(r"^\s*[\"'“”]", "", value)
+        value = re.sub(r"[\"'“”]?\s*[,，]?\s*[}\]]\s*$", "", value).strip()
+        return value
+    return text
+
+
+def _timeline_stage_label(index: int, total: int, raw: str = "") -> str:
+    if total <= 1:
+        stage = "连续动作"
+    elif index == 0:
+        stage = "起势"
+    elif index == total - 1:
+        stage = "收束钩子"
+    else:
+        labels = _BEAT_LABELS.get(total)
+        if labels and index < len(labels):
+            stage = labels[index]
+        elif index == total - 2 and total >= 4:
+            stage = "转折强化"
+        else:
+            stage = "核心动作"
+    raw = (raw or "").strip()
+    if raw and 0 < index < total - 1:
+        for candidate in ("核心动作", "转折强化"):
+            if candidate in raw:
+                stage = candidate
+                break
+    return f"镜头{index + 1}·{stage}"
+
+def _scaled_bounds(duration: int, weights: list[float]) -> list[int]:
+    total = sum(w for w in weights if w > 0) or 1.0
+    bounds, acc = [0], 0.0
+    for w in weights:
+        acc += max(w, 0.0) / total * duration
+        bounds.append(int(round(acc)))
+    bounds[-1] = duration
+    for i in range(1, len(bounds)):
+        if bounds[i] <= bounds[i - 1]:
+            bounds[i] = bounds[i - 1] + 1
+    if bounds[-1] > duration:
+        bounds[-1] = duration
+        for i in range(len(bounds) - 2, 0, -1):
+            if bounds[i] >= bounds[i + 1]:
+                bounds[i] = max(bounds[i + 1] - 1, bounds[i - 1] + 1)
+    return bounds
+
+
+def _timeline_from_shot_style(text: str, duration: int) -> str:
+    """Accept 10S-template style `镜头1：...2s ...` and add time ranges."""
+    items = []
+    for m in _TIMELINE_SHOT_RE.finditer(text or ""):
+        body = re.sub(r"\s+", " ", (m.group("body") or "").strip(" ；;"))
+        if not body:
+            continue
+        sec_m = _SHOT_SECONDS_RE.search(body)
+        sec = float(sec_m.group("sec")) if sec_m else 0.0
+        if sec_m:
+            body = (body[:sec_m.start()] + body[sec_m.end():]).strip(" ，,、")
+        items.append({"seconds": sec, "text": body})
+    if not items:
+        return ""
+    items = items[:max(1, min(6, duration))]
+    weights = [it["seconds"] if it["seconds"] > 0 else 1.0 for it in items]
+    bounds = _scaled_bounds(duration, weights)
+    out = []
+    for i, it in enumerate(items):
+        out.append(f"{bounds[i]}-{bounds[i + 1]}秒（{_timeline_stage_label(i, len(items))}）：{it['text']}")
+    return "；".join(out)
+
+
+def _normalize_timeline_text(text: str, duration: int, fallback: str = "") -> str:
+    """Clamp LLM timeline segments to 0->duration while keeping segment wording."""
+    text = _strip_timeline_heading(text)
+    if not text:
+        return fallback.strip()
+    if _ENGINE_REF_TOKEN_RE.search(text):
+        return fallback.strip()
+
+    compact_text = text.replace("\n", "；")
+    matches = list(_TIMELINE_SEGMENT_RE.finditer(compact_text))
+    if not matches:
+        shot_style = _timeline_from_shot_style(text, duration)
+        if shot_style:
+            return shot_style
+        text = re.sub(r"\s+", " ", text).strip("；; ")
+        return f"0-{duration}秒（连续动作）：{text}" if text else fallback.strip()
+
+    segs: list[dict] = []
+    for m in matches:
+        body = re.sub(r"\s+", " ", (m.group("text") or "").strip(" ；;"))
+        if not body:
+            continue
+        label = (m.group("label") or "").strip()
+        segs.append({"label": label, "text": body})
+    if not segs:
+        return fallback.strip()
+
+    segs = segs[:max(1, min(6, duration))]
+    if duration == 10 and len(segs) == 5:
+        bounds = [0, 2, 4, 6, 9, 10]
+    elif duration == 10 and len(segs) >= 4:
+        bounds = [0, 3, 6, 9, 10]
+        segs = segs[:4]
+    elif duration == 10 and len(segs) == 3:
+        bounds = [0, 4, 8, 10]
+    elif duration == 10 and len(segs) == 2:
+        bounds = [0, 5, 10]
+    else:
+        n = max(1, min(6, len(segs)))
+        weights = list(_BEAT_WEIGHTS.get(n) or ([1.0] * n))
+        bounds = _scaled_bounds(duration, weights)
+        segs = segs[:n]
+
+    out = []
+    for i, seg in enumerate(segs):
+        label = _timeline_stage_label(i, len(segs), seg.get("label", ""))
+        out.append(f"{bounds[i]}-{bounds[i + 1]}秒（{label}）：{seg['text']}")
+    return "；".join(out)
 
 
 _PROMPT_META_SECTION_RE = re.compile(
@@ -650,7 +866,8 @@ def _assets_desc_for_task(project: dict, task: dict) -> str:
 
 
 def infer_shot_prompt(project: dict, shot_no, *, model: Optional[str] = None) -> dict:
-    """Ask an LLM to infer clean image/video prompts for one shot."""
+    """Ask an LLM to optimize only the action timeline for one shot."""
+    started_at = time.time()
     pid = project.get("_pid") or project.get("id")
     target, prev_ho = None, ""
     for t in build_tasks_from_shots(project):
@@ -668,12 +885,23 @@ def infer_shot_prompt(project: dict, shot_no, *, model: Optional[str] = None) ->
         target["_bridge_context"] = _decision_bridge_context(pid, target.get("shot_no"), purpose="video")
     img_draft = target.get("prompt", "") or ""
     bible = project.get("story_bible") or {}
+    fallback_image = img_draft
+    # Read-only base prompt/context for AI timeline overlay. Never persist this
+    # back into the fallback template or the dynamics variable source.
+    fallback_dynamics = _video_dynamics(target)
+    fallback_vid = build_video_prompt(target, fallback_image)
+    fallback_timeline = (
+        _extract_action_timeline(fallback_dynamics)
+        or _extract_action_timeline(fallback_vid)
+        or _action_timeline(target)
+    )
+    dur = _eff_dur(target)
     variables = {
         "style": (bible.get("style") or target.get("style") or "").strip(),
-        "duration": str(_eff_dur(target)),
+        "duration": str(dur),
         "shot_no": str(target.get("shot_no") or shot_no),
         "src_text": target.get("src_text") or "",
-        "image_draft": img_draft,
+        "image_draft": fallback_image,
         "scene": _ff_scene(target),
         "characters": "、".join(target.get("characters_ref") or target.get("characters") or []),
         "props": "、".join(target.get("props", []) or []),
@@ -687,48 +915,50 @@ def infer_shot_prompt(project: dict, shot_no, *, model: Optional[str] = None) ->
         ),
         "handoff": (target.get("handoff_ref") or target.get("handoff") or "").strip(),
         "assets_desc": _assets_desc_for_task(project, target),
+        "fallback_video": fallback_vid,
+        "fallback_dynamics": fallback_dynamics,
+        "fallback_timeline": fallback_timeline,
         "consistency": _CONSISTENCY_GUARD,
     }
     try:
-        body = prompt_templates.get_template_body("shot_prompt_infer")
-        data = llm.chat_json(
-            [{"role": "user", "content": prompt_templates.render(body, variables)}],
-            model=model, temperature=0.5, max_tokens=6000,
+        body = prompt_templates.get_preset_body("shot_prompt_infer", "ten_second_timeline")
+        rendered_prompt = prompt_templates.render(body, variables)
+        logger.info(
+            "[InferTimeline] start shot=%s duration=%s prompt_chars=%s model=%s",
+            shot_no, dur, len(rendered_prompt), model or "default",
         )
-        if not isinstance(data, dict):
-            raise llm.LLMError("LLM 返回不是 JSON 对象")
-        image = _clean_generated_prompt(str(data.get("image") or ""))
-        video = _clean_generated_prompt(str(data.get("video") or ""))
-        if not (image or video):
-            raise llm.LLMError("LLM 返回空结果")
-        if _ENGINE_REF_TOKEN_RE.search(image) or _ENGINE_REF_TOKEN_RE.search(video):
+        raw = llm.chat(
+            [{"role": "user", "content": rendered_prompt}],
+            model=model, temperature=0.25, max_tokens=6000, response_json=True, timeout=300,
+        )
+        raw_timeline = _timeline_text_from_llm_raw(raw)
+        timeline = _normalize_timeline_text(raw_timeline, dur, fallback_timeline)
+        if not timeline:
+            raise llm.LLMError("LLM 返回空时间轴")
+        if _ENGINE_REF_TOKEN_RE.search(timeline):
             raise llm.LLMError("LLM 输出混入引擎内部参考图编号，请重新推理")
-        if len(image) > 12000 or len(video) > 16000:
-            raise llm.LLMError("LLM 返回提示词异常过长，请检查模型输出")
-        source = "llm"
-        fallback_reason = ""
-        if video:
-            vid = video
-        else:
-            vid = build_video_prompt(target, image or img_draft)
-            source = "llm_partial_fallback"
-            fallback_reason = "LLM 未返回 video 字段，视频词使用确定性镜头动态补齐"
+        if len(timeline) > 6000:
+            raise llm.LLMError("LLM 返回时间轴异常过长，请检查模型输出")
+        vid = _replace_action_timeline(fallback_vid, timeline)
         kept, head = _preview_refs(pid, target, "video", include_continuity=True)
         body = reference_set.strip_definition_block(vid or "").strip()
+        logger.info(
+            "[InferTimeline] done shot=%s elapsed=%.1fs timeline_chars=%s",
+            shot_no, time.time() - started_at, len(timeline),
+        )
         return {
-            "image": image or img_draft,
+            "image": fallback_image,
             "video": (head + "\n\n" + body if head and body else head or body),
             "refs": _serialize_ref_items(pid, kept),
-            "source": source,
-            **({"fallback_reason": fallback_reason} if fallback_reason else {}),
+            "source": "llm_timeline",
+            "timeline": timeline,
         }
     except Exception as e:  # noqa: BLE001
-        logger.warning("infer_shot_prompt fallback (%s): %s", shot_no, e)
-        fallback_vid = build_video_prompt(target, img_draft)
+        logger.warning("infer_shot_prompt fallback (%s) elapsed=%.1fs: %s", shot_no, time.time() - started_at, e)
         kept, head = _preview_refs(pid, target, "video", include_continuity=True)
         body = reference_set.strip_definition_block(fallback_vid or "").strip()
         return {
-            "image": img_draft,
+            "image": fallback_image,
             "video": (head + "\n\n" + body if head and body else head or body),
             "refs": _serialize_ref_items(pid, kept),
             "source": "fallback",
@@ -737,9 +967,15 @@ def infer_shot_prompt(project: dict, shot_no, *, model: Optional[str] = None) ->
 
 
 def _shot_duration(task: dict, params: dict) -> int:
-    """Per-shot duration (s): prefer the shot's pacing-derived value, else the
-    batch default; always clamp to the 15s model ceiling."""
-    d = task.get("duration") or params.get("duration", 10)
+    """Per-shot duration (s), clamped to the 15s model ceiling.
+
+    Seedance uses the video-generation control value directly because some
+    channels only accept the selected fixed duration (for example 15s).
+    """
+    if _is_seedance_video_params(params):
+        d = params.get("duration") or task.get("duration") or 10
+    else:
+        d = task.get("duration") or params.get("duration", 10)
     try:
         d = int(d)
     except (TypeError, ValueError):
@@ -905,6 +1141,87 @@ def _is_seedance_video_params(params: dict) -> bool:
         return False
 
 
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_doubao_pool_video_params(params: dict) -> bool:
+    params = params or {}
+    model = str(params.get("model") or "").strip().lower()
+    provider = str(params.get("provider") or params.get("video_provider") or "").strip().lower()
+    base = str(params.get("base_url") or params.get("api_base") or "").strip().lower()
+    if provider == "doubao_pool" or base.startswith("local://doubao-pool") or model == "doubao-web-video":
+        return True
+    try:
+        resolved_base, _key, default_model, resolved_provider = video_gen._resolve_creds(
+            params.get("base_url"), params.get("api_key"))
+        return (
+            resolved_provider == "doubao_pool"
+            or str(resolved_base or "").lower().startswith("local://doubao-pool")
+            or str(default_model or "").strip().lower() == "doubao-web-video"
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _doubao_pool_preflight_error(batch: dict, pending: list[dict]) -> Optional[dict]:
+    if batch.get("kind") != "video" or not pending:
+        return None
+    if not _is_doubao_pool_video_params(batch.get("params") or {}):
+        return None
+    try:
+        snapshot = doubao_pool.list_pool()
+    except Exception as e:  # noqa: BLE001
+        return {
+            "category": "fatal",
+            "code": "doubao_pool_preflight_failed",
+            "retryable": False,
+            "abort_batch": True,
+            "message": f"[豆包号池不可用] 启动前检查号池失败：{e}",
+            "hint": "请先打开左侧“豆包号池”确认账号、插件和本地浏览器状态正常，再重新开始批量生成。",
+            "detail": str(e)[:500],
+        }
+    accounts = snapshot.get("accounts") or []
+    enabled = [a for a in accounts if a.get("enabled", True)]
+    available = _safe_int(snapshot.get("availableTotal"), 0)
+    remaining = _safe_int(snapshot.get("remainingTotal"), 0)
+    active = _safe_int(snapshot.get("activeTotal"), 0)
+    if not accounts:
+        reason = "本地号池还没有账号。"
+    elif not enabled:
+        reason = f"号池内有 {len(accounts)} 个账号，但都未启用。"
+    elif available <= 0 and active > 0:
+        reason = f"当前账号可用并发名额已被运行中任务占满（运行中 {active}，本地剩余次数 {remaining}）。"
+    elif available <= 0:
+        reason = f"账号存在但没有可用视频次数（本地剩余次数 {remaining}，运行中 {active}）。"
+    else:
+        return None
+    account_bits = []
+    for account in accounts[:4]:
+        account_bits.append(
+            f"{account.get('name') or account.get('id')}: "
+            f"enabled={bool(account.get('enabled', True))}, "
+            f"available={_safe_int(account.get('available'), 0)}, "
+            f"remaining={_safe_int(account.get('remaining'), 0)}, "
+            f"active={_safe_int(account.get('active'), 0)}, "
+            f"remoteCredit={account.get('remoteCreditRemaining') if account.get('remoteCreditRemaining') not in (None, '') else '-'}, "
+            f"health={account.get('accountHealthStatus') or 'ok'}"
+        )
+    detail = "; ".join(account_bits)
+    return {
+        "category": "fatal",
+        "code": "doubao_pool_no_available_account",
+        "retryable": False,
+        "abort_batch": True,
+        "message": f"[豆包号池不可用] {reason} 请到左侧“豆包号池”新增/启用账号，或重置账号可生产次数后再开始批量生成。",
+        "hint": f"本次批量共有 {len(pending)} 个待生成任务；已在启动前停止，避免重复打开网页和刷出多条相同失败。账号状态：{detail or '无账号'}",
+        "detail": detail[:500],
+    }
+
+
 _TAIL_NEGATION_PHRASES = (
     "无需尾帧", "不需要尾帧", "不要尾帧", "不使用尾帧", "不用尾帧",
     "取消尾帧", "禁止尾帧", "避免尾帧", "无需首尾帧", "不要首尾帧",
@@ -1015,8 +1332,18 @@ def _generate_video_with_refs(pid: str, batch: dict, task: dict, params: dict,
 
     def _persist_submit_response(resp: dict) -> None:
         try:
-            task_id = video_gen._extract_task_id(resp) if isinstance(resp, dict) else ""
-            transport = "seedance-multipart" if _is_seedance_video_params(params) else "data_url"
+            is_doubao_pool = isinstance(resp, dict) and resp.get("provider") == "doubao_pool"
+            task_id = str(resp.get("task_id") or "") if is_doubao_pool else (video_gen._extract_task_id(resp) if isinstance(resp, dict) else "")
+            transport = "doubao-pool" if is_doubao_pool else ("seedance-multipart" if _is_seedance_video_params(params) else "data_url")
+            doubao_patch = {}
+            if is_doubao_pool:
+                doubao_patch = {
+                    "doubao_task_id": task_id,
+                    "doubao_account_id": str(resp.get("account_id") or ""),
+                    "doubao_initial_account_id": str(resp.get("initial_account_id") or resp.get("account_id") or ""),
+                    "doubao_shot_no": str(resp.get("shot_no") or task.get("shot_no") or filename_prefix or ""),
+                    "doubao_account_switch_policy": str(resp.get("account_switch_policy") or "pre-submit-only"),
+                }
             batches.update_task(pid, batch["id"], task["id"], {
                 "reference_preflight": {
                     "status": "submitted",
@@ -1025,9 +1352,16 @@ def _generate_video_with_refs(pid: str, batch: dict, task: dict, params: dict,
                     "video_task_id": task_id,
                     "updated_at": time.time(),
                 },
+                **({k: v for k, v in doubao_patch.items() if v} if is_doubao_pool else {}),
             })
         except Exception as e:  # noqa: BLE001
             logger.warning("[Refs] failed to persist submit response: %s", e)
+
+    def _cancel_checker() -> bool:
+        if is_paused(batch["id"]):
+            raise BatchPaused("已停止")
+        fresh = batches.get_batch(pid, batch["id"]) or {}
+        return bool(fresh.get("pause_requested"))
 
     return video_gen.generate_video(
         prompt,
@@ -1046,6 +1380,7 @@ def _generate_video_with_refs(pid: str, batch: dict, task: dict, params: dict,
         ref_meta=ref_meta,
         on_refs_prepared=_persist_prepared_refs,
         on_submit_response=_persist_submit_response,
+        cancel_checker=_cancel_checker,
     )
 
 
@@ -1335,6 +1670,48 @@ def _gen_video_task_continuity(pid, batch, task, params):
 _GENERATORS: dict[str, Callable] = {"image": _gen_image_task, "video": _gen_video_task}
 
 
+def _mark_preflight_blocked(pid: str, bid: str, pending: list[dict], err_info: dict) -> dict:
+    if not pending:
+        batches.set_status(pid, bid, "error")
+        return batches.get_batch(pid, bid) or {}
+    for idx, task in enumerate(pending):
+        if idx == 0:
+            batches.update_task(pid, bid, task["id"], {
+                "status": "error",
+                "error": err_info,
+                "attempts": task.get("attempts", 0),
+                "stage": "preflight_failed",
+                "stage_label": "豆包号池不可用",
+                "progress": 100,
+            })
+        else:
+            batches.update_task(pid, bid, task["id"], {
+                "status": "skipped",
+                "error": None,
+                "skip_reason": err_info.get("message") or "批次启动前置条件未通过",
+                "attempts": task.get("attempts", 0),
+                "stage": "skipped",
+                "stage_label": "已跳过：豆包号池不可用",
+                "progress": 100,
+            })
+    batches.set_status(pid, bid, "error")
+    return batches.get_batch(pid, bid) or {}
+
+
+def _mark_pending_skipped_after_abort(pid: str, bid: str, final: dict) -> dict:
+    for task in final.get("tasks", []):
+        if task.get("status") == "pending":
+            batches.update_task(pid, bid, task["id"], {
+                "status": "skipped",
+                "error": None,
+                "skip_reason": "前序致命错误中止本批，未消耗调用。",
+                "stage": "skipped",
+                "stage_label": "已跳过：前序错误",
+                "progress": 100,
+            })
+    return batches.get_batch(pid, bid) or final
+
+
 # Runner
 def _run_one(pid, batch, task, gen, params, backoff):
     """Run one task with retry/error handling."""
@@ -1343,6 +1720,10 @@ def _run_one(pid, batch, task, gen, params, backoff):
     if is_paused(bid):
         return "paused"
     def stage_cb(stage: str, label: str, progress=None):
+        fresh = batches.get_batch(pid, bid) or {}
+        fresh_task = next((t for t in fresh.get("tasks", []) if t.get("id") == task["id"]), {})
+        if fresh.get("pause_requested") or fresh_task.get("status") == "paused":
+            raise BatchPaused("已停止")
         patch = {"stage": stage, "stage_label": label}
         if progress is not None:
             try:
@@ -1389,11 +1770,54 @@ def _run_one(pid, batch, task, gen, params, backoff):
                 result = gen(pid, batch, task, task_params)
             finally:
                 slot.release()
+            if isinstance(result, dict) and result.get("manual_required"):
+                batches.update_task(pid, bid, task["id"], {
+                    "status": "skipped",
+                    "result": result,
+                    "attempts": attempts,
+                    "error": None,
+                    "skip_reason": result.get("message") or "豆包半自动模式已填入素材，等待手动生成",
+                    "stage": "manual",
+                    "stage_label": "豆包半自动：待手动生成",
+                    "progress": 100,
+                })
+                return "done"
             batches.update_task(pid, bid, task["id"],
                                 {"status": "done", "result": result, "attempts": attempts, "error": None,
                                  "stage": "done", "stage_label": "已完成", "progress": 100})
             return "done"
         except Exception as e:  # noqa: BLE001
+            if isinstance(e, BatchPaused):
+                batches.update_task(pid, bid, task["id"], {
+                    "status": "paused",
+                    "stage": "paused",
+                    "stage_label": "已暂停",
+                })
+                return "paused"
+            if isinstance(e, video_gen.DoubaoSemiAutoReady):
+                doubao_task = e.task or {}
+                result = {
+                    "provider": "doubao_pool",
+                    "manual_required": True,
+                    "message": str(e),
+                    "doubao_task_id": doubao_task.get("id") or "",
+                    "doubao_account_id": doubao_task.get("accountId") or "",
+                    "doubao_stage": doubao_task.get("stage") or "semi-auto-ready",
+                    "doubao_automation_mode": doubao_task.get("doubaoAutomationMode") or doubao_task.get("automationMode") or "semi",
+                }
+                batches.update_task(pid, bid, task["id"], {
+                    "status": "skipped",
+                    "result": result,
+                    "attempts": attempts,
+                    "error": None,
+                    "skip_reason": result["message"],
+                    "stage": "manual",
+                    "stage_label": "豆包半自动：待手动生成",
+                    "progress": 100,
+                    "doubao_task_id": result["doubao_task_id"],
+                    "doubao_account_id": result["doubao_account_id"],
+                })
+                return "done"
             err_info = error_policy.classify(e)
             logger.warning(
                 "[Batch %s] task %s failed on attempt %s [%s%s]: %s",
@@ -1424,7 +1848,7 @@ def run_batch(pid: str, bid: str, *, on_progress: Optional[Callable[[int, int], 
         raise ValueError("批次不存在")
     _clear_pause(bid)
     batches.clear_pause_request(pid, bid)
-    batches.set_status(pid, bid, "running")
+    batch = batches.get_batch(pid, bid) or batch
     params = batch.get("params", {})
     continuity_on = batch["kind"] == "video" and bool(params.get("continuity"))
     if generator:
@@ -1438,8 +1862,26 @@ def run_batch(pid: str, bid: str, *, on_progress: Optional[Callable[[int, int], 
 
     all_tasks = batch["tasks"]
     total = len(all_tasks)
-    pending = [t for t in all_tasks if t["status"] != "done"]  # resume
+    pending = [t for t in all_tasks if t.get("status") not in {"done", "skipped"}]  # resume
     done_count = total - len(pending)
+    preflight_error = _doubao_pool_preflight_error(batch, pending)
+    if preflight_error:
+        final = _mark_preflight_blocked(pid, bid, pending, preflight_error)
+        if on_progress:
+            on_progress(
+                sum(1 for t in final.get("tasks", []) if t.get("status") in ("done", "error", "skipped")),
+                total,
+            )
+        logger.warning("[Batch %s] doubao pool preflight blocked: %s", bid, preflight_error.get("message"))
+        statuses = [t.get("status") for t in final.get("tasks", [])]
+        return {
+            "status": "error",
+            "total": total,
+            "done": sum(1 for s in statuses if s == "done"),
+            "error": sum(1 for s in statuses if s == "error"),
+            "skipped": sum(1 for s in statuses if s == "skipped"),
+        }
+    batches.set_status(pid, bid, "running")
 
     def report():
         if on_progress:
@@ -1501,12 +1943,7 @@ def run_batch(pid: str, bid: str, *, on_progress: Optional[Callable[[int, int], 
     # when aborted by a fatal error, mark the still-pending shots as skipped so
     # the UI explains why they didn't run (rather than leaving them "pending")
     if aborted:
-        for t in final["tasks"]:
-            if t["status"] == "pending":
-                batches.update_task(pid, bid, t["id"], {"status": "error", "error": {
-                    "category": "skipped", "message": "已跳过：前序致命错误中止本批，未消耗调用。",
-                    "retryable": False}})
-        final = batches.get_batch(pid, bid)
+        final = _mark_pending_skipped_after_abort(pid, bid, final)
     statuses = [t["status"] for t in final["tasks"]]
     if aborted:
         status = "error"
@@ -1514,7 +1951,7 @@ def run_batch(pid: str, bid: str, *, on_progress: Optional[Callable[[int, int], 
         status = "paused"
     elif any(s == "error" for s in statuses):
         status = "error"
-    elif all(s == "done" for s in statuses):
+    elif all(s in {"done", "skipped"} for s in statuses):
         status = "done"
     else:
         status = "paused"
@@ -1523,6 +1960,7 @@ def run_batch(pid: str, bid: str, *, on_progress: Optional[Callable[[int, int], 
     return {
         "status": status,
         "total": total,
-        "done": sum(1 for s in statuses if s == "done"),
+        "done": sum(1 for s in statuses if s in {"done", "skipped"}),
         "error": sum(1 for s in statuses if s == "error"),
+        "skipped": sum(1 for s in statuses if s == "skipped"),
     }

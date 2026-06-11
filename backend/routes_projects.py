@@ -1,6 +1,7 @@
 ﻿"""Project, asset, analysis, and generation routes."""
 
 import os
+import json
 
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
@@ -17,7 +18,7 @@ from .services import llm as llm_service
 
 
 def register(app: Flask) -> None:
-    # 鈹€鈹€ projects 鈹€鈹€
+    # projects
     @app.route("/api/projects", methods=["GET"])
     def list_projects():
         return jsonify(projects.list_projects())
@@ -26,15 +27,15 @@ def register(app: Flask) -> None:
     def get_project(pid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         return jsonify(p)
 
     @app.route("/api/projects/<pid>/overview", methods=["GET"])
     def project_overview(pid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
-        # 鎸?episode_id + kind 鑱氬悎鎵规杩涘害
+            return jsonify({"error": "项目不存在"}), 404
+        # 按 episode_id + kind 聚合批次进度
         agg: dict = {}
         for b in batches.list_batches(pid):
             eid = b.get("episode_id")
@@ -76,11 +77,11 @@ def register(app: Flask) -> None:
     @app.route("/api/projects/<pid>", methods=["PATCH"])
     def rename_project(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         name = (body.get("name") or "").strip()
         if not name:
-            return jsonify({"error": "??????"}), 400
+            return jsonify({"error": "项目名称不能为空"}), 400
         p = projects.update_project(pid, {"name": name})
         return jsonify(p)
 
@@ -96,38 +97,38 @@ def register(app: Flask) -> None:
         file_type = body.get("file_type", "txt")
         name = body.get("name", "")
         if not text.strip():
-            return jsonify({"error": "鏂囨湰涓虹┖"}), 400
+            return jsonify({"error": "文本为空"}), 400
         use_llm = body.get("use_llm", True)
         llm_model = body.get("llm_model") or None
         split_meta: dict = {}
         episodes = episode_splitter.split_into_episodes(
             text, file_type, use_llm=use_llm, llm_model=llm_model, meta=split_meta)
         if not episodes:
-            return jsonify({"error": "??????"}), 400
+            return jsonify({"error": "没有可导入的分集"}), 400
         project = projects.create_project(name, episodes=episodes)
-        # 鑷€傚簲鍒嗛泦缁撴灉锛坢ethod: markers/llm/volume锛沞pisodes: 闆嗘暟锛変緵鍓嶇 toast 鎻愮ず
+        # 自适应分集结果，供前端 toast 提示
         project = dict(project)
         project["split"] = split_meta
         return jsonify(project)
 
-    # 鈹€鈹€ episodes (闆? 鈹€鈹€
+    # episodes
     @app.route("/api/projects/<pid>/episodes", methods=["GET"])
     def list_episodes(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         return jsonify(projects.list_episodes(pid))
 
     @app.route("/api/projects/<pid>/episodes", methods=["POST"])
     def add_episode(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         text = body.get("text", "")
         if not text.strip():
-            return jsonify({"error": "鏂囨湰涓虹┖"}), 400
+            return jsonify({"error": "文本为空"}), 400
         parsed = script_parser.parse_script(text, body.get("file_type", "txt"))
         if not parsed["segments"]:
-            return jsonify({"error": "??????"}), 400
+            return jsonify({"error": "没有可解析的内容"}), 400
         ep = projects.add_episode(pid, body.get("name", ""),
                                   parsed["source_type"], text, parsed)
         return jsonify(ep)
@@ -136,14 +137,14 @@ def register(app: Flask) -> None:
     def reorder_episodes(pid):
         order = (request.json or {}).get("order", [])
         if not projects.reorder_episodes(pid, order):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         return jsonify(projects.list_episodes(pid))
 
     @app.route("/api/projects/<pid>/episodes/<eid>", methods=["GET"])
     def get_episode(pid, eid):
         ep = projects.get_episode(pid, eid)
         if not ep:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "分集不存在"}), 404
         return jsonify(ep)
 
     @app.route("/api/projects/<pid>/episodes/<eid>", methods=["POST"])
@@ -153,7 +154,7 @@ def register(app: Flask) -> None:
         patch = {k: v for k, v in body.items() if k in ("name",)}
         ep = projects.update_episode(pid, eid, patch)
         if not ep:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "分集不存在"}), 404
         return jsonify(ep)
 
     @app.route("/api/projects/<pid>/episodes/<eid>", methods=["DELETE"])
@@ -165,56 +166,56 @@ def register(app: Flask) -> None:
     def export_jianying(pid, eid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         ep = projects.get_episode(pid, eid)
         if not ep:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "分集不存在"}), 404
         body = request.json or {}
         items = body.get("items") or []
         if not items:
-            return jsonify({"error": "??????"}), 400
-        draft_name = body.get("draft_name") or f"{p.get('name', '椤圭洰')}_{ep.get('name', eid)}"
+            return jsonify({"error": "请选择导出片段"}), 400
+        draft_name = body.get("draft_name") or f"{p.get('name', '项目')}_{ep.get('name', eid)}"
         try:
             zip_path = jianying_export.build_draft(pid, draft_name, items)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         except Exception as e:  # noqa: BLE001
-            return jsonify({"error": f"鍓槧鑽夌瀵煎嚭澶辫触: {e}"}), 500
+            return jsonify({"error": f"剪映草稿导出失败: {e}"}), 500
         return send_file(str(zip_path), as_attachment=True,
                          download_name=zip_path.name, mimetype="application/zip")
 
     @app.route("/api/projects/<pid>/shot_material/select", methods=["POST"])
     def select_shot_material(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         eid = body.get("episode_id") or projects.first_episode_id(pid)
         shot_no = body.get("shot_no")
         if not eid or not shot_no:
-            return jsonify({"error": "缂哄皯 episode_id 鎴?shot_no"}), 400
+            return jsonify({"error": "缺少 episode_id 或 shot_no"}), 400
         material = {
             "bid": body.get("bid"),
             "filename": body.get("filename"),
             "kind": body.get("kind"),
         }
         if not material["bid"] or not material["filename"]:
-            return jsonify({"error": "缂哄皯绱犳潗鎵规鎴栨枃浠跺悕"}), 400
+            return jsonify({"error": "缺少素材批次或文件名"}), 400
         selected = projects.update_shot_selected_material(pid, eid, shot_no, material)
         if not selected:
-            return jsonify({"error": "鍒嗛暅涓嶅瓨鍦ㄦ垨绱犳潗淇℃伅鏃犳晥"}), 404
+            return jsonify({"error": "分镜不存在或素材信息无效"}), 404
         return jsonify({"ok": True, "selected_material": selected})
 
     def _resolve_episode(pid, body):
         eid = (body or {}).get("episode_id") or projects.first_episode_id(pid)
         return eid, projects.get_episode(pid, eid)
 
-    # 鈹€鈹€ story bible: manual edit of novel-level scalar fields 鈹€鈹€
-    # 椋庢牸({{style}})/鏍囬/姊楁鍙墜鍔ㄨ瀹氾紱鎵嬭鍚庡叏娴佺▼娌跨敤璇ュ€硷紝涓旈噸鏂板垎鏋愪笉瑕嗙洊銆?
+    # story bible: manual edit of novel-level scalar fields
+    # 标题、风格、梗概允许手动设定；后续流程沿用这些值，重新分析不覆盖。
     @app.route("/api/projects/<pid>/story_bible", methods=["PATCH"])
     def update_story_bible(pid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         bible = dict(p.get("story_bible") or {})
         for k in ("title", "logline", "style", "summary"):
@@ -223,7 +224,7 @@ def register(app: Flask) -> None:
         projects.update_project(pid, {"story_bible": bible})
         return jsonify({"story_bible": bible})
 
-    # 鈹€鈹€ stage 1: global analysis (per episode 鈫?merged into shared bible) 鈹€鈹€
+    # stage 1: global analysis (per episode merged into shared bible)
     def _story_bible_scalar_seed(existing: dict | None) -> dict:
         existing = existing or {}
         seed = {"characters": [], "scenes": [], "props": [], "continuity_constraints": []}
@@ -248,17 +249,18 @@ def register(app: Flask) -> None:
     def analyze_project(pid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         eid, ep = _resolve_episode(pid, body)
         if not ep:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "分集不存在"}), 404
         try:
             bible = script_analysis.run_global_analysis(ep, model=body.get("model"))
         except Exception as e:  # noqa: BLE001
+            logger.exception("全局分析失败 pid=%s episode=%s", pid, eid)
             return jsonify({"error": str(e)}), 502
         # Replace this episode's analysis contribution, then rebuild the shared
-        # StoryBible from per-episode bibles. This makes "閲嶆柊鍒嗘瀽" a real
+        # StoryBible from per-episode bibles. This makes "重新分析" a real
         # overwrite instead of accumulating stale characters/scenes/props.
         merged = _rebuild_story_bible_from_episodes(p, eid, bible)
         projects.update_project(pid, {"story_bible": merged})
@@ -271,29 +273,29 @@ def register(app: Flask) -> None:
         })
         return jsonify({"story_bible": merged, "episode_bible": bible})
 
-    # 鈹€鈹€ stage 2: decompose (async, polled) 鈹€鈹€
+    # stage 2: decompose (async, polled)
     @app.route("/api/projects/<pid>/decompose", methods=["POST"])
     def decompose_project(pid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         if not p.get("story_bible"):
-            return jsonify({"error": "??????"}), 400
+            return jsonify({"error": "请先完成全局分析"}), 400
         body = request.json or {}
         eid, ep = _resolve_episode(pid, body)
         if not ep:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "分集不存在"}), 404
         ep_stage = ep.get("stage") or "imported"
         ep_ready = bool(ep.get("story_bible")) or ep_stage in {"analyzed", "decomposed"} or bool(ep.get("shots"))
         if not ep_ready:
-            return jsonify({"error": "璇峰厛鍒嗘瀽褰撳墠鍒嗛泦锛屽啀杩涜鍒嗛暅鎷嗚В"}), 400
+            return jsonify({"error": "请先分析当前分集，再进行分镜拆解"}), 400
         model = body.get("model")
         ep_no = ep.get("idx", 1)
         mode = (body.get("mode") or "auto").strip()
-        template_preset = body.get("template_preset")  # 鍒嗛暅妯″紡锛坆atch_decompose 棰勮锛?
+        template_preset = body.get("template_preset")  # 分镜模式预设
         manual_segments = body.get("manual_segments") or []
         if mode == "manual" and not [s for s in manual_segments if (s or "").strip()]:
-            return jsonify({"error": "??????"}), 400
+            return jsonify({"error": "手动模式请至少填写一段内容"}), 400
         # cross-episode handoff: seed with the previous episode's closing handoff
         prev_ep = projects.prev_episode(pid, eid)
         prev_handoff = None
@@ -331,14 +333,14 @@ def register(app: Flask) -> None:
     def get_job(job_id):
         job = jobs.get(job_id)
         if not job:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "任务不存在"}), 404
         return jsonify(job)
 
-    # 鈹€鈹€ assets (Phase 3: @/#/$) 鈹€鈹€
+    # assets (Phase 3: @/#/$)
     @app.route("/api/projects/<pid>/assets", methods=["GET"])
     def list_assets(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         return jsonify(assets_core.list_assets(pid))
 
     @app.route("/api/assets/library", methods=["GET"])
@@ -372,7 +374,7 @@ def register(app: Flask) -> None:
     @app.route("/api/projects/<pid>/assets", methods=["POST"])
     def add_asset(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         try:
             asset = assets_core.add_asset(
@@ -392,7 +394,7 @@ def register(app: Flask) -> None:
     def update_asset(pid, aid):
         asset = assets_core.update_asset(pid, aid, request.json or {})
         if not asset:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "资产不存在"}), 404
         return jsonify(asset)
 
     @app.route("/api/projects/<pid>/assets/<aid>", methods=["DELETE"])
@@ -404,9 +406,9 @@ def register(app: Flask) -> None:
     def seed_assets(pid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         if not p.get("story_bible"):
-            return jsonify({"error": "璇峰厛瀹屾垚鍏ㄥ眬鍒嗘瀽锛圫tage 1锛夊啀瀵煎叆璧勪骇"}), 400
+            return jsonify({"error": "请先完成全局分析（Stage 1）再导入资产"}), 400
         return jsonify(assets_core.seed_from_bible(pid))
 
     @app.route("/api/projects/<pid>/assets/<aid>/refimage", methods=["POST"])
@@ -425,10 +427,10 @@ def register(app: Flask) -> None:
     def start_gen_ref_image(pid, aid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         asset = next((a for a in p.get("assets", []) if a.get("id") == aid), None)
         if not asset:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "资产不存在"}), 404
         body = request.json or {}
         model = body.get("model")
         size = body.get("size", "1024x1024")
@@ -459,7 +461,7 @@ def register(app: Flask) -> None:
     def gen_missing_ref_images(pid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         try:
             out = asset_gen.generate_missing(
@@ -475,7 +477,7 @@ def register(app: Flask) -> None:
     def start_gen_missing_ref_images(pid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         pending = [a for a in p.get("assets", []) if not a.get("ref_image")]
         total = len(pending)
@@ -510,17 +512,30 @@ def register(app: Flask) -> None:
     @app.route("/api/projects/<pid>/assets/<aid>/import-image", methods=["POST"])
     def import_ref_image(pid, aid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         f = request.files.get("file")
         if not f:
-            return jsonify({"error": "??????"}), 400
+            return jsonify({"error": "缺少上传文件"}), 400
         import tempfile
         suffix = "." + (f.filename.rsplit(".", 1)[-1] if "." in (f.filename or "") else "png")
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         try:
             f.save(tmp.name)
             tmp.close()
-            out = asset_gen.import_ref_image(pid, aid, tmp.name, orig_name=f.filename or "")
+            line_options = None
+            raw_line_options = request.form.get("line_options") or ""
+            if raw_line_options:
+                try:
+                    line_options = json.loads(raw_line_options)
+                except json.JSONDecodeError:
+                    line_options = None
+            out = asset_gen.import_ref_image(
+                pid, aid, tmp.name,
+                orig_name=f.filename or "",
+                purpose=request.form.get("purpose") or "import",
+                base_image=request.form.get("base_image") or "",
+                line_options=line_options,
+            )
         except image_gen.GenerationError as e:
             return jsonify({"error": str(e)}), 400
         except Exception as e:  # noqa: BLE001
@@ -530,6 +545,18 @@ def register(app: Flask) -> None:
                 os.unlink(tmp.name)
             except OSError:
                 pass
+        return jsonify(out)
+
+    @app.route("/api/projects/<pid>/assets/<aid>/restore-original", methods=["POST"])
+    def restore_original_ref_image(pid, aid):
+        if not projects.get_project(pid):
+            return jsonify({"error": "项目不存在"}), 404
+        try:
+            out = asset_gen.restore_original_ref_image(pid, aid)
+        except image_gen.GenerationError as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception as e:  # noqa: BLE001
+            return jsonify({"error": str(e)}), 500
         return jsonify(out)
 
     @app.route("/api/projects/<pid>/assets/<aid>/import-library", methods=["POST"])
@@ -556,26 +583,26 @@ def register(app: Flask) -> None:
     @app.route("/api/projects/<pid>/resolve", methods=["POST"])
     def resolve_mentions(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         text = (request.json or {}).get("text", "")
         return jsonify(assets_core.resolve_mentions(text, assets_core.list_assets(pid)))
 
-    # 鈹€鈹€ batches (Phase 4) 鈹€鈹€
+    # batches (Phase 4)
     @app.route("/api/projects/<pid>/batches", methods=["GET"])
     def list_batches(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         return jsonify(batches.list_batches(pid))
 
     @app.route("/api/projects/<pid>/shot_prompts", methods=["POST"])
     def shot_prompts(pid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "分集不存在"}), 404
         body = request.json or {}
         _eid, ep = _resolve_episode(pid, body)
         if not ep:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         ctx = {**ep, "_pid": pid, "assets": p.get("assets", []),
                "story_bible": p.get("story_bible")}
         prompts = batch_engine.build_shot_prompts(
@@ -590,35 +617,35 @@ def register(app: Flask) -> None:
     def save_shot_prompts(pid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         shot_no = body.get("shot_no")
         if not shot_no:
-            return jsonify({"error": "缂哄皯 shot_no"}), 400
+            return jsonify({"error": "缺少 shot_no"}), 400
         _eid, ep = _resolve_episode(pid, body)
         if not ep:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "分集不存在"}), 404
         saved = projects.update_shot_prompts(pid, ep["id"], shot_no, {
             "image": body.get("image", ""),
             "video": body.get("video", ""),
             "source": body.get("source", "manual"),
         })
         if saved is None:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "分镜不存在"}), 404
         return jsonify({"ok": True, "prompt_overrides": saved})
 
     @app.route("/api/projects/<pid>/infer_shot_prompt", methods=["POST"])
     def infer_shot_prompt(pid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         shot_no = body.get("shot_no")
         if not shot_no:
-            return jsonify({"error": "缂哄皯 shot_no"}), 400
+            return jsonify({"error": "缺少 shot_no"}), 400
         _eid, ep = _resolve_episode(pid, body)
         if not ep:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "分集不存在"}), 404
         ctx = {**ep, "_pid": pid, "assets": p.get("assets", []),
                "story_bible": p.get("story_bible")}
         try:
@@ -657,7 +684,7 @@ def register(app: Flask) -> None:
     def create_batch(pid):
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         kind = body.get("kind", "image")
         source = body.get("source", "shots")
@@ -674,15 +701,15 @@ def register(app: Flask) -> None:
         else:
             eid, ep = _resolve_episode(pid, body)
             if not ep:
-                return jsonify({"error": "?????"}), 404
+                return jsonify({"error": "分集不存在"}), 404
             if ep.get("stage") != "decomposed" and not ep.get("shots"):
-                return jsonify({"error": "??????"}), 400
+                return jsonify({"error": "当前分集尚未拆解"}), 400
             ctx = {**ep, "assets": p.get("assets", []),
                    "story_bible": p.get("story_bible")}
             tasks = batch_engine.build_tasks_from_shots(ctx, body.get("shot_nos"))
             _apply_prompts(tasks, kind, body.get("prompt_overrides") or {})
         if not tasks:
-            return jsonify({"error": "娌℃湁鍙敓鎴愮殑浠诲姟"}), 400
+            return jsonify({"error": "没有可生成的任务"}), 400
         params = dict(body.get("params", {}) or {})
         if source != "manual":
             params.setdefault("episode_id", eid)
@@ -702,13 +729,63 @@ def register(app: Flask) -> None:
     def get_batch(pid, bid):
         b = batches.get_batch(pid, bid)
         if not b:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "批次不存在"}), 404
         return jsonify(b)
 
     @app.route("/api/projects/<pid>/batches/<bid>", methods=["DELETE"])
     def delete_batch(pid, bid):
         batches.delete_batch(pid, bid)
         return jsonify({"ok": True})
+
+    @app.route("/api/projects/<pid>/batches/<bid>/tasks/<task_id>/result", methods=["DELETE"])
+    def delete_batch_task_result(pid, bid, task_id):
+        if not batches.get_batch(pid, bid):
+            return jsonify({"error": "批次不存在"}), 404
+        deleted = batches.delete_task_result(pid, bid, task_id)
+        if not deleted:
+            return jsonify({"error": "任务不存在或素材结果不存在"}), 404
+
+        filename = deleted.get("filename") or ""
+        file_deleted = False
+        if filename:
+            base = (OUTPUT_DIR / pid / bid).resolve()
+            target = (base / filename).resolve()
+            try:
+                target.relative_to(base)
+                if target.exists() and target.is_file():
+                    target.unlink()
+                    file_deleted = True
+            except Exception:  # noqa: BLE001
+                app.logger.warning("skip unsafe output delete: pid=%s bid=%s filename=%s", pid, bid, filename)
+
+        cleared = projects.clear_selected_material(pid, bid, filename)
+        return jsonify({"ok": True, "deleted": deleted, "file_deleted": file_deleted, "cleared_selected": cleared})
+
+    @app.route("/api/projects/<pid>/batch_errors/dismiss", methods=["POST"])
+    def dismiss_batch_errors(pid):
+        body = request.json or {}
+        items = body.get("items") or []
+        if not isinstance(items, list) or not items:
+            return jsonify({"error": "没有可清除的错误条目"}), 400
+        grouped = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            bid = str(item.get("batch_id") or item.get("batchId") or "").strip()
+            tid = str(item.get("task_id") or item.get("taskId") or "").strip()
+            if not bid or not tid:
+                continue
+            grouped.setdefault(bid, []).append(tid)
+        if not grouped:
+            return jsonify({"error": "错误条目缺少批次或任务编号"}), 400
+        total = 0
+        updated = []
+        for bid, task_ids in grouped.items():
+            result = batches.dismiss_task_errors(pid, bid, task_ids)
+            total += int(result.get("dismissed") or 0)
+            if result.get("batch"):
+                updated.append(result["batch"])
+        return jsonify({"ok": True, "dismissed": total, "batches": updated})
 
     def _start_batch_job(pid, bid):
         def worker(job_id):
@@ -720,21 +797,23 @@ def register(app: Flask) -> None:
     @app.route("/api/projects/<pid>/batches/<bid>/start", methods=["POST"])
     def start_batch(pid, bid):
         if not batches.get_batch(pid, bid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "批次不存在"}), 404
         return jsonify({"job_id": _start_batch_job(pid, bid)})
 
     @app.route("/api/projects/<pid>/batches/<bid>/pause", methods=["POST"])
     def pause_batch(pid, bid):
         if not batches.get_batch(pid, bid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "批次不存在"}), 404
         batch_engine.pause(bid)
         batches.request_pause(pid, bid)
-        return jsonify({"ok": True})
+        batches.normalize_stopping(pid, bid)
+        cancelled = batch_engine.cancel_doubao_tasks(pid, bid)
+        return jsonify({"ok": True, "cancelled_doubao_tasks": cancelled})
 
     @app.route("/api/projects/<pid>/batches/<bid>/retry", methods=["POST"])
     def retry_batch(pid, bid):
         if not batches.get_batch(pid, bid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         batches.reset_failed(pid, bid)
         return jsonify({"job_id": _start_batch_job(pid, bid)})
 
@@ -743,12 +822,12 @@ def register(app: Flask) -> None:
         # Per-episode concurrent generation.
         p = projects.get_project(pid)
         if not p:
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         kind = body.get("kind", "image")
         eps = body.get("episodes") or []
         if not eps:
-            return jsonify({"error": "鏈€夋嫨浠讳綍鍒嗛泦"}), 400
+            return jsonify({"error": "未选择任何分集"}), 400
         params_base = dict(body.get("params") or {})
         default_cap = settings_store.load_settings().get("max_parallel_episodes", 2)
         max_parallel = int(body.get("max_parallel") or default_cap)
@@ -764,13 +843,13 @@ def register(app: Flask) -> None:
             tasks = batch_engine.build_tasks_from_shots(ctx, item.get("shot_nos"))
             _apply_prompts(tasks, kind, item.get("prompt_overrides") or {})
             if not tasks:
-                skipped.append({"episode_id": eid, "reason": "鏃犲彲鐢熸垚鍒嗛暅"})
+                skipped.append({"episode_id": eid, "reason": "无可生成分镜"})
                 continue
             label = f"{ep.get('name', eid)}-并发{'生视频' if kind == 'video' else '生图'}"
             params = {**params_base, "episode_id": eid,
                       "episode_name": ep.get("name") or f"episode-{ep.get('idx', '')}"}
             try:
-                # 鍗曢泦涓茶锛歝oncurrency=1锛堝惈杩炵画鎬ч摼璺級
+                # 单集串行：concurrency=1，保留连续性链路
                 batch = batches.create_batch(
                     pid, kind, label, tasks, concurrency=1, params=params,
                     max_attempts=body.get("max_attempts", 3))
@@ -779,7 +858,7 @@ def register(app: Flask) -> None:
                 continue
             created.append({"episode_id": eid, "batch_id": batch["id"], "total": len(tasks)})
         if not created:
-            return jsonify({"error": "??????"}), 400
+            return jsonify({"error": "没有可创建的分集批次"}), 400
         job_id = episode_runner.start(pid, [c["batch_id"] for c in created], max_parallel)
         return jsonify({"created": created, "skipped": skipped,
                         "job_id": job_id, "max_parallel": max_parallel})
@@ -788,23 +867,23 @@ def register(app: Flask) -> None:
     def serve_output(pid, bid, filename):
         return send_from_directory(OUTPUT_DIR / pid / bid, filename)
 
-    # 鈹€鈹€ continuity engine (Phase 5) 鈹€鈹€
+    # continuity engine (Phase 5)
     @app.route("/api/projects/<pid>/continuity", methods=["GET"])
     def get_continuity(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         return jsonify(story_state.get_state(pid))
 
     @app.route("/api/projects/<pid>/continuity/reset", methods=["POST"])
     def reset_continuity(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         return jsonify(story_state.reset(pid))
 
     @app.route("/api/projects/<pid>/continuity/decide", methods=["POST"])
     def decide_continuity(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         shot = body.get("shot") or {}
         with story_state.continuity_lock(pid):
@@ -820,7 +899,7 @@ def register(app: Flask) -> None:
     @app.route("/api/projects/<pid>/continuity/tailframe", methods=["POST"])
     def tailframe_continuity(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         shot_no = body.get("shot_no", "")
         # video path: explicit path, or resolve from batch output
@@ -828,7 +907,7 @@ def register(app: Flask) -> None:
         if not video_path and body.get("bid") and body.get("filename"):
             video_path = str(OUTPUT_DIR / pid / body["bid"] / body["filename"])
         if not video_path:
-            return jsonify({"error": "??????"}), 400
+            return jsonify({"error": "缺少视频路径"}), 400
         try:
             with story_state.continuity_lock(pid):
                 out = continuity.extract_tail_frame(pid, shot_no, video_path)
@@ -841,7 +920,7 @@ def register(app: Flask) -> None:
     @app.route("/api/projects/<pid>/continuity/staging", methods=["POST"])
     def staging_continuity(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         shot = body.get("shot") or {}
         try:
@@ -867,7 +946,7 @@ def register(app: Flask) -> None:
     @app.route("/api/projects/<pid>/continuity/director", methods=["POST"])
     def director_continuity(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         shot = body.get("shot") or {}
         try:
@@ -893,7 +972,7 @@ def register(app: Flask) -> None:
     @app.route("/api/projects/<pid>/continuity/review", methods=["POST"])
     def review_continuity(pid):
         if not projects.get_project(pid):
-            return jsonify({"error": "?????"}), 404
+            return jsonify({"error": "项目不存在"}), 404
         body = request.json or {}
         shot = body.get("shot") or {}
         try:
@@ -910,7 +989,7 @@ def register(app: Flask) -> None:
     def serve_continuity_image(pid, filename):
         return send_from_directory(story_state.continuity_dir(pid), filename)
 
-    # 鈹€鈹€ prompt templates 鈹€鈹€
+    # prompt templates
     @app.route("/api/templates", methods=["GET"])
     def list_templates():
         return jsonify(tpl.load_templates(decorate=True))

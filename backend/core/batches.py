@@ -53,7 +53,8 @@ def _save_index(pid: str, idx: list) -> None:
 def _summarize(b: dict) -> dict:
     tasks = b.get("tasks", [])
     done = sum(1 for t in tasks if t["status"] == "done")
-    err = sum(1 for t in tasks if t["status"] == "error")
+    err = sum(1 for t in tasks if t["status"] == "error" and not t.get("error_dismissed_at"))
+    skipped = sum(1 for t in tasks if t["status"] == "skipped")
     return {
         "id": b["id"],
         "name": b.get("name", ""),
@@ -62,6 +63,7 @@ def _summarize(b: dict) -> dict:
         "total": len(tasks),
         "done": done,
         "error": err,
+        "skipped": skipped,
         "concurrency": b.get("concurrency", 2),
         "pause_requested": bool(b.get("pause_requested")),
         "episode_id": (b.get("params") or {}).get("episode_id"),
@@ -201,10 +203,32 @@ def request_pause(pid: str, bid: str) -> Optional[dict]:
                 t["stage_label"] = "已暂停等待"
                 t["updated_at"] = time.time()
             elif t.get("status") == "running":
-                t["stage"] = "stopping"
-                t["stage_label"] = "停止中"
+                t["status"] = "paused"
+                t["stage"] = "paused"
+                t["stage_label"] = "已暂停"
                 t["updated_at"] = time.time()
+        batch["status"] = "paused"
         return save_batch(pid, batch)
+
+
+def normalize_stopping(pid: str, bid: str) -> Optional[dict]:
+    with _mutate_lock:
+        batch = get_batch(pid, bid)
+        if not batch:
+            return None
+        changed = False
+        for t in batch.get("tasks", []):
+            if t.get("stage") == "stopping" or t.get("stage_label") == "停止中":
+                t["status"] = "paused"
+                t["stage"] = "paused"
+                t["stage_label"] = "已暂停"
+                t["updated_at"] = time.time()
+                changed = True
+        if changed:
+            batch["pause_requested"] = True
+            batch["status"] = "paused"
+            return save_batch(pid, batch)
+        return batch
 
 
 def clear_pause_request(pid: str, bid: str) -> Optional[dict]:
@@ -227,14 +251,72 @@ def reset_failed(pid: str, bid: str) -> Optional[dict]:
         if not batch:
             return None
         for t in batch["tasks"]:
-            if t["status"] in ("error", "paused"):
+            if t.get("status") == "error" and t.get("error_dismissed_at"):
+                continue
+            if t["status"] in ("error", "paused", "skipped"):
                 t["status"] = "pending"
                 t["error"] = None
                 t["attempts"] = 0
                 t["stage"] = "pending"
                 t["stage_label"] = ""
+                t.pop("error_dismissed_at", None)
+                t.pop("error_dismissed_by", None)
+                t.pop("error_dismissed_reason", None)
         batch["pause_requested"] = False
         return save_batch(pid, batch)
+
+
+def dismiss_task_errors(pid: str, bid: str, task_ids: list[str], *, reason: str = "user_clear") -> dict:
+    with _mutate_lock:
+        batch = get_batch(pid, bid)
+        if not batch:
+            return {"ok": False, "dismissed": 0, "batch": None}
+        wanted = {str(x) for x in (task_ids or []) if str(x or "").strip()}
+        now = time.time()
+        dismissed = 0
+        for t in batch.get("tasks", []):
+            if wanted and str(t.get("id") or "") not in wanted:
+                continue
+            if t.get("status") != "error" and not t.get("error"):
+                continue
+            t["error_dismissed_at"] = now
+            t["error_dismissed_by"] = "worktable"
+            t["error_dismissed_reason"] = reason or "user_clear"
+            t["updated_at"] = now
+            dismissed += 1
+        if dismissed:
+            batch["last_error_dismissed_at"] = now
+            batch = save_batch(pid, batch)
+        return {"ok": True, "dismissed": dismissed, "batch": batch}
+
+
+def delete_task_result(pid: str, bid: str, task_id: str) -> Optional[dict]:
+    """Clear one generated task result without deleting the whole batch."""
+    with _mutate_lock:
+        batch = get_batch(pid, bid)
+        if not batch:
+            return None
+        for t in batch.get("tasks", []):
+            if str(t.get("id")) != str(task_id):
+                continue
+            result = t.get("result") if isinstance(t.get("result"), dict) else {}
+            filename = str((result or {}).get("filename") or "")
+            t["result"] = None
+            t["deleted_result"] = {
+                "filename": filename,
+                "deleted_at": time.time(),
+            }
+            t["stage"] = "deleted"
+            t["stage_label"] = "素材已删除"
+            t["updated_at"] = time.time()
+            save_batch(pid, batch)
+            return {
+                "task_id": t.get("id"),
+                "shot_no": t.get("shot_no"),
+                "filename": filename,
+                "status": t.get("status"),
+            }
+    return None
 
 
 def delete_batch(pid: str, bid: str) -> None:

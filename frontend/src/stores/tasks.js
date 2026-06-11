@@ -25,7 +25,7 @@ let batchRefreshing = false
 // a batch finishes. Poll quickly at first, then back off to avoid hammering.
 const BATCH_POLL_INITIAL_DELAY = 4_000
 const BATCH_POLL_INTERVAL = 20_000
-const BATCH_POLL_MAX_MINUTES_DEFAULT = 30
+const BATCH_POLL_MAX_MINUTES_DEFAULT = 5
 const DECOMPOSE_POLL_INTERVAL = 1_000
 const ASSET_POLL_INTERVAL = 1_500
 
@@ -79,17 +79,19 @@ export const useTasksStore = defineStore('tasks', {
       if (!eid) return null
       const bs = s.batches.filter((b) => b.episode_id === eid)
       if (!bs.length) return null
-      let total = 0, done = 0, error = 0
+      let total = 0, done = 0, error = 0, skipped = 0
       let running = false, queued = false
       for (const b of bs) {
         total += b.total || 0
         done += b.done || 0
         error += b.error || 0
+        skipped += b.skipped || 0
         if (b.status === 'running') running = true
         else if (b.status === 'pending') queued = true
       }
-      const status = running ? 'running' : queued ? 'queued' : error ? 'error' : 'done'
-      return { total, done, error, status, percent: total ? Math.round((done / total) * 100) : 0 }
+      const manual = Boolean(skipped && !done && skipped >= total)
+      const status = running ? 'running' : queued ? 'queued' : error ? 'error' : manual ? 'manual' : 'done'
+      return { total, done, error, skipped, status, percent: total ? Math.round(((done + error + skipped) / total) * 100) : 0 }
     },
   },
   actions: {

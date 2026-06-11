@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -63,6 +64,57 @@ def _normalize_base(api_base: str) -> str:
     if api_base.endswith("/v1"):
         return api_base[:-3]
     return api_base
+
+
+_OPENAI_SIZE_RE = re.compile(r"^\s*(\d+)\s*x\s*(\d+)\s*$", re.IGNORECASE)
+_ASPECT_RE = re.compile(r"^\s*(\d+)\s*:\s*(\d+)\s*$")
+
+
+def _image_size_for_aspect(aspect: str, *, model: str = "") -> str:
+    """Map local aspect-ratio presets to OpenAI-compatible image sizes."""
+    text = str(aspect or "").strip()
+    match = _ASPECT_RE.match(text)
+    if not match:
+        return "1024x1024"
+    w, h = int(match.group(1)), int(match.group(2))
+    if w <= 0 or h <= 0:
+        return "1024x1024"
+    if abs((w / h) - 1.0) < 0.04:
+        return "1024x1024"
+
+    model_name = (model or "").lower()
+    if "dall-e-2" in model_name or "dalle-2" in model_name:
+        return "1024x1024"
+    if "dall-e-3" in model_name or "dalle-3" in model_name:
+        return "1792x1024" if w > h else "1024x1792"
+    return "1536x1024" if w > h else "1024x1536"
+
+
+def _normalize_openai_image_size(size: str, *, model: str = "") -> str:
+    """Normalize UI/Vidu-style size values before calling OpenAI-style APIs.
+
+    Vidu accepts values such as ``16:9@1080p``. OpenAI-compatible image APIs
+    usually expect ``widthxheight``; sending the local preset verbatim causes
+    upstream "invalid size" errors. Exact ``widthxheight`` values are preserved.
+    """
+    text = str(size or "").strip()
+    if not text:
+        return "1024x1024"
+
+    exact = _OPENAI_SIZE_RE.match(text)
+    if exact:
+        return f"{int(exact.group(1))}x{int(exact.group(2))}"
+
+    # Drop optional sample/count suffixes used by some local providers.
+    core = text.split("#", 1)[0].strip()
+    if "@" in core:
+        aspect = core.split("@", 1)[0].strip()
+        return _image_size_for_aspect(aspect, model=model)
+    if _ASPECT_RE.match(core):
+        return _image_size_for_aspect(core, model=model)
+    if core.lower() == "auto":
+        return "auto"
+    return "1024x1024"
 
 
 def _parse_image_result(result: dict, timeout: int) -> str:
@@ -144,6 +196,13 @@ def generate_image(
 
     api_base = _normalize_base(api_base)
     model = model or default_model or "gpt-image-1"
+    requested_size = size
+    size = _normalize_openai_image_size(size, model=model)
+    if str(requested_size or "").strip() != size:
+        logger.info(
+            "[Generate] normalized image size provider=%s model=%s requested_size=%s api_size=%s",
+            provider, model, requested_size, size,
+        )
     ref_images_b64 = [b for b in (ref_images_b64 or []) if b]
 
     headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}

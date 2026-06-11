@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>豆包任务助手</title>
+    <link rel="stylesheet" href="ui.css">
+  </head>
+  <body>
+    <main class="panel">
+      <header class="header">
+        <div>
+          <h1>豆包任务助手</h1>
+          <p id="statusText">Waiting for current tab</p>
+        </div>
+        <button id="refreshBtn" class="icon-btn" title="Refresh" aria-label="Refresh">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
+            <path d="M21 3v6h-6"/>
+          </svg>
+        </button>
+      </header>
+
+      <section id="resultList" class="result-list"></section>
+    </main>
+
+    <template id="videoItemTemplate">
+      <article class="video-item">
+        <div class="video-meta">
+          <strong class="video-title"></strong>
+          <span class="video-detail"></span>
+        </div>
+        <button class="download-btn" title="Save" aria-label="Save">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <path d="M7 10l5 5 5-5"/>
+            <path d="M12 15V3"/>
+          </svg>
+        </button>
+      </article>
+    </template>
+
+    <script src="gate.js"></script>
+    <script src="ui.js"></script>
+  </body>
+</html>

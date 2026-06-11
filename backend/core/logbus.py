@@ -8,6 +8,7 @@ buffer via :func:`export_text` to hand to a developer when reporting a bug.
 import logging
 import re
 import time
+import traceback
 from collections import deque
 
 _buffer: deque = deque(maxlen=2000)
@@ -30,6 +31,11 @@ class MemoryLogHandler(logging.Handler):
             msg = record.getMessage()
         except Exception:  # noqa: BLE001 — never let logging crash the app
             msg = str(record.msg)
+        if record.exc_info:
+            try:
+                msg = msg + "\n" + "".join(traceback.format_exception(*record.exc_info)).rstrip()
+            except Exception:  # noqa: BLE001
+                pass
         msg = _ANSI_RE.sub("", msg).strip()
         if not msg or any(kw in msg for kw in _FILTER):
             return

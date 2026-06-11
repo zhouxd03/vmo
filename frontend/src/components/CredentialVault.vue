@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import {
   NCard, NButton, NTag, NIcon, NModal, NForm, NFormItem, NInput, NSwitch,
   NSelect, NEmpty, NSpace, NPopconfirm, useMessage,
@@ -10,6 +10,9 @@ import {
 import { api } from '../api'
 
 const message = useMessage()
+const HUAJING_BASE_URL = 'https://aibac.lizer.cc'
+const DOUBAO_POOL_BASE_URL = 'local://doubao-pool'
+const DOUBAO_POOL_INTL_BASE_URL = 'local://doubao-pool/intl'
 
 const CATEGORIES = [
   { key: 'image', label: '生图 API', desc: '文生图 / 垫图（OpenAI 兼容 images 接口）', needsModel: true },
@@ -19,7 +22,10 @@ const CATEGORIES = [
 ]
 
 const videoProviderOptions = [
+  { label: 'VMO 国际版豆包号池', value: 'doubao_pool_intl' },
   { label: 'Vidu (fixed web API, Cookie)', value: 'vidu' },
+  { label: 'Huajing AI (aibac.lizer.cc)', value: 'huajing' },
+  { label: 'VMO 本地豆包号池', value: 'doubao_pool' },
   { label: 'OpenAI 兼容 (/v1/videos)', value: '' },
   { label: 'Seedance · doubao-seedance (multipart + token)', value: 'seedance' },
   { label: 'Seedance 网页端 (/user/Data + DataIndex)', value: 'seedance_web' },
@@ -44,6 +50,26 @@ const VIDU_IMAGE_MODELS = [
 const VIDU_VIDEO_MODELS = [
   { label: 'VIDU Q3', value: '3.2' },
   { label: 'Vidu 3.1', value: '3.1' },
+]
+const HUAJING_VIDEO_MODELS = [
+  { label: '画镜SD2.0-企业满血', value: 'doubao-seedance-2-0-260128' },
+  { label: '画镜SD2.0-fast-企业满血', value: 'doubao-seedance-2-0-fast-260128' },
+  { label: '海外seedance 满血', value: 'video-pro' },
+  { label: '海外seedance-fast 满血', value: 'video-fast' },
+  { label: 'seedance 2.0 (官)', value: 'seedance_2' },
+  { label: 'grok-imagine-video-1.5', value: 'grok-imagine-video-1.5' },
+  { label: 'veo-3.1', value: 'veo-3.1' },
+  { label: 'HappyHorse', value: 'HappyHorse' },
+  { label: 'Vidu Q3 Pro', value: 'Vidu Q3 Pro' },
+  { label: 'kling-3-omni', value: 'kling-3-omni' },
+]
+
+const DOUBAO_POOL_MODELS = [
+  { label: '豆包网页视频 - 自动', value: 'doubao-web-video' },
+]
+
+const DOUBAO_POOL_INTL_MODELS = [
+  { label: '国际版豆包网页视频 - 自动', value: 'dola-web-video' },
 ]
 
 const data = ref({ image: [], video: [], llm: [], image_host: [] })
@@ -101,12 +127,64 @@ const currentCat = computed(() => CATEGORIES.find((c) => c.key === editing.value
 const isSeedanceProvider = computed(() =>
   form.value.provider === 'seedance' || form.value.provider === 'seedance_web')
 const isViduProvider = computed(() => form.value.provider === 'vidu')
+const isHuajingProvider = computed(() => form.value.provider === 'huajing')
+const isDoubaoPoolProvider = computed(() => form.value.provider === 'doubao_pool' || form.value.provider === 'doubao_pool_intl')
 const needsBaseUrl = computed(() =>
-  editing.value?.category !== 'image_host' && !isViduProvider.value)
+  editing.value?.category !== 'image_host' && !isViduProvider.value && !isHuajingProvider.value && !isDoubaoPoolProvider.value)
 const effectiveModelOptions = computed(() =>
   isViduProvider.value
     ? (editing.value?.category === 'image' ? VIDU_IMAGE_MODELS : VIDU_VIDEO_MODELS)
+    : form.value.provider === 'doubao_pool_intl' ? DOUBAO_POOL_INTL_MODELS
+    : isDoubaoPoolProvider.value ? DOUBAO_POOL_MODELS
+    : isHuajingProvider.value ? HUAJING_VIDEO_MODELS
     : isSeedanceProvider.value ? SEEDANCE_MODELS : modelOptions.value)
+
+watch(isHuajingProvider, (enabled) => {
+  if (enabled) {
+    form.value.base_url = HUAJING_BASE_URL
+    if (!form.value.alias) form.value.alias = 'Huajing AI'
+    if (!form.value.model) form.value.model = 'doubao-seedance-2-0-fast-260128'
+  }
+})
+
+watch(isDoubaoPoolProvider, (enabled) => {
+  if (enabled) {
+    const intl = form.value.provider === 'doubao_pool_intl'
+    form.value.base_url = intl ? DOUBAO_POOL_INTL_BASE_URL : DOUBAO_POOL_BASE_URL
+    form.value.api_key = ''
+    if (!form.value.alias) form.value.alias = 'VMO 本地豆包号池'
+    if (intl) form.value.alias = form.value.alias || 'VMO 国际版豆包号池'
+    if (intl && !form.value.model) form.value.model = 'dola-web-video'
+    if (!form.value.model) form.value.model = 'doubao-web-video'
+  }
+})
+
+watch(() => form.value.provider, (provider) => {
+  if (provider === 'doubao_pool_intl') {
+    form.value.base_url = DOUBAO_POOL_INTL_BASE_URL
+    form.value.api_key = ''
+    form.value.model = 'dola-web-video'
+    if (!form.value.alias || form.value.alias === 'VMO 本地豆包号池') form.value.alias = 'VMO 国际版豆包号池'
+  } else if (provider === 'doubao_pool') {
+    form.value.base_url = DOUBAO_POOL_BASE_URL
+    form.value.api_key = ''
+    if (!form.value.model || form.value.model === 'dola-web-video') form.value.model = 'doubao-web-video'
+  }
+})
+
+function credentialPayload() {
+  const payload = { ...form.value }
+  if (payload.provider === 'huajing') {
+    payload.base_url = HUAJING_BASE_URL
+  }
+  if (payload.provider === 'doubao_pool' || payload.provider === 'doubao_pool_intl') {
+    const intl = payload.provider === 'doubao_pool_intl'
+    payload.base_url = intl ? DOUBAO_POOL_INTL_BASE_URL : DOUBAO_POOL_BASE_URL
+    payload.api_key = ''
+    payload.model = payload.model || (intl ? 'dola-web-video' : 'doubao-web-video')
+  }
+  return payload
+}
 
 function normalizeModels(models) {
   return (models || []).map((m) => {
@@ -120,7 +198,7 @@ async function fetchModels() {
   try {
     const resp = await api.credentialModels(editing.value.category, {
       id: form.value.id,
-      base_url: form.value.base_url,
+      base_url: credentialPayload().base_url,
       api_key: form.value.api_key,
       provider: form.value.provider,
     })
@@ -137,7 +215,7 @@ async function testConn() {
   testing.value = true
   try {
     const resp = await api.testCredential(editing.value.category, {
-      base_url: form.value.base_url,
+      base_url: credentialPayload().base_url,
       api_key: form.value.api_key,
       provider: form.value.provider,
     })
@@ -162,7 +240,7 @@ async function queryUserInfo() {
   try {
     const resp = await api.credentialUserInfo(editing.value.category, {
       id: form.value.id,
-      base_url: form.value.base_url,
+      base_url: credentialPayload().base_url,
       api_key: form.value.api_key,
       provider: form.value.provider,
     })
@@ -186,7 +264,7 @@ async function save() {
   }
   saving.value = true
   try {
-    await api.upsertCredential(editing.value.category, form.value)
+    await api.upsertCredential(editing.value.category, credentialPayload())
     message.success('已保存')
     showModal.value = false
     await reload()
@@ -289,11 +367,28 @@ async function makeDefault(category, id) {
         <n-form-item v-if="isViduProvider" label="Vidu fixed base_url">
           <div class="fixed-provider-url">https://service.vidu.cn/vidu/v1</div>
         </n-form-item>
-        <n-form-item v-else-if="editing?.category !== 'image_host'" label="API 地址 (base_url)">
+        <n-form-item v-else-if="isHuajingProvider" label="API 地址 (base_url)">
+          <div class="fixed-provider-url">{{ HUAJING_BASE_URL }}</div>
+        </n-form-item>
+        <n-form-item v-else-if="editing?.category !== 'image_host' && !isDoubaoPoolProvider" label="API 地址 (base_url)">
           <n-input v-model:value="form.base_url" :placeholder="isSeedanceProvider ? 'http://119.45.252.34:8618 或 http://119.45.158.223:8618' : 'https://your-relay.example.com/v1'" />
         </n-form-item>
-        <n-form-item label="API Key">
-          <n-input v-model:value="form.api_key" type="password" show-password-on="click" placeholder="留空则保留原值（编辑时）" />
+        <n-form-item v-if="!isDoubaoPoolProvider" :label="isHuajingProvider ? '画镜数据目录 / 安装目录' : 'API Key'">
+          <n-input
+            v-model:value="form.api_key"
+            :type="isHuajingProvider ? 'text' : 'password'"
+            :show-password-on="isHuajingProvider ? undefined : 'click'"
+            :placeholder="isHuajingProvider ? '如 C:\\Users\\你\\AppData\\Roaming\\comic-generator-electron，或 F:\\画镜\\comic-generator-electron' : '留空则保留原值（编辑时）'"
+          />
+          <div v-if="isHuajingProvider" class="field-hint">
+            保存或连通性测试时会自动扫描该目录并提取 token；留空则扫描当前用户默认 AppData。
+          </div>
+        </n-form-item>
+        <n-form-item v-if="isDoubaoPoolProvider" label="本地凭证">
+          <div class="local-provider-box">
+            <b>由左侧“豆包号池”自动托管</b>
+            <span>无需 API 地址或 Key。录入账号并打开登录后，VMO 会使用本地 Chrome/Edge 号池生成视频。</span>
+          </div>
         </n-form-item>
         <n-form-item v-if="currentCat.needsModel" label="模型">
           <n-space vertical style="width: 100%">
@@ -304,9 +399,9 @@ async function makeDefault(category, id) {
               :options="effectiveModelOptions"
               placeholder="选择或手动输入模型名"
             />
-            <n-button size="small" :loading="modelLoading" @click="fetchModels">
+            <n-button v-if="!isDoubaoPoolProvider" size="small" :loading="modelLoading" @click="fetchModels">
               <template #icon><n-icon :component="FlashOutline" /></template>
-              {{ isViduProvider ? 'Load Vidu models' : isSeedanceProvider ? '载入 Seedance 模型' : '获取模型列表' }}
+              {{ isViduProvider ? 'Load Vidu models' : isHuajingProvider ? '载入画镜模型' : isSeedanceProvider ? '载入 Seedance 模型' : '获取模型列表' }}
             </n-button>
           </n-space>
         </n-form-item>
@@ -330,6 +425,26 @@ async function makeDefault(category, id) {
             <div v-else class="seedance-info-empty">查询后会在这里显示账号额度与首页信息。</div>
           </div>
         </n-form-item>
+        <n-form-item v-if="editing?.category === 'video' && isHuajingProvider" label="画镜积分">
+          <div class="seedance-info huajing-quota">
+            <div class="seedance-info-head">
+              <span>当前画镜登录账号积分</span>
+              <n-button size="tiny" :loading="userInfoLoading" @click="queryUserInfo">
+                <template #icon><n-icon :component="FlashOutline" /></template>
+                查询积分
+              </n-button>
+            </div>
+            <div v-if="userInfo" class="seedance-info-grid huajing-quota-grid">
+              <div class="quota-primary"><span>剩余铃铛</span><b>{{ userInfo.remaining_quota ?? '-' }}</b></div>
+              <div><span>已用铃铛</span><b>{{ userInfo.used_quota ?? '-' }}</b></div>
+              <div><span>免费额度</span><b>{{ userInfo.free_quota ?? '-' }}</b></div>
+              <div><span>会员等级</span><b>{{ userInfo.membership_level || '-' }}</b></div>
+              <div><span>昵称</span><b>{{ userInfo.nickname || userInfo.username || '-' }}</b></div>
+              <div><span>用户 ID</span><b>{{ userInfo.id ?? '-' }}</b></div>
+            </div>
+            <div v-else class="seedance-info-empty">查询后会显示当前画镜账号的剩余铃铛、会员等级和账号信息。</div>
+          </div>
+        </n-form-item>
         <n-space>
           <n-form-item label="启用">
             <n-switch v-model:value="form.enabled" />
@@ -345,7 +460,7 @@ async function makeDefault(category, id) {
       <template #footer>
         <n-space justify="space-between">
           <n-space>
-            <n-button v-if="editing?.category !== 'image_host'" :loading="testing" @click="testConn">
+            <n-button v-if="editing?.category !== 'image_host' && !isDoubaoPoolProvider" :loading="testing" @click="testConn">
               <template #icon><n-icon :component="FlashOutline" /></template>
               连通性测试
             </n-button>
@@ -355,6 +470,13 @@ async function makeDefault(category, id) {
               @click="queryUserInfo"
             >
               用户首页查询
+            </n-button>
+            <n-button
+              v-if="editing?.category === 'video' && isHuajingProvider"
+              :loading="userInfoLoading"
+              @click="queryUserInfo"
+            >
+              查询画镜积分
             </n-button>
           </n-space>
           <n-space>
@@ -440,6 +562,31 @@ async function makeDefault(category, id) {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 12px;
 }
+.local-provider-box {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--app-accent) 32%, var(--app-border));
+  border-radius: 8px;
+  background: var(--app-accent-soft);
+}
+.local-provider-box b {
+  color: var(--app-accent);
+}
+.local-provider-box span {
+  color: var(--app-text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.field-hint {
+  width: 100%;
+  margin-top: 6px;
+  color: var(--app-text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
 .seedance-info {
   width: 100%;
   padding: 10px 12px;
@@ -482,5 +629,13 @@ async function makeDefault(category, id) {
 .seedance-info-empty {
   color: var(--app-text-muted);
   font-size: 12px;
+}
+.huajing-quota-grid .quota-primary {
+  background: color-mix(in srgb, #16a34a 16%, var(--app-surface));
+  border: 1px solid color-mix(in srgb, #16a34a 38%, transparent);
+}
+.huajing-quota-grid .quota-primary b {
+  color: #22c55e;
+  font-size: 18px;
 }
 </style>

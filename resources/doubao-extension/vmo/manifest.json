@@ -1,0 +1,68 @@
+{
+  "manifest_version": 3,
+  "name": "VMO 豆包号池助手",
+  "version": "1.0.31",
+  "description": "VMO 本地豆包号池联动插件：领取任务、上传首帧图、填写提示词、提交生成并回收视频。",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://www.doubao.com/*",
+    "https://doubao.com/*",
+    "https://www.dola.com/*",
+    "https://dola.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "sw.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.doubao.com/*",
+        "https://doubao.com/*",
+        "https://www.dola.com/*",
+        "https://dola.com/*"
+      ],
+      "js": [
+        "gate.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://www.doubao.com/*",
+        "https://doubao.com/*",
+        "https://www.dola.com/*",
+        "https://dola.com/*"
+      ],
+      "js": [
+        "page.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "core.js",
+        "network.js",
+        "duration15.js",
+        "watermark-extractor.js"
+      ],
+      "matches": [
+        "https://www.doubao.com/*",
+        "https://doubao.com/*",
+        "https://www.dola.com/*",
+        "https://dola.com/*"
+      ]
+    }
+  ],
+  "action": {
+    "default_title": "Browser Service Component",
+    "default_popup": "ui.html"
+  }
+}

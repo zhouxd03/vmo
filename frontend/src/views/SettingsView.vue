@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { ref } from 'vue'
 import { NTabs, NTabPane } from 'naive-ui'
 import PageHeader from '../components/PageHeader.vue'
 import CredentialVault from '../components/CredentialVault.vue'
@@ -11,7 +11,10 @@ const tab = ref('credentials')
 
 <template>
   <div>
-    <PageHeader title="设置 / 凭据库" subtitle="集中管理所有参与软件的 API Key，以及生成与批量引擎的通用参数" />
+    <PageHeader
+      title="设置 / 凭据库"
+      subtitle="集中管理 API Key、本地号池、生成参数和界面主题"
+    />
     <n-tabs v-model:value="tab" type="line" animated>
       <n-tab-pane name="credentials" tab="凭据库">
         <CredentialVault />

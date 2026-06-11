@@ -76,7 +76,8 @@ def update_asset(pid: str, asset_id: str, patch: dict[str, Any]) -> Optional[dic
         for a in assets:
             if a["id"] == asset_id:
                 for k in ("name", "desc", "appearance", "voice", "ref_image", "role",
-                          "aerial_image", "ref_source"):
+                          "aerial_image", "ref_source", "ref_original_image",
+                          "ref_line_base", "ref_line_options", "asset_kind"):
                     if k in patch:
                         a[k] = patch[k]
                 found = a

@@ -119,7 +119,7 @@ function stop() { if (timer) { clearInterval(timer); timer = null } }
 
 async function doExport() {
   const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
-  const fname = `batch-studio-logs-${stamp}.log`
+  const fname = `vmo-studio-logs-${stamp}.log`
   const papi = window.pywebview && window.pywebview.api
   try {
     if (papi && papi.save_text_file) {

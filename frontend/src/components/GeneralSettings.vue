@@ -30,6 +30,7 @@ const SCHEMA = [
     group: '分镜拆解',
     hint: '拆解剧本生成分镜时，按单镜目标时长折算每镜承载的文字量；纯画面/旁白约 8 字/秒，对白约 5 字/秒。对白越多，单镜字数越少，避免对白过载；最终会限制在模型支持的合理范围内。',
     fields: [
+      { key: 'llm_timeout', label: 'LLM 超时(秒)', type: 'number', min: 60, max: 1800 },
       { key: 'shot_target_seconds', label: '单镜目标时长(秒)', type: 'number', min: 3, max: 15 },
     ],
   },
@@ -44,7 +45,7 @@ const SCHEMA = [
   },
   {
     group: '参考图引用',
-    hint: '单镜喂给模型的参考图总数上限；超过时按优先级裁剪。JSON/Relay 类视频接口默认使用 Data URL(Base64) 直传，避免公网图床失效导致漏图；只有明确需要公网抓取时再切换到公网 URL。',
+    hint: '单镜喂给模型的参考图总数上限；超过时按优先级裁剪。JSON/Relay 类视频接口默认先用 Data URL(Base64) 直传；如果上游仍按 URL 抓图失败，会自动改用公网 URL 重试。',
     fields: [
       { key: 'max_reference_images', label: '总参考图上限', type: 'number', min: 1, max: 16 },
       {
@@ -52,8 +53,8 @@ const SCHEMA = [
         label: '视频参考图传输',
         type: 'select',
         options: [
-          { label: 'Data URL(Base64，默认)', value: 'data_url' },
-          { label: '自动(Base64 优先)', value: 'auto' },
+          { label: '自动(Base64 优先，失败转公网)', value: 'auto' },
+          { label: 'Data URL(Base64)', value: 'data_url' },
           { label: '公网 URL', value: 'public_url' },
         ],
       },

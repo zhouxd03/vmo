@@ -447,7 +447,7 @@ def build_draft(pid: str, draft_name: str, items: list) -> Path:
     one clip on the video track and (when subtitle is non-empty) one subtitle on
     the text track, laid end-to-end.
     """
-    safe_name = "".join(c for c in (draft_name or "batch-studio") if c not in '\\/:*?"<>|').strip() or "draft"
+    safe_name = "".join(c for c in (draft_name or "vmo-studio") if c not in '\\/:*?"<>|').strip() or "draft"
     base = OUTPUT_DIR / pid / "jianying"
     base.mkdir(parents=True, exist_ok=True)
     draft_dir = base / safe_name

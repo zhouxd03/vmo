@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import logging
+import mimetypes
 import re
 import time
 import uuid
@@ -20,7 +21,7 @@ import requests as http
 
 from ..core import credentials
 from ..core import settings as settings_store
-from . import image_host, vidu_gen
+from . import doubao_pool, image_host, vidu_gen
 
 logger = logging.getLogger("batch_studio")
 
@@ -84,17 +85,21 @@ class VideoError(Exception):
         self.raw = raw
 
 
+class DoubaoSemiAutoReady(VideoError):
+    def __init__(self, task: dict):
+        message = task.get("error") or task.get("doubaoPageMessage") or "豆包半自动模式已填入提示词和参考图，请在豆包网页中手动设置参数、生成并下载"
+        super().__init__(message, code="doubao_pool_semi_auto_ready", err_type="doubao_pool", raw=task)
+        self.task = task
+
+
 def _api_error(resp, where="API") -> "VideoError":
     """Build a structured VideoError from an HTTP error response."""
     code = err_type = ""
     msg = resp.text[:300]
     try:
         body = resp.json()
-        err = body.get("error", body) if isinstance(body, dict) else {}
-        if isinstance(err, dict):
-            code = str(err.get("code") or "")
-            err_type = str(err.get("type") or "")
-            msg = str(err.get("message") or msg)
+        if isinstance(body, dict):
+            msg, code, err_type = _extract_error_fields(body)
     except Exception:  # noqa: BLE001
         pass
     return VideoError(f"{where}错误 (HTTP {resp.status_code}): {msg}",
@@ -116,10 +121,10 @@ def _openai_video_base(api_base: str) -> str:
 
 
 def _video_reference_transport() -> str:
-    value = str(settings_store.load_settings().get("video_reference_transport", "data_url") or "data_url").strip().lower()
+    value = str(settings_store.load_settings().get("video_reference_transport", "auto") or "auto").strip().lower()
     if value in {"auto", "public_url", "data_url"}:
         return value
-    return "data_url"
+    return "auto"
 
 
 def _video_size(aspect_ratio: str, resolution: str) -> str:
@@ -138,6 +143,13 @@ def _is_reference_fetch_error(exc: VideoError) -> bool:
     text = " ".join(
         str(x or "") for x in (exc, exc.code, exc.err_type, exc.raw)
     ).lower()
+    if any(marker in text for marker in (
+        "model_not_found",
+        "no available channel",
+        "invalid model",
+        "model not found",
+    )):
+        return False
     return "fail_to_fetch_task" in text
 
 
@@ -147,6 +159,9 @@ def _resolve_creds(base_url: Optional[str], api_key: Optional[str]) -> tuple[str
         return base_url.strip().rstrip("/"), api_key.strip(), "", _detect_provider(base_url, "")
     cred = credentials.get_default("video")
     provider = (cred or {}).get("provider", "").strip().lower()
+    if cred and provider in {"doubao_pool", "doubao_pool_intl"}:
+        base = (cred.get("base_url") or "local://doubao-pool").strip().rstrip("/")
+        return base, (cred.get("api_key") or "").strip(), cred.get("model", ""), provider
     if not cred or not cred.get("api_key") or (provider != "vidu" and not cred.get("base_url")):
         raise VideoError("请先在设置中添加并启用一个视频生成 API（地址 + Key）。")
     base = (cred.get("base_url") or "").strip().rstrip("/")
@@ -158,9 +173,11 @@ def _detect_provider(base_url: str, provider: str) -> str:
     wins; otherwise sniff the base_url (Seedance hosts its API under
     /seedanceapi). Defaults to the OpenAI-compatible /v1/videos shape."""
     p = (provider or "").strip().lower()
-    if p in ("seedance", "seedance_web", "openai", "vidu"):
+    if p in ("seedance", "seedance_web", "openai", "vidu", "huajing", "doubao_pool", "doubao_pool_intl"):
         return p
     base = (base_url or "").lower()
+    if "aibac.lizer.cc" in base or "hjai.lizer.cc" in base:
+        return "huajing"
     if "/user/data" in base or "119.45.158.223:8618" in base or "119.45.233.77:8963" in base:
         return "seedance_web"
     if (
@@ -312,6 +329,10 @@ def _should_adapt_json_reference_tokens(model: str, api_base: str) -> bool:
     )
 
 
+def _is_newapi_video_relay(api_base: str) -> bool:
+    return "64.81.112.180:3000" in (api_base or "").lower()
+
+
 def _adapt_json_reference_prompt(prompt: str, ref_meta: Optional[list[dict]] = None) -> str:
     text = _strip_definition_heading_note(prompt or "")
     text = text.replace(
@@ -382,28 +403,64 @@ def _stringify_upstream(value, limit: int = 1200) -> str:
         return str(value)[:limit]
 
 
+def _decode_nested_json_text(value):
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not (text.startswith("{") or text.startswith("[")):
+        return None
+    try:
+        return json.loads(text)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _extract_error_fields(data: dict) -> tuple[str, str, str]:
     """Extract (message, code, type) from common relay/provider error shapes."""
     candidates = []
     if isinstance(data, dict):
-        for k in ("fail_reason", "error", "message", "msg", "detail", "reason"):
+        nested_data = data.get("data")
+        if isinstance(nested_data, dict) and str(nested_data.get("status") or "").lower() in ("failed", "error", "failure", "cancelled", "canceled"):
+            for kk in ("error_message", "fail_reason", "error", "detail", "reason", "progress_message"):
+                if nested_data.get(kk) not in (None, ""):
+                    candidates.append(nested_data.get(kk))
+        for k in ("error_message", "fail_reason", "error", "message", "msg", "detail", "reason", "progress_message"):
             if data.get(k) not in (None, ""):
                 candidates.append(data.get(k))
         for k in ("data", "result"):
             v = data.get(k)
             if isinstance(v, dict):
-                for kk in ("fail_reason", "error", "message", "msg", "detail", "reason"):
+                for kk in ("error_message", "fail_reason", "error", "message", "msg", "detail", "reason", "progress_message"):
                     if v.get(kk) not in (None, ""):
                         candidates.append(v.get(kk))
     msg_src = candidates[0] if candidates else data
+    nested = _decode_nested_json_text(msg_src)
+    if nested is not None:
+        nested_msg, nested_code, nested_type = _extract_error_fields(nested if isinstance(nested, dict) else {"error": nested})
+        if nested_code or nested_type or nested_msg:
+            return nested_msg, nested_code, nested_type
     code = err_type = ""
     if isinstance(msg_src, dict):
         code = str(msg_src.get("code") or msg_src.get("error_code") or "")
         err_type = str(msg_src.get("type") or msg_src.get("error_type") or "")
+        nested_err = msg_src.get("error")
+        if isinstance(nested_err, dict):
+            code = str(nested_err.get("code") or nested_err.get("error_code") or code)
+            err_type = str(nested_err.get("type") or nested_err.get("error_type") or err_type)
+            msg_src = nested_err.get("message") or msg_src
+        elif msg_src.get("message"):
+            msg_src = msg_src.get("message")
     if not code and isinstance(data, dict):
         code = str(data.get("code") or data.get("error_code") or "")
     if not err_type and isinstance(data, dict):
         err_type = str(data.get("type") or data.get("error_type") or "")
+    if code == "fail_to_fetch_task":
+        for candidate in candidates[1:]:
+            nested = _decode_nested_json_text(candidate)
+            if isinstance(nested, dict):
+                nested_msg, nested_code, nested_type = _extract_error_fields(nested)
+                if nested_code and nested_code != "fail_to_fetch_task":
+                    return nested_msg, nested_code, nested_type
     msg = _stringify_upstream(msg_src)
     return msg or "生成失败", code, err_type
 
@@ -429,6 +486,7 @@ def generate_video(
     ref_meta: Optional[list[dict]] = None,
     on_refs_prepared: Optional[Callable[[list[dict], list[str]], None]] = None,
     on_submit_response: Optional[Callable[[dict], None]] = None,
+    cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> dict:
     prompt = (prompt or "").strip()
     if not prompt:
@@ -444,8 +502,12 @@ def generate_video(
 
     # safety net: a doubao-seedance model implies the Seedance dialect even if
     # the credential's provider field was left blank.
-    if provider != "seedance" and (model or default_model or "").lower().startswith("doubao-seedance"):
+    if provider not in ("seedance", "huajing") and (model or default_model or "").lower().startswith("doubao-seedance"):
         provider = "seedance"
+    logger.info(
+        "[Video][Provider] resolved provider=%s base=%s model=%s default_model=%s",
+        provider, _safe_url(api_base), model or "", default_model or "",
+    )
 
     if provider == "vidu":
         try:
@@ -468,6 +530,31 @@ def generate_video(
             )
         except vidu_gen.ViduError as e:
             raise VideoError(str(e), code=e.code, status=e.status, err_type="vidu", raw=e.raw) from e
+
+    if provider == "huajing":
+        return _generate_huajing(
+            prompt, api_base=api_base, key=key, model=model or default_model,
+            duration=duration, aspect_ratio=aspect_ratio, resolution=resolution,
+            ref_images_b64=ref_images_b64, save_dir=save_dir,
+            filename_prefix=filename_prefix, timeout=timeout,
+            poll_interval=poll_interval, on_progress=on_progress, on_stage=on_stage,
+            generate_audio=generate_audio, watermark=watermark,
+            ref_meta=ref_meta, on_refs_prepared=on_refs_prepared,
+            on_submit_response=on_submit_response,
+        )
+
+    if provider in {"doubao_pool", "doubao_pool_intl"}:
+        doubao_site = "intl" if provider == "doubao_pool_intl" or (model or default_model or "").lower().startswith("dola-") else "cn"
+        return _generate_doubao_pool(
+            prompt, model=model or default_model, duration=duration,
+            aspect_ratio=aspect_ratio, ref_images_b64=ref_images_b64,
+            save_dir=save_dir, filename_prefix=filename_prefix,
+            timeout=max(timeout, 30 * 60), poll_interval=poll_interval,
+            on_progress=on_progress, on_stage=on_stage,
+            cancel_checker=cancel_checker,
+            on_submit_response=on_submit_response,
+            site=doubao_site,
+        )
 
     if provider == "seedance_web" or "/user/data" in api_base.lower():
         return _generate_seedance_web_data(
@@ -493,6 +580,7 @@ def generate_video(
         )
 
     model = model or default_model or "sora-v3-fast"
+    newapi_video_relay = _is_newapi_video_relay(api_base)
     json_ref_token_adapter = False
     submit_prompt = prompt
     if ref_images_b64 and _should_adapt_json_reference_tokens(model, api_base):
@@ -581,21 +669,37 @@ def generate_video(
         "size": _video_size(aspect_ratio, resolution),
     }
 
-    # 多模态软参考生视频：上一镜尾帧 / 导演图 / 站位图 / 资产图均作为
-    # reference_image_urls 传入，模型按数组顺序与画面定义中的 @图N 对齐。
+    # 多模态软参考生视频：默认 OpenAI-compatible 中转使用 reference_image_urls。
+    # 64.81.112.180:3000 的 New API 文档要求使用 image/images 字段，隔离适配。
     submit_url = f"{_openai_video_base(api_base)}/videos"
 
     def _attach_refs(transport):
         if ref_images_b64:
-            payload["reference_image_urls"] = _prepare_ref_urls(transport)
+            urls = _prepare_ref_urls(transport)
+            if newapi_video_relay:
+                payload.pop("reference_image_urls", None)
+                payload.pop("image", None)
+                payload.pop("images", None)
+                if len(urls) == 1:
+                    payload["image"] = urls[0]
+                else:
+                    payload["images"] = urls
+            else:
+                payload["reference_image_urls"] = urls
+                payload.pop("image", None)
+                payload.pop("images", None)
             return "图生视频"
         payload.pop("reference_image_urls", None)
+        payload.pop("image", None)
+        payload.pop("images", None)
         return "文生视频"
 
     def _submit(transport_label):
         mode = _attach_refs(transport_label)
         _stage("submitting", "请求中", 8)
-        ref_urls = payload.get("reference_image_urls") or []
+        ref_urls = payload.get("reference_image_urls") or payload.get("images") or []
+        if payload.get("image"):
+            ref_urls = [payload.get("image")]
         payload_summary = {
             "keys": _json_keys(payload),
             "model": payload.get("model"),
@@ -607,6 +711,7 @@ def generate_video(
             "prompt_sha256": hashlib.sha256((payload.get("prompt") or "").encode("utf-8")).hexdigest()[:16],
             "prompt_preview": _clip(payload.get("prompt") or "", 2000),
             "reference_token_adapter": "seed-json" if json_ref_token_adapter else "",
+            "reference_field": "images" if newapi_video_relay else "reference_image_urls",
             "reference_image_urls_count": len(ref_urls),
             "reference_transport": transport_label,
             "reference_bindings": [
@@ -627,9 +732,9 @@ def generate_video(
             ],
         }
         logger.info(
-            f"[Video] 提交 {mode}: model={model} {duration}s "
+            f"[Video] 提交 {mode}: model={payload.get('model')} {duration}s "
             f"{aspect_ratio} {resolution} size={payload.get('size')} "
-            f"refs={len(payload.get('reference_image_urls') or [])} "
+            f"refs={len(ref_urls)} "
             f"transport={transport_label} "
             f"ref_token_adapter={'seed-json' if json_ref_token_adapter else 'none'}"
         )
@@ -644,6 +749,10 @@ def generate_video(
             len(resp.content or b""),
         )
         if resp.status_code >= 400:
+            logger.warning(
+                "[Video][Response] submit error body=%s",
+                _clip(resp.text, 1200),
+            )
             raise _api_error(resp, "提交")
         data = resp.json()
         logger.info(
@@ -652,17 +761,52 @@ def generate_video(
         )
         return data
 
+    def _forget_public_url_host(exc: VideoError):
+        urls = list(ref_url_cache.get("public_url") or [])
+        if urls:
+            image_host.mark_urls_unhealthy(urls, exc)
+        ref_url_cache.pop("public_url", None)
+
+    def _submit_public_url_with_host_retries(max_attempts: int = 3):
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                logger.warning(
+                    "[Video] public_url reference fetch failed; re-uploading refs with alternate image host (attempt %s/%s)",
+                    attempt, max_attempts,
+                )
+            try:
+                return _submit("public_url")
+            except VideoError as exc:
+                if not _is_reference_fetch_error(exc) or attempt >= max_attempts:
+                    raise
+                last_exc = exc
+                _forget_public_url_host(exc)
+        raise last_exc or VideoError("public_url reference retry failed", code="fail_to_fetch_task")
+
+    def _retry_public_url_with_fresh_hosts(exc: VideoError):
+        _forget_public_url_host(exc)
+        logger.warning("[Video] public_url reference fetch failed; re-uploading refs with alternate image host")
+        return _submit_public_url_with_host_retries()
+
     actual_transport = ref_transport
+    first_transport = "public_url" if (newapi_video_relay and ref_transport == "auto" and ref_images_b64) else (
+        "data_url" if ref_transport == "auto" else ref_transport
+    )
     try:
-        result = _submit("data_url" if ref_transport == "auto" else ref_transport)
+        result = _submit(first_transport)
         if ref_transport == "auto":
-            actual_transport = "data_url"
+            actual_transport = first_transport
     except VideoError as exc:
-        if ref_transport != "auto" or not _is_reference_fetch_error(exc):
+        if ref_transport == "public_url" and _is_reference_fetch_error(exc):
+            actual_transport = "public_url"
+            result = _retry_public_url_with_fresh_hosts(exc)
+        elif ref_transport in {"auto", "data_url"} and _is_reference_fetch_error(exc):
+            logger.warning("[Video] data_url reference fetch failed; retrying with public_url")
+            actual_transport = "public_url"
+            result = _submit_public_url_with_host_retries()
+        else:
             raise
-        logger.warning("[Video] data_url reference rejected in auto mode; retrying with public_url")
-        actual_transport = "public_url"
-        result = _submit("public_url")
     if on_submit_response:
         on_submit_response(result if isinstance(result, dict) else {"raw": result})
 
@@ -689,26 +833,35 @@ def generate_video(
 
 def _poll(api_base, task_id, key, timeout, interval, on_progress, on_stage=None) -> str:
     headers = {"Authorization": _bearer_header(key), "Content-Type": "application/json"}
-    poll_url = f"{_openai_video_base(api_base)}/videos/{task_id}"
+    base = _openai_video_base(api_base)
+    poll_urls = [f"{base}/videos/{task_id}"]
+    if _is_newapi_video_relay(api_base):
+        poll_urls.append(f"{base}/video/generations/{task_id}")
     logger.info(
         "[Video][Request] poll start GET %s task_id=%s timeout=%ss interval=%ss",
-        _safe_url(poll_url), task_id, timeout, interval,
+        ", ".join(_safe_url(u) for u in poll_urls), task_id, timeout, interval,
     )
     elapsed = 0
     while elapsed < timeout:
         time.sleep(interval)
         elapsed += interval
         try:
-            r = http.get(poll_url, headers=headers, timeout=30)
-            logger.info(
-                "[Video][Poll] GET %s elapsed=%ss status_code=%s bytes=%s",
-                _safe_url(poll_url), elapsed, r.status_code, len(r.content or b""),
-            )
-            if r.status_code >= 400:
+            data = None
+            for poll_url in poll_urls:
+                r = http.get(poll_url, headers=headers, timeout=30)
+                logger.info(
+                    "[Video][Poll] GET %s elapsed=%ss status_code=%s bytes=%s",
+                    _safe_url(poll_url), elapsed, r.status_code, len(r.content or b""),
+                )
+                if r.status_code >= 400:
+                    continue
+                data = r.json()
+                break
+            if data is None:
                 continue
-            data = r.json()
-            status = str(data.get("status", "")).lower()
-            prog = data.get("progress", 0)
+            data_obj = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+            status = str((data_obj or {}).get("status") or (data_obj or {}).get("Status") or "").lower()
+            prog = (data_obj or {}).get("progress", (data_obj or {}).get("Progress", 0))
             if isinstance(prog, str) and prog.endswith("%"):
                 prog = int(prog.replace("%", ""))
             elif isinstance(prog, (int, float)):
@@ -724,7 +877,7 @@ def _poll(api_base, task_id, key, timeout, interval, on_progress, on_stage=None)
                 "[Video][Poll] json=%s",
                 json.dumps(_response_summary(data), ensure_ascii=False),
             )
-            if status in ("completed", "done", "success", "finished"):
+            if status in ("completed", "done", "success", "finished", "succeeded"):
                 url = _extract_video_url(data)
                 if url:
                     logger.info("[Video] completed, video url extracted; downloading result")
@@ -737,7 +890,7 @@ def _poll(api_base, task_id, key, timeout, interval, on_progress, on_stage=None)
                     err_type="upstream",
                     raw=raw,
                 )
-            elif status in ("failed", "error"):
+            elif status in ("failed", "error", "failure"):
                 msg, code, err_type = _extract_error_fields(data)
                 raise VideoError(msg, code=code, err_type=err_type, raw=_stringify_upstream(data))
         except VideoError:
@@ -766,6 +919,198 @@ SEEDANCE_MODELS = [
     "doubao-seedance-2-0-260128-3",
 ]
 _SEEDANCE_DEFAULT_MODEL = SEEDANCE_MODELS[0]
+
+HUAJING_DEFAULT_BASE_URL = "https://aibac.lizer.cc"
+HUAJING_VIDEO_MODELS = [
+    {"label": "画镜SD2.0-企业满血", "value": "doubao-seedance-2-0-260128"},
+    {"label": "画镜SD2.0-fast-企业满血", "value": "doubao-seedance-2-0-fast-260128"},
+    {"label": "海外seedance 满血", "value": "video-pro"},
+    {"label": "海外seedance-fast 满血", "value": "video-fast"},
+    {"label": "seedance 2.0 (官)", "value": "seedance_2"},
+    "grok-imagine-video-1.5",
+    "veo-3.1",
+    "HappyHorse",
+    "Vidu Q3 Pro",
+    "kling-3-omni",
+]
+HUAJING_MODEL_ALIASES = {
+    "seedance_2_fast": "doubao-seedance-2-0-fast-260128",
+    "seedance_2": "doubao-seedance-2-0-260128",
+}
+
+
+def _generate_doubao_pool(
+    prompt, *, model, duration, aspect_ratio, ref_images_b64, save_dir,
+    filename_prefix, timeout, poll_interval, on_progress, on_stage=None,
+    cancel_checker=None, on_submit_response=None, site="cn",
+):
+    site = doubao_pool.normalize_site(site)
+    model = model or ("dola-web-video" if site == "intl" else "doubao-web-video")
+    requested_duration = duration
+    if len(ref_images_b64 or []) > 9:
+        logger.warning("[DoubaoPool] web adapter supports up to 9 reference images; extra images will be ignored")
+    if on_stage:
+        on_stage("submitting", "准备 VMO 本地豆包号池与专用浏览器", 8)
+    try:
+        task = doubao_pool.create_video_task(
+            prompt,
+            duration=requested_duration,
+            aspect_ratio=aspect_ratio,
+            ref_images_b64=(ref_images_b64 or [])[:9],
+            site=site,
+            shot_no=filename_prefix,
+            filename_prefix=filename_prefix,
+        )
+        duration = int(task.get("duration") or doubao_pool.select_doubao_duration(requested_duration))
+        logger.info("[DoubaoPool] created task id=%s account=%s", task.get("id"), task.get("accountId"))
+        if on_submit_response:
+            on_submit_response({
+                "provider": "doubao_pool",
+                "site": site,
+                "task_id": task.get("id"),
+                "account_id": task.get("accountId"),
+                "initial_account_id": task.get("initialAccountId") or task.get("accountId"),
+                "shot_no": task.get("shotNo") or filename_prefix,
+                "account_switch_policy": task.get("accountSwitchPolicy") or "pre-submit-only",
+                "source_duration": task.get("sourceDuration") or requested_duration,
+                "target_duration": duration,
+            })
+        if on_stage:
+            on_stage("waiting", "豆包账号页已激活，正在自动传图、填词、提交并回收", 12)
+        done = doubao_pool.wait_for_task(
+            task["id"],
+            timeout=timeout,
+            interval=poll_interval,
+            on_progress=on_progress,
+            on_stage=on_stage,
+            cancel_checker=cancel_checker,
+        )
+        if str(done.get("status") or "") == "manual":
+            raise DoubaoSemiAutoReady(done)
+        if on_progress:
+            on_progress(99)
+        if on_stage:
+            on_stage("downloading", "复制豆包下载结果", 99)
+        out = doubao_pool.copy_result(
+            done,
+            save_dir=save_dir,
+            model=model,
+            duration=duration,
+            filename_prefix=filename_prefix,
+        )
+        if on_progress:
+            on_progress(100)
+        return out
+    except doubao_pool.DoubaoPoolError as e:
+        latest = doubao_pool.get_task(task.get("id", "")) if "task" in locals() and task.get("id") else None
+        if latest and str(latest.get("status") or "") == "manual":
+            raise DoubaoSemiAutoReady(latest) from e
+        raise VideoError(str(e), code="doubao_pool_error", err_type="doubao_pool") from e
+
+
+def _huajing_base(api_base: str) -> str:
+    return (api_base or HUAJING_DEFAULT_BASE_URL).strip().rstrip("/")
+
+
+def _huajing_headers(key: str) -> dict:
+    return {
+        "Authorization": _bearer_header(key),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Banana-Brand": "default",
+    }
+
+
+def _huajing_data(obj):
+    if isinstance(obj, dict) and isinstance(obj.get("data"), dict):
+        return obj.get("data") or {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _extract_huajing_task_id(obj) -> str:
+    data = _huajing_data(obj)
+    for item in (obj, data):
+        if not isinstance(item, dict):
+            continue
+        for key in ("generation_id", "requestId", "request_id", "task_id", "taskId", "id"):
+            value = item.get(key)
+            if value not in (None, ""):
+                return str(value)
+    return ""
+
+
+def _extract_huajing_output_url(obj) -> str:
+    url = _extract_video_url(obj)
+    if url:
+        return url
+    data = _huajing_data(obj)
+    for item in (obj, data):
+        if not isinstance(item, dict):
+            continue
+        for key in ("video_url", "videoUrl", "cover_url", "download_url", "url"):
+            value = item.get(key)
+            if value:
+                return str(value)
+    outputs = data.get("outputs") if isinstance(data, dict) else None
+    if isinstance(outputs, list):
+        for item in outputs:
+            if not isinstance(item, dict):
+                continue
+            for key in ("object_url", "url", "upstream_object_url", "video_url", "download_url"):
+                value = item.get(key)
+                if value:
+                    return str(value)
+    return ""
+
+
+def _normalize_huajing_model(model: str) -> str:
+    value = str(model or "").strip() or "doubao-seedance-2-0-fast-260128"
+    return HUAJING_MODEL_ALIASES.get(value, value)
+
+
+def huajing_list_video_models(base_url: str, api_key: str) -> list:
+    """Load Huajing video model config when available; fall back to known gateway ids."""
+    base = _huajing_base(base_url)
+    try:
+        resp = http.get(
+            f"{base}/api/ai-config/video-models",
+            headers=_huajing_headers(api_key),
+            timeout=30,
+        )
+        if resp.status_code < 400:
+            body = resp.json()
+            items = body.get("data") if isinstance(body, dict) else body
+            if isinstance(items, list):
+                models = []
+                for item in items:
+                    if isinstance(item, str):
+                        models.append(item)
+                    elif isinstance(item, dict):
+                        value = item.get("model_name") or item.get("name") or item.get("id") or item.get("value")
+                        label = item.get("display_name") or item.get("label") or value
+                        if value:
+                            models.append({"label": label, "value": value})
+                if models:
+                    return models
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[Huajing] load video models failed, using fallback: %s", e)
+    return HUAJING_VIDEO_MODELS
+
+
+def huajing_user_info(base_url: str, api_key: str) -> dict:
+    base = _huajing_base(base_url)
+    for path in ("/api/auth/profile", "/api/auth/me", "/api/user/profile", "/api/user/info"):
+        try:
+            resp = http.get(f"{base}{path}", headers=_huajing_headers(api_key), timeout=30)
+            if resp.status_code >= 400:
+                continue
+            body = resp.json()
+            data = body.get("data") if isinstance(body, dict) else body
+            if isinstance(data, dict):
+                return data
+        except Exception:  # noqa: BLE001
+            continue
+    raise VideoError("Huajing auth check failed; token may be expired or endpoint changed", code="huajing_auth_failed")
 
 
 def _seedance_root(api_base: str) -> str:
@@ -1103,6 +1448,310 @@ def seedance_user_info(base_url: str, api_key: str) -> dict:
     if resp.status_code >= 400:
         raise _api_error(resp, "Seedance 鉴权")
     return (_seedance_json(resp, "鉴权").get("data") or {})
+
+
+def _huajing_reference_item(url: str, idx: int, kind: str = "image") -> dict:
+    ext = ".png"
+    try:
+        path = urlparse(url).path
+        match = re.search(r"\.([a-z0-9]{2,5})$", path or "", re.I)
+        if match:
+            ext = "." + match.group(1).lower()
+    except Exception:  # noqa: BLE001
+        pass
+    label = "图片" if kind == "image" else "素材"
+    return {"type": kind, "url": url, "name": f"{label}{idx}{ext}"}
+
+
+def _decode_image_b64(img_b64: str) -> tuple[bytes, str]:
+    value = str(img_b64 or "").strip()
+    mime = "image/png"
+    match = re.match(r"^data:([^;,]+);base64,(.*)$", value, re.I | re.S)
+    if match:
+        mime = match.group(1) or mime
+        value = match.group(2)
+    raw = base64.b64decode(value)
+    if raw.startswith(b"\xff\xd8\xff"):
+        mime = "image/jpeg"
+    elif raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+    elif raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+        mime = "image/webp"
+    elif raw.startswith(b"GIF87a") or raw.startswith(b"GIF89a"):
+        mime = "image/gif"
+    return raw, mime
+
+
+def _huajing_upload_image(base: str, key: str, img_b64: str, filename: str) -> str:
+    raw, mime = _decode_image_b64(img_b64)
+    suffix = mimetypes.guess_extension(mime) or ".png"
+    if not filename or "." not in Path(filename).name:
+        filename = f"{Path(filename or 'image').stem or 'image'}{suffix}"
+    headers = _huajing_headers(key)
+    presign_url = f"{_huajing_base(base)}/api/upload/presign"
+    presign_payload = {"filename": filename, "content_type": mime, "size": len(raw)}
+    logger.info(
+        "[Video][Huajing] presign upload filename=%s content_type=%s bytes=%s",
+        filename, mime, len(raw),
+    )
+    try:
+        presign_resp = http.post(presign_url, json=presign_payload, headers=headers, timeout=30)
+    except Exception as e:  # noqa: BLE001
+        raise VideoError("画镜参考图预签名失败: %s" % e, code="reference_image_upload_failed", err_type="huajing_upload") from e
+    if presign_resp.status_code >= 400:
+        raise _api_error(presign_resp, "画镜参考图预签名")
+    try:
+        presign_body = presign_resp.json()
+    except Exception as e:  # noqa: BLE001
+        raise VideoError(f"画镜参考图预签名返回非 JSON: {presign_resp.text[:200]}") from e
+    data = _huajing_data(presign_body)
+    signed_url = data.get("presigned_url") or data.get("upload_url") or data.get("url")
+    public_url = data.get("public_url")
+    object_key = data.get("object_key") or data.get("key")
+    signed_headers = data.get("signed_headers") if isinstance(data.get("signed_headers"), dict) else {}
+    if not signed_url or not public_url or not object_key:
+        raise VideoError(
+            f"画镜参考图预签名缺少字段: {json.dumps(_response_summary(presign_body), ensure_ascii=False)}",
+            code="reference_image_upload_failed",
+            err_type="huajing_upload",
+            raw=str(presign_body)[:1000],
+        )
+
+    put_headers = {"Content-Type": mime}
+    put_headers.update({str(k): str(v) for k, v in signed_headers.items()})
+    try:
+        put_resp = http.put(signed_url, data=raw, headers=put_headers, timeout=120)
+    except Exception as e:  # noqa: BLE001
+        raise VideoError("画镜 TOS 上传失败: %s" % e, code="reference_image_upload_failed", err_type="huajing_upload") from e
+    if put_resp.status_code >= 400:
+        raise VideoError(
+            f"画镜 TOS 上传错误 (HTTP {put_resp.status_code}): {put_resp.text[:200]}",
+            code="reference_image_upload_failed",
+            status=put_resp.status_code,
+            err_type="huajing_upload",
+            raw=put_resp.text[:500],
+        )
+
+    confirm_url = f"{_huajing_base(base)}/api/upload/confirm"
+    confirm_payload = {
+        "object_key": object_key,
+        "public_url": public_url,
+        "filename": filename,
+        "size": len(raw),
+        "content_type": mime,
+    }
+    try:
+        confirm_resp = http.post(confirm_url, json=confirm_payload, headers=headers, timeout=30)
+    except Exception as e:  # noqa: BLE001
+        raise VideoError("画镜参考图确认失败: %s" % e, code="reference_image_upload_failed", err_type="huajing_upload") from e
+    if confirm_resp.status_code >= 400:
+        raise _api_error(confirm_resp, "画镜参考图确认")
+    try:
+        confirm_body = confirm_resp.json()
+    except Exception:
+        confirm_body = {}
+    confirm_data = _huajing_data(confirm_body)
+    final_url = (
+        confirm_data.get("image_url")
+        or confirm_data.get("media_url")
+        or confirm_data.get("url")
+        or confirm_data.get("uploadUrl")
+        or public_url
+    )
+    logger.info("[Video][Huajing] upload complete host=%s", urlparse(final_url).netloc)
+    return final_url
+
+
+def _generate_huajing(
+    prompt, *, api_base, key, model, duration, aspect_ratio, resolution,
+    ref_images_b64, save_dir, filename_prefix, timeout, poll_interval,
+    on_progress, on_stage, generate_audio, watermark,
+    ref_meta=None, on_refs_prepared=None, on_submit_response=None,
+) -> dict:
+    base = _huajing_base(api_base)
+    model = _normalize_huajing_model(model)
+    dur = max(1, min(15, int(duration or 5)))
+    ratio = str(aspect_ratio or "16:9").strip() or "16:9"
+    res = str(resolution or "720p").strip().upper()
+    if res not in ("480P", "720P", "1080P"):
+        res = "720P"
+
+    ref_urls: list[str] = []
+    ref_mapping: list[dict] = []
+    if ref_images_b64:
+        if on_stage:
+            on_stage("uploading_refs", "上传参考图", 2)
+        for idx, b64 in enumerate(ref_images_b64):
+            try:
+                _decode_image_b64(b64)
+            except Exception as e:  # noqa: BLE001
+                raise VideoError(f"第 {idx + 1} 张参考图数据无效") from e
+            try:
+                url = _huajing_upload_image(
+                    base,
+                    key,
+                    b64,
+                    ((ref_meta or [])[idx].get("filename") if idx < len(ref_meta or []) else "") or f"ref{idx + 1}.png",
+                )
+            except Exception as e:  # noqa: BLE001
+                raise VideoError(
+                    f"画镜视频网关需要公网可访问的参考图 URL，第 {idx + 1} 张上传失败: {e}",
+                    code="reference_image_upload_failed",
+                    err_type="huajing_upload",
+                    raw=str(e),
+                ) from e
+            meta = (ref_meta or [])[idx] if idx < len(ref_meta or []) else {}
+            ref_urls.append(url)
+            ref_mapping.append({
+                "index": idx + 1,
+                "token": meta.get("token") or f"@图{idx + 1}",
+                "provider_token": "",
+                "provider_tokens": [],
+                "role": meta.get("role") or "unknown",
+                "name": meta.get("name") or "",
+                "filename": meta.get("filename") or f"ref{idx + 1}.png",
+                "sha256": meta.get("sha256") or "",
+                "host": urlparse(url).netloc,
+            })
+        if on_refs_prepared:
+            on_refs_prepared(ref_mapping, ref_urls)
+
+    payload = {
+        "prompt": prompt,
+        "base_model": model,
+        "generation_mode": "image_to_video" if ref_urls else "text_to_video",
+        "orientation": "portrait" if ratio == "9:16" else "landscape",
+        "generation_params": {
+            "duration": dur,
+            "aspect_ratio": ratio,
+            "resolution": res.lower(),
+        },
+        "reference_mode": "multimodal" if len(ref_urls) > 1 else ("first_frame" if ref_urls else "text_to_video"),
+    }
+    if ref_urls:
+        payload["reference_images"] = ref_urls
+        payload["input_image_url"] = ref_urls[0]
+
+    submit_url = f"{base}/api/videos/generate"
+    if on_stage:
+        on_stage("submitting", "请求画镜视频生成", 8)
+    logger.info(
+        "[Video][Huajing] submit model=%s duration=%ss ratio=%s resolution=%s refs=%s",
+        model, dur, ratio, res, len(ref_urls),
+    )
+    logger.info(
+        "[Video][Request] POST %s provider=huajing payload=%s",
+        _safe_url(submit_url),
+        json.dumps({
+            "keys": _json_keys(payload),
+            "model": model,
+            "base_model": payload.get("base_model"),
+            "generation_mode": payload.get("generation_mode"),
+            "reference_mode": payload.get("reference_mode"),
+            "duration": dur,
+            "ratio": ratio,
+            "resolution": res,
+            "refs": len(ref_urls),
+            "prompt_chars": len(prompt or ""),
+            "prompt_sha256": hashlib.sha256((prompt or "").encode("utf-8")).hexdigest()[:16],
+            "prompt_preview": _clip(prompt or "", 1200),
+        }, ensure_ascii=False),
+    )
+    try:
+        resp = http.post(submit_url, json=payload, headers=_huajing_headers(key), timeout=120)
+    except Exception as e:  # noqa: BLE001
+        raise VideoError(f"画镜视频提交失败: {e}") from e
+    logger.info(
+        "[Video][Response] POST %s status=%s content_type=%s bytes=%s",
+        _safe_url(submit_url), resp.status_code, resp.headers.get("Content-Type", ""),
+        len(resp.content or b""),
+    )
+    if resp.status_code >= 400:
+        raise _api_error(resp, "画镜视频提交")
+    try:
+        body = resp.json()
+    except Exception as e:  # noqa: BLE001
+        raise VideoError(f"画镜视频提交返回非 JSON: {resp.text[:200]}") from e
+    logger.info("[Video][Response] huajing submit json=%s", json.dumps(_response_summary(body), ensure_ascii=False))
+    if on_submit_response:
+        on_submit_response(body)
+
+    video_url = _extract_huajing_output_url(body)
+    task_id = _extract_huajing_task_id(body)
+    if not video_url:
+        if not task_id:
+            raise VideoError(f"画镜视频生成未返回任务 ID 或视频 URL: {str(body)[:300]}")
+        if on_progress:
+            on_progress(5)
+        if on_stage:
+            on_stage("waiting", "等待画镜生成", 10)
+        video_url = _poll_huajing(base, task_id, key, timeout, poll_interval, on_progress, on_stage)
+
+    if on_progress:
+        on_progress(99)
+    if on_stage:
+        on_stage("downloading", "下载视频中", 99)
+    out = _download(video_url, model, dur, save_dir, filename_prefix)
+    if ref_mapping:
+        out["reference_image_mapping"] = ref_mapping
+        out["reference_image_urls"] = ref_urls
+        out["reference_transport"] = "huajing-public-url"
+    out["huajing_task_id"] = task_id
+    if on_progress:
+        on_progress(100)
+    return out
+
+
+def _poll_huajing(base, task_id, key, timeout, interval, on_progress, on_stage=None) -> str:
+    task_url = f"{_huajing_base(base)}/api/videos/task/{task_id}"
+    headers = _huajing_headers(key)
+    elapsed = 0
+    interval = max(3, interval)
+    logger.info(
+        "[Video][Huajing] poll start task=%s timeout=%ss interval=%ss",
+        task_id, timeout, interval,
+    )
+    while elapsed < timeout:
+        time.sleep(interval)
+        elapsed += interval
+        try:
+            resp = http.get(task_url, headers=headers, timeout=30)
+            logger.info(
+                "[Video][Huajing][Poll] GET %s elapsed=%ss status=%s bytes=%s",
+                _safe_url(task_url), elapsed, resp.status_code, len(resp.content or b""),
+            )
+            if resp.status_code >= 400:
+                continue
+            body = resp.json()
+            data = _huajing_data(body)
+            status = str(data.get("status") or data.get("state") or body.get("status") or "").lower()
+            progress = data.get("progress") or body.get("progress") or 0
+            try:
+                progress = int(progress)
+            except Exception:  # noqa: BLE001
+                progress = 0
+            if on_progress:
+                on_progress(progress)
+            if on_stage:
+                on_stage("polling", status or "生成中", progress)
+            logger.info(
+                "[Video][Huajing][Poll] status=%s progress=%s summary=%s",
+                status, progress, json.dumps(_response_summary(body), ensure_ascii=False),
+            )
+
+            url = _extract_huajing_output_url(body)
+            if url and (not status or status in ("completed", "succeeded", "success", "done", "finished")):
+                return url
+            if status in ("completed", "succeeded", "success", "done", "finished"):
+                raise VideoError("画镜任务已完成，但未返回可下载视频地址", code="missing_video_url", raw=str(body)[:800])
+            if status in ("failed", "error", "failure", "cancelled", "canceled"):
+                msg, code, err_type = _extract_error_fields(body)
+                raise VideoError(msg or "画镜视频生成失败", code=code, err_type=err_type or "huajing", raw=_stringify_upstream(body))
+        except VideoError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[Video][Huajing] poll error: %s", e)
+    raise VideoError(f"画镜视频生成超时（{timeout}秒）")
 
 
 def _poll_seedance(root, task_id, key, timeout, interval, on_progress, on_stage=None) -> dict:

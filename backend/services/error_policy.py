@@ -36,6 +36,7 @@ _FATAL_KEYS = (
     "permission", "forbidden", "insufficient_quota", "insufficient quota",
     "insufficient_balance", "insufficient balance", "exceeded your current quota",
     "insufficient_user_quota", "quota", "billing", "no balance", "out of credit", "account",
+    "model_not_found", "model not found", "no available channel",
     "token不足", "token 不足", "insufficient token", "insufficient tokens",
     "密钥", "鉴权", "未授权", "无权限", "额度", "余额", "欠费", "配额",
 )
@@ -54,6 +55,14 @@ _PARAM_KEYS = (
     "参考图片最多支持", "最多支持 4 张", "最多支持4张",
     "参考图片数量", "参考图数量", "参考图片数", "参考图数",
     "超过当前视频接口上限", "超过上限", "最多支持",
+)
+
+_DOUBAO_POOL_UNAVAILABLE_KEYS = (
+    "没有可用豆包账号", "没有可用", "本地号池", "本地额度", "账号本地额度",
+    "可用账号", "可用次数", "视频次数", "次数已用完",
+    "no available doubao", "no available account", "no enabled account",
+    "local quota", "account quota", "quota exhausted", "capacity exhausted",
+    "娌℃湁鍙", "鏈湴鍙锋睜", "鏈湴棰濆害", "璐﹀彿鏈湴",
 )
 
 _META = {
@@ -95,6 +104,13 @@ def _match(text: str, keys) -> bool:
     return any(k in text for k in keys)
 
 
+def _is_doubao_pool_unavailable(text: str, code: str) -> bool:
+    code = (code or "").lower()
+    if code != "doubao_pool_error" and "doubao_pool" not in text and "doubao-pool" not in text:
+        return False
+    return _match(text, _DOUBAO_POOL_UNAVAILABLE_KEYS)
+
+
 def classify(exc: Exception) -> dict:
     """Return a structured error dict for *exc*.
 
@@ -107,7 +123,9 @@ def classify(exc: Exception) -> dict:
     text = _text_of(exc)
 
     # 1) hard network-layer exceptions → always transient
-    if "seedance_timeout" in text:
+    if _is_doubao_pool_unavailable(text, code):
+        category = "fatal"
+    elif "seedance_timeout" in text:
         category = "transient"
     elif isinstance(exc, (http.Timeout, http.ConnectionError)):
         category = "transient"
@@ -153,10 +171,14 @@ _CATEGORY_LABEL = {
 
 def _friendly_message(category: str, code: str, detail: str) -> str:
     text = " ".join(str(x or "") for x in (code, detail)).lower()
+    if _is_doubao_pool_unavailable(text, code):
+        return "[豆包号池不可用] 当前没有可用豆包账号/视频次数。请到左侧“豆包号池”新增或启用账号，或重置账号可生产次数后再开始批量生成。"
     if "seedance_timeout" in text:
         return "[Seedance 排队超时] 上游任务一直处于待处理，软件已停止等待；这不是 token/余额不足。请稍后重试，或切换到 Seedance 网页端接口后重新提交。"
     if "unbound_reference_tags" in text:
         return "[图生视频引用未绑定] 视频提示词里仍有未随请求上传的 @对象；请调高「总参考图上限」或删除对应引用后重试。"
+    if any(k in text for k in ("model_not_found", "model not found", "no available channel")):
+        return "[视频模型通道不可用] 当前视频 Key/分组没有可用的该模型通道；请在凭据库更换视频 Key、切换可用模型，或联系中转方开通对应通道。"
     if _match(text, _FATAL_KEYS) and any(k in text for k in ("quota", "balance", "token不足", "insufficient token", "余额", "额度")):
         return "[额度不足] 视频服务 token/余额不足；请充值/更换视频凭据后重试。"
     if "missing_video_url" in text:

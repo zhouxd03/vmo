@@ -1,6 +1,8 @@
 // Thin fetch wrapper around the Flask JSON API.
 const DEFAULT_TIMEOUT_MS = 30_000
 const HEALTH_TIMEOUT_MS = 4_000
+const LONG_TASK_TIMEOUT_MS = 1_800_000
+const AI_INFER_TIMEOUT_MS = 300_000
 
 function apiError(message, detail = {}) {
   const err = new Error(message)
@@ -45,13 +47,13 @@ async function req(method, path, body, options = {}) {
 
 // POST that expects a binary (zip) response; triggers a browser download.
 // On error the server returns JSON, which we surface as an Error.
-async function downloadBlob(method, path, body) {
+async function downloadBlob(method, path, body, options = {}) {
   const opts = { method, headers: {} }
   if (body !== undefined) {
     opts.headers['Content-Type'] = 'application/json'
     opts.body = JSON.stringify(body)
   }
-  const resp = await fetchWithTimeout(path, opts, DEFAULT_TIMEOUT_MS)
+  const resp = await fetchWithTimeout(path, opts, options.timeoutMs || DEFAULT_TIMEOUT_MS)
   if (!resp.ok) {
     let msg = `HTTP ${resp.status}`
     try { msg = (await resp.json()).error || msg } catch { /* ignore */ }
@@ -96,6 +98,12 @@ export const api = {
   exportLogs: () => downloadBlob('GET', '/api/logs/export'),
   clearLogs: () => req('POST', '/api/logs/clear'),
 
+  authConfig: () => req('GET', '/api/auth/config'),
+  authMe: () => req('GET', '/api/auth/me'),
+  authLogin: (body) => req('POST', '/api/auth/login', body),
+  authRegister: (body) => req('POST', '/api/auth/register', body),
+  authLogout: () => req('POST', '/api/auth/logout'),
+
   getSettings: () => req('GET', '/api/settings'),
   saveSettings: (patch) => req('POST', '/api/settings', patch),
 
@@ -108,16 +116,42 @@ export const api = {
   credentialModels: (category, body) => req('POST', `/api/credentials/${category}/models`, body),
   llmModels: (body) => req('POST', '/api/llm/models', body),
 
+  doubaoPool: (params = {}) => {
+    const query = new URLSearchParams()
+    if (params.autoOpen) query.set('autoOpen', '1')
+    if (params.site) query.set('site', params.site)
+    return req('GET', `/api/doubao-pool${query.toString() ? `?${query.toString()}` : ''}`)
+  },
+  enableDoubaoCredential: (body = {}) => req('POST', '/api/doubao-pool/enable-credential', body),
+  prepareDoubaoExtension: (body = {}) => req('POST', '/api/doubao-pool/extension/prepare', body),
+  updateDoubaoPoolSettings: (body = {}) => req('POST', '/api/doubao-pool/settings', body),
+  readyDoubaoPool: (body) => req('POST', '/api/doubao-pool/ready', body),
+  openDoubaoExtensionDir: () => req('POST', '/api/doubao-pool/extension/open-dir'),
+  diagnoseDoubaoPool: (body) => req('POST', '/api/doubao-pool/diagnose', body),
+  addDoubaoAccount: (body) => req('POST', '/api/doubao-pool/accounts', body),
+  importDoubaoAccounts: (body) => req('POST', '/api/doubao-pool/accounts/import', body, { timeoutMs: LONG_TASK_TIMEOUT_MS }),
+  exportDoubaoAccounts: (params = {}) => {
+    const query = new URLSearchParams()
+    if (params.site) query.set('site', params.site)
+    return downloadBlob('GET', `/api/doubao-pool/accounts/export${query.toString() ? `?${query.toString()}` : ''}`, undefined, { timeoutMs: LONG_TASK_TIMEOUT_MS })
+  },
+  updateDoubaoAccount: (id, body) => req('PATCH', `/api/doubao-pool/accounts/${id}`, body),
+  resetDoubaoAccountUsage: (id, body) => req('POST', `/api/doubao-pool/accounts/${id}/reset-usage`, body),
+  resetAllDoubaoAccountUsage: (body) => req('POST', '/api/doubao-pool/accounts/reset-usage', body),
+  deleteDoubaoAccount: (id, body = {}) => req('DELETE', `/api/doubao-pool/accounts/${id}`, body),
+  setDoubaoRoot: (rootDir, body = {}) => req('POST', '/api/doubao-pool/root', { rootDir, ...body }),
+  openDoubaoAccount: (body) => req('POST', '/api/doubao-pool/open', body),
+
   // projects (Phase 2)
   listProjects: () => req('GET', '/api/projects'),
   getProject: (pid) => req('GET', `/api/projects/${pid}`),
   getProjectOverview: (pid) => req('GET', `/api/projects/${pid}/overview`),
   deleteProject: (pid) => req('DELETE', `/api/projects/${pid}`),
   renameProject: (pid, name) => req('PATCH', `/api/projects/${pid}`, { name }),
-  importProject: (body) => req('POST', '/api/projects/import', body),
-  analyzeProject: (pid, body) => req('POST', `/api/projects/${pid}/analyze`, body),
+  importProject: (body) => req('POST', '/api/projects/import', body, { timeoutMs: LONG_TASK_TIMEOUT_MS }),
+  analyzeProject: (pid, body) => req('POST', `/api/projects/${pid}/analyze`, body, { timeoutMs: LONG_TASK_TIMEOUT_MS }),
   updateStoryBible: (pid, patch) => req('PATCH', `/api/projects/${pid}/story_bible`, patch),
-  decomposeProject: (pid, body) => req('POST', `/api/projects/${pid}/decompose`, body),
+  decomposeProject: (pid, body) => req('POST', `/api/projects/${pid}/decompose`, body, { timeoutMs: LONG_TASK_TIMEOUT_MS }),
   getJob: (jobId) => req('GET', `/api/jobs/${jobId}`),
 
   // episodes (集) — Phase 8
@@ -140,12 +174,17 @@ export const api = {
   startAssetRefImage: (pid, aid, body) => req('POST', `/api/projects/${pid}/assets/${aid}/refimage/start`, body),
   genMissingAssets: (pid, body) => req('POST', `/api/projects/${pid}/assets/generate-missing`, body || {}),
   startMissingAssets: (pid, body) => req('POST', `/api/projects/${pid}/assets/generate-missing/start`, body || {}),
-  importAssetImage: (pid, aid, file) => {
+  importAssetImage: (pid, aid, file, extra = {}) => {
     const fd = new FormData()
     fd.append('file', file)
+    Object.entries(extra || {}).forEach(([key, value]) => {
+      if (value === undefined || value === null || value === '') return
+      fd.append(key, typeof value === 'string' ? value : JSON.stringify(value))
+    })
     return upload(`/api/projects/${pid}/assets/${aid}/import-image`, fd)
   },
   importAssetFromLibrary: (pid, aid, body) => req('POST', `/api/projects/${pid}/assets/${aid}/import-library`, body),
+  restoreAssetOriginal: (pid, aid) => req('POST', `/api/projects/${pid}/assets/${aid}/restore-original`),
   assetImageUrl: (pid, filename) => `/api/projects/${pid}/asset-image/${filename}`,
   resolveMentions: (pid, text) => req('POST', `/api/projects/${pid}/resolve`, { text }),
 
@@ -154,11 +193,13 @@ export const api = {
   previewShotPrompts: (pid, body) => req('POST', `/api/projects/${pid}/shot_prompts`, body),
   saveShotPrompts: (pid, body) => req('POST', `/api/projects/${pid}/shot_prompts/save`, body),
   saveShotMaterial: (pid, body) => req('POST', `/api/projects/${pid}/shot_material/select`, body),
-  inferShotPrompt: (pid, body) => req('POST', `/api/projects/${pid}/infer_shot_prompt`, body),
+  inferShotPrompt: (pid, body) => req('POST', `/api/projects/${pid}/infer_shot_prompt`, body, { timeoutMs: AI_INFER_TIMEOUT_MS }),
   createBatch: (pid, body) => req('POST', `/api/projects/${pid}/batches`, body),
   createEpisodeBatches: (pid, body) => req('POST', `/api/projects/${pid}/episode_batches`, body),
   getBatch: (pid, bid) => req('GET', `/api/projects/${pid}/batches/${bid}`),
   deleteBatch: (pid, bid) => req('DELETE', `/api/projects/${pid}/batches/${bid}`),
+  deleteBatchTaskResult: (pid, bid, taskId) => req('DELETE', `/api/projects/${pid}/batches/${bid}/tasks/${taskId}/result`),
+  dismissBatchErrors: (pid, body) => req('POST', `/api/projects/${pid}/batch_errors/dismiss`, body || {}),
   startBatch: (pid, bid) => req('POST', `/api/projects/${pid}/batches/${bid}/start`),
   pauseBatch: (pid, bid) => req('POST', `/api/projects/${pid}/batches/${bid}/pause`),
   retryBatch: (pid, bid) => req('POST', `/api/projects/${pid}/batches/${bid}/retry`),

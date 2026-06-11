@@ -6,7 +6,7 @@ image of the next shot (无缝衔接). We also expose probe_duration so the deci
 engine can reason about timing.
 
 Binary resolution order (so dev + frozen builds both work):
-  1. BATCH_STUDIO_FFMPEG / BATCH_STUDIO_FFPROBE env override
+  1. VMO_STUDIO_FFMPEG / VMO_STUDIO_FFPROBE env override
   2. a bundled binary next to the executable / under BUNDLED_DIR (PyInstaller)
   3. the system PATH (dev machines / users who already have ffmpeg)
 """
@@ -47,8 +47,8 @@ class FFmpegError(Exception):
     pass
 
 
-def _find(tool: str, env_key: str) -> Optional[str]:
-    override = os.environ.get(env_key)
+def _find(tool: str, env_key: str, legacy_env_key: str = "") -> Optional[str]:
+    override = os.environ.get(env_key) or (os.environ.get(legacy_env_key) if legacy_env_key else "")
     if override and Path(override).exists():
         return override
     # bundled (next to exe, or under PyInstaller temp / backend dir)
@@ -62,14 +62,14 @@ def _find(tool: str, env_key: str) -> Optional[str]:
 
 
 def ffmpeg_path() -> str:
-    p = _find("ffmpeg", "BATCH_STUDIO_FFMPEG")
+    p = _find("ffmpeg", "VMO_STUDIO_FFMPEG", "BATCH_STUDIO_FFMPEG")
     if not p:
         raise FFmpegError("未找到 ffmpeg 可执行文件（开发机请安装 ffmpeg，打包版会内置）")
     return p
 
 
 def ffprobe_path() -> Optional[str]:
-    return _find("ffprobe", "BATCH_STUDIO_FFPROBE")
+    return _find("ffprobe", "VMO_STUDIO_FFPROBE", "BATCH_STUDIO_FFPROBE")
 
 
 def is_available() -> bool:

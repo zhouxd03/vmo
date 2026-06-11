@@ -66,13 +66,20 @@ function startPolling() {
 
 const progress = computed(() => {
   if (!current.value?.tasks?.length) return 0
-  const d = current.value.tasks.filter((t) => t.status === 'done').length
+  const d = current.value.tasks.filter((t) => ['done', 'error', 'skipped'].includes(t.status)).length
   return Math.round((d / current.value.tasks.length) * 100)
 })
 const counts = computed(() => {
-  const c = { pending: 0, running: 0, done: 0, error: 0 }
-  current.value?.tasks?.forEach((t) => { c[t.status] = (c[t.status] || 0) + 1 })
+  const c = { pending: 0, running: 0, done: 0, error: 0, skipped: 0, dismissed: 0 }
+  current.value?.tasks?.forEach((t) => {
+    const s = viewStatus(t)
+    c[s] = (c[s] || 0) + 1
+  })
   return c
+})
+const currentBatchStatus = computed(() => {
+  if (current.value?.status === 'error' && !counts.value.error && counts.value.dismissed) return 'dismissed'
+  return current.value?.status || 'pending'
 })
 
 async function start() {
@@ -103,10 +110,22 @@ function openPreview(t) {
   if (url) preview.value = { url, video: isVideoFile(t.result.filename) }
 }
 function statusType(s) {
-  return { done: 'success', error: 'error', running: 'warning', pending: 'default', paused: 'warning' }[s] || 'default'
+  return { done: 'success', error: 'error', running: 'warning', pending: 'default', paused: 'warning', skipped: 'default', dismissed: 'default' }[s] || 'default'
 }
 function statusLabel(s) {
+  if (s === 'dismissed') return '已清除'
+  if (s === 'skipped') return '已跳过'
   return { done: '完成', error: '失败', running: '生成中', pending: '等待', paused: '已暂停' }[s] || s
+}
+function isDismissedError(t) {
+  return t?.status === 'error' && !!t?.error_dismissed_at
+}
+function viewStatus(t) {
+  return isDismissedError(t) ? 'dismissed' : (t?.status || 'pending')
+}
+function batchListStatus(b) {
+  if (b?.status === 'error' && !Number(b?.error || 0)) return 'dismissed'
+  return b?.status || 'pending'
 }
 function fmtTime(ts) {
   if (!ts) return ''
@@ -144,14 +163,15 @@ function fmtTime(ts) {
             <div class="bc-top">
               <n-icon :component="b.kind === 'video' ? VideocamOutline : ImageOutline" :size="15" />
               <span class="bc-name">{{ b.name }}</span>
-              <n-tag size="tiny" :type="statusType(b.status)" :bordered="false">{{ statusLabel(b.status) }}</n-tag>
+              <n-tag size="tiny" :type="statusType(batchListStatus(b))" :bordered="false">{{ statusLabel(batchListStatus(b)) }}</n-tag>
             </div>
             <div class="bc-meta">
               <span>{{ b.done }}/{{ b.total }} 完成</span>
               <span v-if="b.error" class="bc-err">· {{ b.error }} 失败</span>
+              <span v-if="b.skipped">· {{ b.skipped }} 跳过</span>
               <span class="bc-time">{{ fmtTime(b.created_at) }}</span>
             </div>
-            <div class="bc-bar"><span :style="{ width: (b.total ? Math.round(b.done / b.total * 100) : 0) + '%' }" /></div>
+            <div class="bc-bar"><span :style="{ width: (b.total ? Math.round(((b.done || 0) + (b.error || 0) + (b.skipped || 0)) / b.total * 100) : 0) + '%' }" /></div>
           </button>
         </n-scrollbar>
       </div>
@@ -166,7 +186,7 @@ function fmtTime(ts) {
             <div class="d-title">
               <n-icon :component="current.kind === 'video' ? VideocamOutline : ImageOutline" :size="18" />
               <span>{{ current.name }}</span>
-              <n-tag size="small" :type="statusType(current.status)" :bordered="false">{{ statusLabel(current.status) }}</n-tag>
+              <n-tag size="small" :type="statusType(currentBatchStatus)" :bordered="false">{{ statusLabel(currentBatchStatus) }}</n-tag>
             </div>
             <div class="d-actions">
               <n-button v-if="['pending','paused','error'].includes(current.status)" size="small" type="primary" @click="start">
@@ -190,7 +210,7 @@ function fmtTime(ts) {
             <div class="d-progress">
               <n-progress type="line" :percentage="progress" :height="8" :border-radius="6"
                 :status="counts.error ? 'error' : 'success'" />
-              <span class="d-counts">完成 {{ counts.done }} · 生成中 {{ counts.running }} · 等待 {{ counts.pending }} · 失败 {{ counts.error }}</span>
+              <span class="d-counts">完成 {{ counts.done }} · 生成中 {{ counts.running }} · 等待 {{ counts.pending }} · 跳过 {{ counts.skipped }}<template v-if="counts.dismissed"> · 已清除 {{ counts.dismissed }}</template> · 失败 {{ counts.error }}</span>
             </div>
           </div>
 
@@ -199,17 +219,17 @@ function fmtTime(ts) {
               <div class="cell-media" :class="{ clickable: taskUrl(t) }" @click="openPreview(t)">
                 <video v-if="taskUrl(t) && isVideoFile(t.result.filename)" :src="taskUrl(t)" muted class="media" />
                 <img v-else-if="taskUrl(t)" :src="taskUrl(t)" class="media" />
-                <div v-else class="media ph" :class="t.status">
+                <div v-else class="media ph" :class="viewStatus(t)">
                   <n-icon :component="current.kind === 'video' ? VideocamOutline : ImageOutline" :size="22" />
-                  <span>{{ statusLabel(t.status) }}</span>
+                  <span>{{ statusLabel(viewStatus(t)) }}</span>
                 </div>
               </div>
               <div class="cell-foot">
                 <span class="cell-no">{{ t.shot_no || `#${t.index + 1}` }}</span>
-                <n-tag size="tiny" :type="statusType(t.status)" :bordered="false">{{ statusLabel(t.status) }}</n-tag>
+                <n-tag size="tiny" :type="statusType(viewStatus(t))" :bordered="false">{{ statusLabel(viewStatus(t)) }}</n-tag>
               </div>
               <div class="cell-prompt" :title="t.prompt">{{ t.prompt || '（无提示词）' }}</div>
-              <div v-if="t.error" class="cell-error" :title="t.error">⚠ {{ t.error }}</div>
+              <div v-if="t.error && !isDismissedError(t)" class="cell-error" :title="t.error">⚠ {{ t.error }}</div>
             </div>
           </div>
         </template>

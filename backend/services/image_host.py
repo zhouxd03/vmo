@@ -22,7 +22,7 @@ logger = logging.getLogger("batch_studio")
 # real public-URL hosts first; "datauri" is a non-fetchable last resort
 SERVICES = ["catbox", "uguu", "0x0", "litterbox", "datauri"]
 
-_UA = {"User-Agent": "Mozilla/5.0 (batch-studio)"}
+_UA = {"User-Agent": "Mozilla/5.0 (vmo-studio)"}
 _UNHEALTHY_FOR_SECONDS = 600
 _unhealthy_until: dict[str, float] = {}
 
@@ -147,6 +147,29 @@ _UPLOADERS = {
     "uguu": _to_uguu,
     "0x0": _to_0x0,
 }
+
+
+def _service_from_url(url: str) -> str:
+    host = (urlparse(url or "").netloc or "").lower()
+    if host.endswith("catbox.moe"):
+        if host.startswith("litterbox."):
+            return "litterbox"
+        return "catbox"
+    if host.endswith("uguu.se"):
+        return "uguu"
+    if host.endswith("0x0.st"):
+        return "0x0"
+    return ""
+
+
+def mark_urls_unhealthy(urls: list[str], reason: Exception | str) -> None:
+    """Temporarily avoid hosts whose URLs the upstream video service rejected."""
+    seen: set[str] = set()
+    for url in urls or []:
+        service = _service_from_url(url)
+        if service and service not in seen:
+            seen.add(service)
+            _mark_unhealthy(service, reason)
 
 
 def upload(img_b64: str, *, allow_data_uri: bool = True, verify: bool = True) -> str:

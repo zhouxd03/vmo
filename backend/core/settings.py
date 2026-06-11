@@ -12,6 +12,7 @@ DEFAULTS = {
     "video_resolution": "720p",
     "video_duration": 10,
     "video_timeout": 300,
+    "llm_timeout": 600,
     # 分镜：单个分镜的目标时长（秒）。拆解剧本时按此折算单镜承载的文字量——
     # 纯画面/旁白 ≈8字/秒（120字≈15秒），对白 ≈5字/秒；一镜对白越多则承载文字
     # 越少，避免"对话过载"。单镜估算时长也以此为中心，最终钳制到模型 15s 上限。
@@ -34,10 +35,10 @@ DEFAULTS = {
     # 导演图/首帧图 ＞ 角色图 ＞ 背景图 ＞ 配角图 ＞ 道具图.
     "max_reference_images": 4,
     # Video reference transport:
-    # - data_url: default; send data:image/...;base64 directly to JSON relays
-    # - auto: Data URL first, public URL fallback only when the relay rejects it
+    # - auto: default; Data URL first, public URL fallback when the relay fetches refs
+    # - data_url: send data:image/...;base64 directly to JSON relays
     # - public_url: require a fetchable public URL
-    "video_reference_transport": "data_url",
+    "video_reference_transport": "auto",
     # storage / theme
     "output_dir": str(OUTPUT_DIR),
     # 剪映/CapCut Windows 默认草稿目录。留空时只生成 zip，不自动写入剪映草稿库。

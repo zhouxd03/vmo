@@ -320,6 +320,34 @@ def update_shot_selected_material(pid: str, eid: str, shot_no, material: dict[st
     return None
 
 
+def clear_selected_material(pid: str, bid: str, filename: str) -> int:
+    """Remove persisted shot material selections that point to a deleted file."""
+    p = get_project(pid)
+    if not p:
+        return 0
+    bid = str(bid or "").strip()
+    filename = str(filename or "").strip()
+    if not bid or not filename:
+        return 0
+    cleared = 0
+    now = time.time()
+    for e in p.get("episodes", []) or []:
+        changed = False
+        for s in e.get("shots", []) or []:
+            selected = s.get("selected_material")
+            if not isinstance(selected, dict):
+                continue
+            if selected.get("bid") == bid and selected.get("filename") == filename:
+                s.pop("selected_material", None)
+                cleared += 1
+                changed = True
+        if changed:
+            e["updated_at"] = now
+    if cleared:
+        _write(p)
+    return cleared
+
+
 def delete_episode(pid: str, eid: str) -> Optional[dict]:
     p = get_project(pid)
     if not p:

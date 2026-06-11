@@ -13,6 +13,7 @@ from typing import Any, Optional
 import requests as http
 
 from ..core import credentials
+from ..core import settings as settings_store
 
 logger = logging.getLogger("batch_studio")
 
@@ -64,7 +65,7 @@ def chat(
     temperature: float = 0.7,
     max_tokens: Optional[int] = None,
     response_json: bool = False,
-    timeout: int = 180,
+    timeout: Optional[int] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> str:
@@ -72,6 +73,9 @@ def chat(
     model = model or default_model
     if not model:
         raise LLMError("未指定 LLM 模型，请在凭据库为该 API 设置默认模型或手动选择")
+    if timeout is None:
+        timeout = settings_store.load_settings().get("llm_timeout", 600)
+    timeout = max(60, min(1800, int(timeout or 600)))
     url = f"{_base(api_base)}/chat/completions"
     payload: dict[str, Any] = {"model": model, "messages": messages, "temperature": temperature}
     if max_tokens:

@@ -54,6 +54,8 @@ def run_async(kind: str, worker: Callable[[str], Any], meta: Optional[dict] = No
             result = worker(job_id)
             finish(job_id, result)
         except Exception as e:  # noqa: BLE001
+            import logging
+            logging.getLogger("batch_studio").exception("[Job %s] worker failed", job_id)
             fail(job_id, str(e))
 
     threading.Thread(target=_run, daemon=True).start()

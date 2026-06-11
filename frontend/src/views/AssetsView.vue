@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NSelect, NButton, NIcon, NCard, NEmpty, NModal, NForm, NFormItem, NInput,
@@ -36,6 +36,42 @@ const resolutionOptions = [
   { label: '1080p', value: '1080p' },
   { label: '2K', value: '2K' },
   { label: '4K', value: '4K' },
+]
+const lineStyleOptions = [
+  { label: '错位分割十字', value: 'split-cross' },
+  { label: '三分构图线', value: 'thirds' },
+  { label: '中心十字线', value: 'center-cross' },
+  { label: '基础方格', value: 'square' },
+  { label: '斜切菱形网', value: 'isometric' },
+  { label: '蜂窝蛛网', value: 'spider' },
+  { label: '雷达同心圆', value: 'radar' },
+]
+const lineResolutionOptions = [
+  { label: '保持原图', value: 'original' },
+  { label: '长边 1080', value: '1080' },
+  { label: '长边 720', value: '720' },
+  { label: '长边 480', value: '480' },
+]
+const lineFilterOptions = [
+  { label: '无滤镜', value: 'none' },
+  { label: '全彩插画', value: 'illustration' },
+  { label: '彩色铅笔', value: 'pencil' },
+]
+const collageLayoutOptions = [
+  { label: '方案A 画廊卡片', value: 'gallery' },
+  { label: '方案B 清爽设定表', value: 'sheet' },
+  { label: '方案C 紧凑索引板', value: 'compact' },
+]
+const collageSizeOptions = [
+  { label: 'AI兼容 3072', value: 3072 },
+  { label: '高清 2048', value: 2048 },
+  { label: '接近4K 3840', value: 3840 },
+  { label: '最高4K 4096', value: 4096 },
+]
+const collageAspectOptions = [
+  { label: '16:9 横向画板', value: '16:9' },
+  { label: '4:3 图集画板', value: '4:3' },
+  { label: '1:1 方形画板', value: '1:1' },
 ]
 const LEGACY_SIZE_MAP = {
   '1024x1024': '1:1',
@@ -366,6 +402,638 @@ function imgUrl(a) {
   return v ? `${url}?v=${v}` : url
 }
 
+// ── local character line/grid tool ──────────────────────────────────────────
+const lineModal = ref(false)
+const linePreviewCanvas = ref(null)
+const lineBusy = ref(false)
+const lineBatchBusy = ref(false)
+const lineTarget = ref(null)
+const lineMode = ref('single')
+const lineOptions = ref({
+  style: 'split-cross',
+  color: '#ffffff',
+  width: 5,
+  spacing: 180,
+  opacity: 0.72,
+  resolution: 'original',
+  filter: 'none',
+})
+const characterRefs = computed(() => assets.value.filter((a) => a.type === 'character' && a.ref_image))
+const restorableCharacterRefs = computed(() => characterRefs.value.filter(hasRestorableOriginal))
+
+function openLineTool(a) {
+  if (!a?.ref_image) {
+    message.warning('这个角色还没有参考图，先生成或导入一张再划线')
+    return
+  }
+  lineMode.value = 'single'
+  lineTarget.value = a
+  lineModal.value = true
+  nextTick(renderLinePreview)
+}
+
+function openBatchLineTool() {
+  const first = characterRefs.value[0]
+  if (!first) {
+    message.info('当前没有带参考图的角色')
+    return
+  }
+  lineMode.value = 'batch'
+  lineTarget.value = first
+  lineModal.value = true
+  nextTick(renderLinePreview)
+}
+
+function clampNumber(v, min, max, fallback) {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return fallback
+  return Math.min(max, Math.max(min, n))
+}
+
+function normalizedLineOptions() {
+  return {
+    ...lineOptions.value,
+    width: clampNumber(lineOptions.value.width, 1, 40, 5),
+    spacing: clampNumber(lineOptions.value.spacing, 30, 800, 180),
+    opacity: clampNumber(lineOptions.value.opacity, 0.1, 1, 0.72),
+  }
+}
+
+function assetImageSrc(a) {
+  if (!store.current || !a?.ref_image) return ''
+  return api.assetImageUrl(store.current.id, a.ref_image)
+}
+
+function lineBaseImageName(a) {
+  return a?.ref_original_image || a?.ref_image || ''
+}
+
+function lineAssetImageSrc(a) {
+  const name = lineBaseImageName(a)
+  if (!store.current || !name) return ''
+  return api.assetImageUrl(store.current.id, name)
+}
+
+function hasRestorableOriginal(a) {
+  return !!(a?.ref_original_image && a.ref_image && a.ref_original_image !== a.ref_image)
+}
+
+function loadCanvasImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error('图片加载失败'))
+    img.src = src
+  })
+}
+
+function targetSize(img, resolution) {
+  const maxSide = resolution === 'original' ? 0 : Number(resolution || 0)
+  if (!maxSide || Math.max(img.width, img.height) <= maxSide) {
+    return { width: img.width, height: img.height }
+  }
+  const scale = maxSide / Math.max(img.width, img.height)
+  return { width: Math.round(img.width * scale), height: Math.round(img.height * scale) }
+}
+
+function drawProcessedImage(img, opts) {
+  const { width, height } = targetSize(img, opts.resolution)
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')
+
+  if (opts.filter === 'illustration') {
+    ctx.filter = 'contrast(1.16) saturate(1.55) brightness(1.04)'
+  } else if (opts.filter === 'pencil') {
+    ctx.filter = 'grayscale(0.25) contrast(1.35) saturate(0.82) sepia(0.18)'
+  }
+
+  if (opts.style === 'split-cross') {
+    drawSplitCross(ctx, width, height, opts, img)
+    return canvas
+  }
+
+  ctx.drawImage(img, 0, 0, width, height)
+  ctx.filter = 'none'
+  ctx.save()
+  ctx.strokeStyle = opts.color
+  ctx.fillStyle = opts.color
+  ctx.lineWidth = opts.width
+  ctx.globalAlpha = opts.opacity
+  ctx.lineCap = 'round'
+  ctx.lineJoin = 'round'
+  switch (opts.style) {
+    case 'center-cross': drawCenterCross(ctx, width, height); break
+    case 'square': drawSquareGrid(ctx, width, height, opts.spacing); break
+    case 'isometric': drawIsometricGrid(ctx, width, height, opts.spacing); break
+    case 'spider': drawSpiderGrid(ctx, width, height, opts.spacing); break
+    case 'radar': drawRadarGrid(ctx, width, height, opts.spacing); break
+    default: drawThirdsGrid(ctx, width, height, opts.width); break
+  }
+  ctx.restore()
+  return canvas
+}
+
+function drawSplitCross(ctx, width, height, opts, img) {
+  const gap = opts.width * 2
+  const cx = width * 0.52
+  const cy = height * 0.38
+  const offsetX = Math.max(4, opts.width * 1.6)
+  const offsetY = Math.max(6, opts.width * 2.4)
+  const sx = img.width / width
+  const sy = img.height / height
+  ctx.filter = 'none'
+  ctx.fillStyle = opts.color
+  ctx.globalAlpha = 1
+  ctx.fillRect(0, 0, width, height)
+  if (opts.filter === 'illustration') ctx.filter = 'contrast(1.16) saturate(1.55) brightness(1.04)'
+  if (opts.filter === 'pencil') ctx.filter = 'grayscale(0.25) contrast(1.35) saturate(0.82) sepia(0.18)'
+  ctx.drawImage(img, 0, 0, cx * sx, cy * sy, 0, 0, cx, cy)
+  ctx.drawImage(img, cx * sx, 0, (width - cx) * sx, cy * sy, cx + gap, offsetY, width - cx - gap, cy)
+  ctx.drawImage(img, 0, cy * sy, cx * sx, (height - cy) * sy, offsetX, cy + gap, cx, height - cy - gap)
+  ctx.drawImage(img, cx * sx, cy * sy, (width - cx) * sx, (height - cy) * sy, cx + gap + offsetX, cy + gap + offsetY, width - cx - gap, height - cy - gap)
+  ctx.filter = 'none'
+}
+
+function drawCenterCross(ctx, width, height) {
+  ctx.beginPath()
+  ctx.moveTo(width / 2, 0); ctx.lineTo(width / 2, height)
+  ctx.moveTo(0, height / 2); ctx.lineTo(width, height / 2)
+  ctx.stroke()
+}
+
+function drawThirdsGrid(ctx, width, height, lineWidth) {
+  ctx.beginPath()
+  ctx.moveTo(width / 3, 0); ctx.lineTo(width / 3, height)
+  ctx.moveTo(width * 2 / 3, 0); ctx.lineTo(width * 2 / 3, height)
+  ctx.moveTo(0, height / 3); ctx.lineTo(width, height / 3)
+  ctx.moveTo(0, height * 2 / 3); ctx.lineTo(width, height * 2 / 3)
+  ctx.stroke()
+  ;[[width / 3, height / 3], [width * 2 / 3, height / 3], [width / 3, height * 2 / 3], [width * 2 / 3, height * 2 / 3]].forEach(([x, y]) => {
+    ctx.beginPath(); ctx.arc(x, y, lineWidth * 2, 0, Math.PI * 2); ctx.fill()
+  })
+}
+
+function drawSquareGrid(ctx, width, height, spacing) {
+  ctx.beginPath()
+  for (let x = 0; x <= width; x += spacing) { ctx.moveTo(x, 0); ctx.lineTo(x, height) }
+  for (let y = 0; y <= height; y += spacing) { ctx.moveTo(0, y); ctx.lineTo(width, y) }
+  ctx.stroke()
+}
+
+function drawIsometricGrid(ctx, width, height, spacing) {
+  ctx.beginPath()
+  for (let i = -height; i <= width; i += spacing) { ctx.moveTo(i, 0); ctx.lineTo(i + height, height) }
+  for (let i = 0; i <= width + height; i += spacing) { ctx.moveTo(i, 0); ctx.lineTo(i - height, height) }
+  ctx.stroke()
+}
+
+function drawSpiderGrid(ctx, width, height, radius) {
+  const rowHeight = radius * Math.sin(Math.PI / 3)
+  const colWidth = radius * 1.5
+  for (let y = -radius; y < height + radius; y += rowHeight) {
+    const rowNum = Math.round(y / rowHeight)
+    const xOffset = rowNum % 2 === 0 ? 0 : colWidth / 2 + radius * 0.25
+    for (let x = -radius + xOffset; x < width + radius; x += colWidth) {
+      for (let i = 0; i < 6; i += 1) {
+        const angle = i * (Math.PI * 2 / 6)
+        ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(angle) * radius, y + Math.sin(angle) * radius); ctx.stroke()
+      }
+      for (let r = 1; r <= 3; r += 1) {
+        ctx.beginPath()
+        for (let i = 0; i < 6; i += 1) {
+          const angle = i * (Math.PI * 2 / 6)
+          const px = x + Math.cos(angle) * (radius / 3) * r
+          const py = y + Math.sin(angle) * (radius / 3) * r
+          if (i === 0) ctx.moveTo(px, py)
+          else ctx.lineTo(px, py)
+        }
+        ctx.closePath(); ctx.stroke()
+      }
+    }
+  }
+}
+
+function drawRadarGrid(ctx, width, height, radius) {
+  for (let y = 0; y < height + radius; y += radius) {
+    for (let x = 0; x < width + radius; x += radius) {
+      ctx.beginPath(); ctx.moveTo(x - radius, y); ctx.lineTo(x + radius, y); ctx.stroke()
+      ctx.beginPath(); ctx.moveTo(x, y - radius); ctx.lineTo(x, y + radius); ctx.stroke()
+      for (let r = 1; r <= 3; r += 1) {
+        ctx.beginPath(); ctx.arc(x, y, (radius / 3) * r, 0, Math.PI * 2); ctx.stroke()
+      }
+    }
+  }
+}
+
+async function renderLinePreview() {
+  if (!lineModal.value || !lineTarget.value || !linePreviewCanvas.value) return
+  try {
+    const img = await loadCanvasImage(lineAssetImageSrc(lineTarget.value))
+    const full = drawProcessedImage(img, normalizedLineOptions())
+    const preview = linePreviewCanvas.value
+    const maxW = 760
+    const maxH = 520
+    const scale = Math.min(1, maxW / full.width, maxH / full.height)
+    preview.width = Math.max(1, Math.round(full.width * scale))
+    preview.height = Math.max(1, Math.round(full.height * scale))
+    const pctx = preview.getContext('2d')
+    pctx.clearRect(0, 0, preview.width, preview.height)
+    pctx.drawImage(full, 0, 0, preview.width, preview.height)
+  } catch (e) {
+    message.error(e.message || '预览失败')
+  }
+}
+
+function canvasToBlob(canvas) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error('导出图片失败'))), 'image/png', 1)
+  })
+}
+
+async function processedAssetFile(a) {
+  const img = await loadCanvasImage(lineAssetImageSrc(a))
+  const canvas = drawProcessedImage(img, normalizedLineOptions())
+  const blob = await canvasToBlob(canvas)
+  const safeName = String(a.name || a.id || 'character').replace(/[\\/:*?"<>|]+/g, '_')
+  return new File([blob], `${safeName}_line.png`, { type: 'image/png' })
+}
+
+async function saveLineTarget() {
+  if (!store.current || !lineTarget.value) return
+  lineBusy.value = true
+  try {
+    const file = await processedAssetFile(lineTarget.value)
+    await api.importAssetImage(store.current.id, lineTarget.value.id, file, {
+      purpose: 'line',
+      base_image: lineBaseImageName(lineTarget.value),
+      line_options: normalizedLineOptions(),
+    })
+    markImageFresh(lineTarget.value.id)
+    message.success(`已保存 ${lineTarget.value.trigger}${lineTarget.value.name} 的划线图`)
+    await loadAssets()
+    lineModal.value = false
+  } catch (e) {
+    message.error('保存划线图失败: ' + e.message)
+  } finally {
+    lineBusy.value = false
+  }
+}
+
+async function batchLineCharacters() {
+  if (!store.current) return
+  if (lineBatchBusy.value) return
+  const list = characterRefs.value
+  if (!list.length) {
+    message.info('当前没有带参考图的角色')
+    return
+  }
+  lineBatchBusy.value = true
+  let done = 0
+  try {
+    for (const a of list) {
+      const file = await processedAssetFile(a)
+      await api.importAssetImage(store.current.id, a.id, file, {
+        purpose: 'line',
+        base_image: lineBaseImageName(a),
+        line_options: normalizedLineOptions(),
+      })
+      markImageFresh(a.id)
+      done += 1
+    }
+    message.success(`已批量转换 ${done} 张角色图`)
+    await loadAssets()
+    if (lineModal.value) await nextTick(renderLinePreview)
+    if (lineMode.value === 'batch') lineModal.value = false
+  } catch (e) {
+    message.error(`批量转换中断：已完成 ${done}/${list.length}，${e.message}`)
+  } finally {
+    lineBatchBusy.value = false
+  }
+}
+
+async function restoreOriginal(a) {
+  if (!store.current || !a || !hasRestorableOriginal(a)) return
+  importingId.value = a.id
+  try {
+    await api.restoreAssetOriginal(store.current.id, a.id)
+    markImageFresh(a.id)
+    message.success(`已恢复 ${a.trigger || '@'}${a.name || ''} 的原图`)
+    await loadAssets()
+    if (lineTarget.value?.id === a.id) {
+      lineTarget.value = assets.value.find((item) => item.id === a.id) || lineTarget.value
+      if (lineModal.value) await nextTick(renderLinePreview)
+    }
+  } catch (e) {
+    message.error('恢复原图失败: ' + e.message)
+  } finally {
+    importingId.value = null
+  }
+}
+
+async function batchRestoreOriginals() {
+  if (!store.current || lineBatchBusy.value) return
+  const list = restorableCharacterRefs.value
+  if (!list.length) {
+    message.info('当前没有需要恢复的角色图')
+    return
+  }
+  lineBatchBusy.value = true
+  let done = 0
+  try {
+    for (const a of list) {
+      await api.restoreAssetOriginal(store.current.id, a.id)
+      markImageFresh(a.id)
+      done += 1
+    }
+    message.success(`已恢复 ${done} 张角色原图`)
+    await loadAssets()
+    if (lineModal.value) await nextTick(renderLinePreview)
+  } catch (e) {
+    message.error(`批量恢复中断：已完成 ${done}/${list.length}，${e.message}`)
+  } finally {
+    lineBatchBusy.value = false
+  }
+}
+
+watch(lineOptions, () => {
+  if (lineModal.value) nextTick(renderLinePreview)
+}, { deep: true })
+
+// ── local character collage board ───────────────────────────────────────────
+const collageModal = ref(false)
+const collagePreviewCanvas = ref(null)
+const collageBusy = ref(false)
+const collageSelectedIds = ref([])
+const collageAssetName = ref('角色拼接画板')
+const collageOptions = ref({
+  layout: 'gallery',
+  maxSize: 3072,
+  aspect: '16:9',
+  showTitle: true,
+  title: '角色参考图合集',
+  background: '#f6f7f8',
+  nameColor: '#101318',
+  labelColor: '#101318',
+  labelSize: 30,
+  accentColor: '#16f28b',
+})
+const selectedCharacterRefs = computed(() => {
+  const selected = new Set(collageSelectedIds.value)
+  return characterRefs.value.filter((a) => selected.has(a.id))
+})
+
+function openCollageTool() {
+  if (!characterRefs.value.length) {
+    message.info('当前没有带参考图的角色')
+    return
+  }
+  const valid = new Set(characterRefs.value.map((a) => a.id))
+  const kept = collageSelectedIds.value.filter((id) => valid.has(id))
+  collageSelectedIds.value = kept.length ? kept : characterRefs.value.map((a) => a.id)
+  if (!collageAssetName.value.trim()) collageAssetName.value = '角色拼接画板'
+  collageModal.value = true
+  nextTick(renderCollagePreview)
+}
+
+function selectAllCollageCharacters() {
+  collageSelectedIds.value = characterRefs.value.map((a) => a.id)
+}
+
+function clearCollageCharacters() {
+  collageSelectedIds.value = []
+}
+
+function collageSize() {
+  const maxSize = clampNumber(collageOptions.value.maxSize, 1024, 4096, 3072)
+  const aspect = collageOptions.value.aspect || '16:9'
+  if (aspect === '1:1') return { width: maxSize, height: maxSize }
+  if (aspect === '4:3') return { width: maxSize, height: Math.round(maxSize * 3 / 4) }
+  return { width: maxSize, height: Math.round(maxSize * 9 / 16) }
+}
+
+function bestGrid(count, width, height) {
+  let best = { cols: Math.ceil(Math.sqrt(count)), rows: Math.ceil(count / Math.ceil(Math.sqrt(count))), score: Infinity }
+  for (let cols = 1; cols <= count; cols += 1) {
+    const rows = Math.ceil(count / cols)
+    const cellRatio = (width / cols) / (height / rows)
+    const score = Math.abs(Math.log(cellRatio / 1.55)) + rows * 0.015
+    if (score < best.score) best = { cols, rows, score }
+  }
+  return best
+}
+
+function drawRoundRect(ctx, x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h / 2)
+  ctx.beginPath()
+  ctx.moveTo(x + rr, y)
+  ctx.lineTo(x + w - rr, y)
+  ctx.quadraticCurveTo(x + w, y, x + w, y + rr)
+  ctx.lineTo(x + w, y + h - rr)
+  ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h)
+  ctx.lineTo(x + rr, y + h)
+  ctx.quadraticCurveTo(x, y + h, x, y + h - rr)
+  ctx.lineTo(x, y + rr)
+  ctx.quadraticCurveTo(x, y, x + rr, y)
+  ctx.closePath()
+}
+
+function drawContain(ctx, img, x, y, w, h) {
+  const scale = Math.min(w / img.width, h / img.height)
+  const dw = img.width * scale
+  const dh = img.height * scale
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh)
+}
+
+function fitFont(ctx, text, maxWidth, startSize, minSize = 18) {
+  let size = startSize
+  while (size > minSize) {
+    ctx.font = `700 ${size}px "Microsoft YaHei", "PingFang SC", sans-serif`
+    if (ctx.measureText(text).width <= maxWidth) break
+    size -= 2
+  }
+  return size
+}
+
+async function buildCollageCanvas(preview = false) {
+  const list = selectedCharacterRefs.value
+  if (!list.length) throw new Error('请先选择至少一个角色')
+  const opts = collageOptions.value
+  const board = collageSize()
+  const canvas = document.createElement('canvas')
+  canvas.width = preview ? Math.round(board.width * Math.min(1, 980 / board.width, 620 / board.height)) : board.width
+  canvas.height = preview ? Math.round(board.height * Math.min(1, 980 / board.width, 620 / board.height)) : board.height
+  const scale = canvas.width / board.width
+  const ctx = canvas.getContext('2d')
+  ctx.scale(scale, scale)
+
+  ctx.fillStyle = opts.background || '#f6f7f8'
+  ctx.fillRect(0, 0, board.width, board.height)
+
+  const margin = opts.layout === 'compact' ? 72 : 96
+  const titleH = opts.showTitle ? 150 : 40
+  if (opts.showTitle) {
+    ctx.fillStyle = opts.nameColor || '#101318'
+    ctx.font = '800 54px "Microsoft YaHei", "PingFang SC", sans-serif'
+    ctx.textAlign = 'left'
+    ctx.textBaseline = 'middle'
+    ctx.fillText(opts.title || '角色参考图合集', margin, 78)
+    ctx.fillStyle = opts.accentColor || '#16f28b'
+    drawRoundRect(ctx, margin, 120, Math.min(520, board.width - margin * 2), 10, 5)
+    ctx.fill()
+  }
+
+  const areaX = margin
+  const areaY = titleH
+  const areaW = board.width - margin * 2
+  const areaH = board.height - areaY - margin
+  const { cols, rows } = bestGrid(list.length, areaW, areaH)
+  const gap = opts.layout === 'compact' ? 26 : 44
+  const cellW = (areaW - gap * (cols - 1)) / cols
+  const cellH = (areaH - gap * (rows - 1)) / rows
+  const images = await Promise.all(list.map(async (a) => ({ asset: a, img: await loadCanvasImage(assetImageSrc(a)) })))
+
+  images.forEach(({ asset, img }, idx) => {
+    const col = idx % cols
+    const row = Math.floor(idx / cols)
+    const x = areaX + col * (cellW + gap)
+    const y = areaY + row * (cellH + gap)
+    const nameH = opts.layout === 'compact' ? 74 : 92
+    const pad = opts.layout === 'compact' ? 14 : 24
+
+    if (opts.layout !== 'compact') {
+      ctx.save()
+      ctx.shadowColor = 'rgba(15, 18, 24, 0.16)'
+      ctx.shadowBlur = 24
+      ctx.shadowOffsetY = 10
+      drawRoundRect(ctx, x, y, cellW, cellH, 28)
+      ctx.fillStyle = opts.layout === 'sheet' ? '#ffffff' : 'rgba(255,255,255,0.92)'
+      ctx.fill()
+      ctx.restore()
+    }
+
+    const imgX = x + pad
+    const imgY = y + pad
+    const imgW = cellW - pad * 2
+    const imgH = cellH - nameH - pad * 1.5
+    ctx.save()
+    drawRoundRect(ctx, imgX, imgY, imgW, imgH, opts.layout === 'compact' ? 18 : 22)
+    ctx.clip()
+    ctx.fillStyle = opts.layout === 'compact' ? 'rgba(255,255,255,0.55)' : '#edf0f2'
+    ctx.fillRect(imgX, imgY, imgW, imgH)
+    drawContain(ctx, img, imgX, imgY, imgW, imgH)
+    ctx.restore()
+
+    const name = `${asset.trigger || '@'}${asset.name || ''}`
+    const tagX = opts.layout === 'compact' ? x + 8 : x + pad
+    const tagY = y + cellH - nameH + 18
+    const tagW = cellW - pad * 2
+    const baseLabelSize = clampNumber(opts.labelSize, 14, 72, opts.layout === 'compact' ? 28 : 32)
+    const fontSize = fitFont(ctx, name, tagW - 36, baseLabelSize, 14)
+    if (opts.layout === 'gallery') {
+      ctx.fillStyle = opts.accentColor || '#16f28b'
+      drawRoundRect(ctx, tagX, tagY, Math.min(tagW, ctx.measureText(name).width + 44), fontSize + 24, 18)
+      ctx.fill()
+      ctx.fillStyle = opts.labelColor || '#06130d'
+    } else {
+      ctx.fillStyle = opts.labelColor || opts.nameColor || '#101318'
+    }
+    ctx.font = `800 ${fontSize}px "Microsoft YaHei", "PingFang SC", sans-serif`
+    ctx.textAlign = 'left'
+    ctx.textBaseline = 'middle'
+    ctx.fillText(name, tagX + (opts.layout === 'gallery' ? 22 : 0), tagY + (fontSize + 24) / 2)
+  })
+  return canvas
+}
+
+async function renderCollagePreview() {
+  if (!collageModal.value || !collagePreviewCanvas.value) return
+  collageBusy.value = true
+  try {
+    const rendered = await buildCollageCanvas(true)
+    const preview = collagePreviewCanvas.value
+    preview.width = rendered.width
+    preview.height = rendered.height
+    const ctx = preview.getContext('2d')
+    ctx.clearRect(0, 0, preview.width, preview.height)
+    ctx.drawImage(rendered, 0, 0)
+  } catch (e) {
+    message.error('拼接预览失败: ' + e.message)
+  } finally {
+    collageBusy.value = false
+  }
+}
+
+async function downloadCollage() {
+  if (!selectedCharacterRefs.value.length) {
+    message.info('请先选择至少一个角色')
+    return
+  }
+  collageBusy.value = true
+  try {
+    const canvas = await buildCollageCanvas(false)
+    const blob = await canvasToBlob(canvas)
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `角色拼接画板_${canvas.width}x${canvas.height}.png`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    message.success('角色拼接画板已导出')
+  } catch (e) {
+    message.error('导出拼接图失败: ' + e.message)
+  } finally {
+    collageBusy.value = false
+  }
+}
+
+async function saveCollageToAssets() {
+  if (!store.current) return
+  const name = collageAssetName.value.trim()
+  if (!name) {
+    message.warning('请先填写拼接资产名称')
+    return
+  }
+  if (!selectedCharacterRefs.value.length) {
+    message.info('请先选择至少一个角色')
+    return
+  }
+  collageBusy.value = true
+  try {
+    const canvas = await buildCollageCanvas(false)
+    const blob = await canvasToBlob(canvas)
+    const file = new File([blob], `${name.replace(/[\\/:*?"<>|]+/g, '_')}_${canvas.width}x${canvas.height}.png`, { type: 'image/png' })
+    const asset = await api.addAsset(store.current.id, {
+      type: 'character',
+      name,
+      desc: `角色拼接画板，包含 ${selectedCharacterRefs.value.map((a) => a.name).join('、')}`,
+      appearance: '多角色拼接参考图，可直接 @ 引用',
+      role: 'support',
+    })
+    await api.importAssetImage(store.current.id, asset.id, file, { purpose: 'collage' })
+    markImageFresh(asset.id)
+    message.success(`已保存为资产 @${name}`)
+    await loadAssets()
+    collageSelectedIds.value = [asset.id]
+    collageModal.value = false
+  } catch (e) {
+    message.error('保存到资产库失败: ' + e.message)
+  } finally {
+    collageBusy.value = false
+  }
+}
+
+watch(collageOptions, () => {
+  if (collageModal.value) nextTick(renderCollagePreview)
+}, { deep: true })
+
+watch(collageSelectedIds, () => {
+  if (collageModal.value) nextTick(renderCollagePreview)
+}, { deep: true })
+
 // ── @ resolve tester ──
 const testText = ref('')
 const resolved = ref(null)
@@ -395,6 +1063,25 @@ async function runResolve() {
         <n-button size="small" secondary @click="seedFromBible">
           <template #icon><n-icon :component="SparklesOutline" /></template>
           从故事圣经导入
+        </n-button>
+        <n-button
+          size="small"
+          secondary
+          :disabled="!characterRefs.length"
+          @click="openBatchLineTool"
+        >
+          <template #icon><n-icon :component="DownloadOutline" /></template>
+          批量角色划线<span v-if="characterRefs.length">（{{ characterRefs.length }}）</span>
+        </n-button>
+        <n-button
+          size="small"
+          secondary
+          :loading="collageBusy"
+          :disabled="!characterRefs.length"
+          @click="openCollageTool"
+        >
+          <template #icon><n-icon :component="ImageOutline" /></template>
+          角色拼接画板<span v-if="characterRefs.length">（{{ characterRefs.length }}）</span>
         </n-button>
         <div class="gen-controls">
           <n-input
@@ -520,6 +1207,28 @@ async function runResolve() {
                     <n-button size="tiny" quaternary :loading="importingId === a.id" title="导入/复用图片" @click="openImport(a)">
                       <template #icon><n-icon :component="CloudUploadOutline" /></template>
                     </n-button>
+                    <n-button
+                      v-if="col.type === 'character'"
+                      size="tiny"
+                      secondary
+                      :disabled="!a.ref_image"
+                      title="角色图划线"
+                      @click="openLineTool(a)"
+                    >
+                      <template #icon><n-icon :component="DownloadOutline" /></template>
+                      划线
+                    </n-button>
+                    <n-button
+                      v-if="col.type === 'character' && hasRestorableOriginal(a)"
+                      size="tiny"
+                      tertiary
+                      :loading="importingId === a.id"
+                      title="恢复成未划线原图"
+                      @click="restoreOriginal(a)"
+                    >
+                      <template #icon><n-icon :component="RefreshOutline" /></template>
+                      原图
+                    </n-button>
                     <n-button size="tiny" quaternary @click="openEdit(a)">
                       <template #icon><n-icon :component="CreateOutline" /></template>
                     </n-button>
@@ -623,6 +1332,178 @@ async function runResolve() {
       </n-tabs>
     </n-modal>
 
+    <n-modal
+      v-model:show="lineModal"
+      preset="card"
+      :title="lineMode === 'batch' ? '批量角色划线设置' : '角色图划线工具'"
+      class="line-modal"
+      @after-enter="renderLinePreview"
+    >
+      <div class="line-tool">
+        <div class="line-preview">
+          <canvas ref="linePreviewCanvas"></canvas>
+        </div>
+        <div class="line-panel">
+          <div class="line-target" v-if="lineTarget">
+            <span>{{ lineMode === 'batch' ? `预览角色（共 ${characterRefs.length} 张）` : '当前角色' }}</span>
+            <b>{{ lineTarget.trigger }}{{ lineTarget.name }}</b>
+          </div>
+          <label class="line-field">
+            <span>线型</span>
+            <n-select v-model:value="lineOptions.style" :options="lineStyleOptions" size="small" />
+          </label>
+          <label class="line-field">
+            <span>输出</span>
+            <n-select v-model:value="lineOptions.resolution" :options="lineResolutionOptions" size="small" />
+          </label>
+          <label class="line-field">
+            <span>滤镜</span>
+            <n-select v-model:value="lineOptions.filter" :options="lineFilterOptions" size="small" />
+          </label>
+          <label class="line-field compact">
+            <span>颜色</span>
+            <input v-model="lineOptions.color" type="color" />
+          </label>
+          <label class="line-field compact">
+            <span>粗细 {{ lineOptions.width }}</span>
+            <input v-model.number="lineOptions.width" type="range" min="1" max="24" />
+          </label>
+          <label class="line-field compact">
+            <span>间距 {{ lineOptions.spacing }}</span>
+            <input v-model.number="lineOptions.spacing" type="range" min="40" max="520" step="10" />
+          </label>
+          <label class="line-field compact">
+            <span>透明度 {{ Math.round(lineOptions.opacity * 100) }}%</span>
+            <input v-model.number="lineOptions.opacity" type="range" min="0.1" max="1" step="0.05" />
+          </label>
+          <div class="line-actions">
+            <n-button
+              v-if="lineMode === 'single' && lineTarget && hasRestorableOriginal(lineTarget)"
+              tertiary
+              :loading="!!importingId"
+              @click="restoreOriginal(lineTarget)"
+            >
+              恢复当前原图
+            </n-button>
+            <n-button
+              v-if="lineMode === 'batch' && restorableCharacterRefs.length"
+              tertiary
+              :loading="lineBatchBusy"
+              @click="batchRestoreOriginals"
+            >
+              批量恢复原图（{{ restorableCharacterRefs.length }}）
+            </n-button>
+            <n-button
+              :type="lineMode === 'batch' ? 'primary' : 'default'"
+              secondary
+              :loading="lineBatchBusy"
+              :disabled="!characterRefs.length"
+              @click="batchLineCharacters"
+            >
+              {{ lineMode === 'batch' ? `开始批量转换 ${characterRefs.length} 张` : '批量套用全部角色' }}
+            </n-button>
+            <n-button v-if="lineMode === 'single'" type="primary" :loading="lineBusy" @click="saveLineTarget">
+              保存到当前角色
+            </n-button>
+          </div>
+        </div>
+      </div>
+    </n-modal>
+
+    <n-modal
+      v-model:show="collageModal"
+      preset="card"
+      title="角色拼接画板"
+      class="collage-modal"
+      @after-enter="renderCollagePreview"
+    >
+      <div class="collage-tool">
+        <div class="collage-preview">
+          <n-spin :show="collageBusy">
+            <canvas ref="collagePreviewCanvas"></canvas>
+          </n-spin>
+        </div>
+        <div class="collage-panel">
+          <div class="collage-summary">
+            <b>{{ selectedCharacterRefs.length }} / {{ characterRefs.length }} 张角色图</b>
+            <span>只会拼接已勾选的角色，并可保存成新的 @ 资产</span>
+          </div>
+          <label class="line-field">
+            <span>保存名称</span>
+            <n-input v-model:value="collageAssetName" size="small" placeholder="例如：主角团拼接参考" />
+          </label>
+          <div class="collage-picker">
+            <div class="collage-picker-head">
+              <span>选择角色</span>
+              <div>
+                <n-button size="tiny" quaternary @click="selectAllCollageCharacters">全选</n-button>
+                <n-button size="tiny" quaternary @click="clearCollageCharacters">清空</n-button>
+              </div>
+            </div>
+            <label v-for="a in characterRefs" :key="a.id" class="collage-check">
+              <input v-model="collageSelectedIds" type="checkbox" :value="a.id" />
+              <span>{{ a.trigger || '@' }}{{ a.name }}</span>
+            </label>
+          </div>
+          <div class="collage-summary">
+            <b>{{ characterRefs.length }} 张角色图</b>
+            <span>{{ collageOptions.maxSize }} 长边，{{ collageOptions.aspect }}，PNG 导出</span>
+          </div>
+          <label class="line-field">
+            <span>拼接方案</span>
+            <n-select v-model:value="collageOptions.layout" :options="collageLayoutOptions" size="small" />
+          </label>
+          <label class="line-field">
+            <span>画板清晰度</span>
+            <n-select v-model:value="collageOptions.maxSize" :options="collageSizeOptions" size="small" />
+          </label>
+          <label class="line-field">
+            <span>画板比例</span>
+            <n-select v-model:value="collageOptions.aspect" :options="collageAspectOptions" size="small" />
+          </label>
+          <label class="line-field">
+            <span>标题</span>
+            <n-input v-model:value="collageOptions.title" size="small" />
+          </label>
+          <label class="line-field compact">
+            <span>背景色</span>
+            <input v-model="collageOptions.background" type="color" />
+          </label>
+          <label class="line-field compact">
+            <span>标题文字色</span>
+            <input v-model="collageOptions.nameColor" type="color" />
+          </label>
+          <label class="line-field compact">
+            <span>角色名颜色</span>
+            <input v-model="collageOptions.labelColor" type="color" />
+          </label>
+          <label class="line-field compact">
+            <span>角色名字号 {{ collageOptions.labelSize }}</span>
+            <input v-model.number="collageOptions.labelSize" type="range" min="14" max="72" step="2" />
+          </label>
+          <label class="line-field compact">
+            <span>强调色</span>
+            <input v-model="collageOptions.accentColor" type="color" />
+          </label>
+          <label class="collage-toggle">
+            <input v-model="collageOptions.showTitle" type="checkbox" />
+            <span>显示顶部标题</span>
+          </label>
+          <div class="collage-schemes">
+            <b>方案说明</b>
+            <span>A：卡片式，更适合发给 AI 识别单个角色。</span>
+            <span>B：白底设定表，更接近角色资料页。</span>
+            <span>C：紧凑索引板，角色多时更省空间。</span>
+          </div>
+          <div class="line-actions">
+            <n-button secondary :loading="collageBusy" @click="renderCollagePreview">刷新预览</n-button>
+            <n-button secondary :loading="collageBusy" :disabled="!selectedCharacterRefs.length" @click="saveCollageToAssets">保存到资产库</n-button>
+            <n-button type="primary" :loading="collageBusy" @click="downloadCollage">下载拼接图</n-button>
+          </div>
+        </div>
+      </div>
+    </n-modal>
+
     <!-- add/edit modal -->
     <n-modal v-model:show="modal" preset="card" :title="editing ? '编辑资产' : '添加资产'" style="width: 520px">
       <n-form label-placement="top">
@@ -666,6 +1547,163 @@ async function runResolve() {
 .gen-aspect { width: 132px; }
 .gen-resolution { width: 108px; }
 .hint { color: var(--app-text-muted); font-size: 12px; }
+.line-modal { width: min(1120px, 94vw); }
+.line-tool {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 16px;
+}
+.line-preview {
+  min-height: 360px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  border: 1px solid var(--app-border);
+  border-radius: 10px;
+  background:
+    linear-gradient(45deg, color-mix(in srgb, var(--app-bg-soft) 72%, transparent) 25%, transparent 25%),
+    linear-gradient(-45deg, color-mix(in srgb, var(--app-bg-soft) 72%, transparent) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, color-mix(in srgb, var(--app-bg-soft) 72%, transparent) 75%),
+    linear-gradient(-45deg, transparent 75%, color-mix(in srgb, var(--app-bg-soft) 72%, transparent) 75%);
+  background-size: 18px 18px;
+  background-position: 0 0, 0 9px, 9px -9px, -9px 0;
+}
+.line-preview canvas {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+.line-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.line-target {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: var(--app-bg-soft);
+}
+.line-target span,
+.line-field span {
+  color: var(--app-text-muted);
+  font-size: 12px;
+}
+.line-target b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.line-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.line-field.compact input[type="range"] { width: 100%; }
+.line-field input[type="color"] {
+  width: 42px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+  background: transparent;
+}
+.line-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+.collage-modal { width: min(1280px, 95vw); }
+.collage-tool {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 16px;
+}
+.collage-preview {
+  min-height: 420px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  border: 1px solid var(--app-border);
+  border-radius: 10px;
+  background: var(--app-bg-soft);
+}
+.collage-preview canvas {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 8px;
+  box-shadow: 0 18px 44px rgba(0,0,0,.22);
+}
+.collage-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.collage-summary,
+.collage-schemes {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: var(--app-bg-soft);
+}
+.collage-summary span,
+.collage-schemes span {
+  color: var(--app-text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.collage-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  max-height: 180px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: var(--app-bg-soft);
+}
+.collage-picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--app-text-muted);
+  font-size: 12px;
+}
+.collage-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--app-text-secondary);
+  font-size: 13px;
+}
+.collage-check span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.collage-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--app-text-secondary);
+  font-size: 13px;
+}
 .import-modal { width: min(880px, 92vw); }
 .import-target {
   color: var(--app-text-muted);
@@ -752,6 +1790,10 @@ async function runResolve() {
 @media (max-width: 760px) {
   .gen-controls { width: 100%; flex-wrap: wrap; }
   .gen-model, .gen-aspect, .gen-resolution { width: 100%; }
+  .line-tool { grid-template-columns: 1fr; }
+  .line-preview { min-height: 260px; }
+  .collage-tool { grid-template-columns: 1fr; }
+  .collage-preview { min-height: 260px; }
   .library-grid { grid-template-columns: 1fr; }
   .local-import { grid-template-columns: 1fr; }
 }

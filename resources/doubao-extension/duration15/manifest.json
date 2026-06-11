@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "豆包国服视频 15 秒选项",
+  "version": "1.1.2",
+  "description": "在豆包国服网页视频生成时长菜单中增加 15 秒选项，选择后提交为 Seedance 2.0 / 15 秒参数。",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.doubao.com/*",
+        "https://doubao.com/*",
+        "https://www.dola.com/*",
+        "https://dola.com/*"
+      ],
+      "js": [
+        "loader.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "page.js"
+      ],
+      "matches": [
+        "https://www.doubao.com/*",
+        "https://doubao.com/*",
+        "https://www.dola.com/*",
+        "https://dola.com/*"
+      ]
+    }
+  ]
+}

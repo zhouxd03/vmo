@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "豆包视频无水印下载",
+  "version": "1.0.11",
+  "description": "在已登录的豆包页面提取可下载的视频地址。",
+  "permissions": ["activeTab", "scripting", "downloads"],
+  "host_permissions": ["https://www.doubao.com/*", "https://doubao.com/*", "https://www.dola.com/*", "https://dola.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "豆包视频下载",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.doubao.com/*", "https://doubao.com/*", "https://www.dola.com/*", "https://dola.com/*"],
+      "js": ["page-extractor.js"],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.doubao.com/*", "https://doubao.com/*", "https://www.dola.com/*", "https://dola.com/*"],
+      "js": ["content.js", "content-bridge.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

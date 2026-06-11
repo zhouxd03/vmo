@@ -4,13 +4,14 @@
 Bundles:
   - the Flask backend + run_desktop.py launcher (pywebview frameless window)
   - the built Vue frontend (frontend/dist -> _internal/static, read via paths.STATIC_DIR)
+  - Doubao localized Chromium runtime + VMO bridge + 15s duration + watermark helper -> _internal/resources/...
   - ffmpeg.exe + ffprobe.exe (-> _internal, found by services.ffmpeg_util._find)
 
 User data (data/, output/) is created next to the .exe at runtime (portable),
 NOT inside the bundle — see backend/core/paths.py (_is_frozen branch).
 
 Build:  pyinstaller desktop.spec --noconfirm
-Output: dist/BatchStudio/BatchStudio.exe  (+ _internal/)
+Output: dist/VmoStudio/VmoStudio.exe  (+ _internal/)
 """
 
 import os
@@ -26,6 +27,10 @@ WEBVIEW2_SETUP = os.path.join(ROOT, "desktop_assets", "MicrosoftEdgeWebview2Setu
 
 datas = [
     (os.path.join(ROOT, "frontend", "dist"), "static"),
+    (os.path.join(ROOT, "resources", "doubao-extension", "vmo"), os.path.join("resources", "doubao-extension", "vmo")),
+    (os.path.join(ROOT, "resources", "doubao-extension", "duration15"), os.path.join("resources", "doubao-extension", "duration15")),
+    (os.path.join(ROOT, "resources", "doubao-extension", "watermark"), os.path.join("resources", "doubao-extension", "watermark")),
+    (os.path.join(ROOT, "resources", "doubao-browser", "chrome_bin"), os.path.join("resources", "doubao-browser", "chrome_bin")),
     # Evergreen WebView2 bootstrapper -> _internal root (sys._MEIPASS);
     # run at first launch if the runtime is absent (see core/webview2.py).
     (WEBVIEW2_SETUP, "."),
@@ -68,7 +73,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="BatchStudio",
+    name="VmoStudio",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -84,5 +89,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="BatchStudio",
+    name="VmoStudio",
 )

@@ -1,22 +1,24 @@
 <script setup>
 import { computed } from 'vue'
-import { RemoveOutline, SquareOutline, CloseOutline } from '@vicons/ionicons5'
+import { LogOutOutline, RemoveOutline, SquareOutline, CloseOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
 import { useHealthStore } from '../stores/health'
 
+const props = defineProps({
+  user: { type: Object, default: null },
+  authenticated: { type: Boolean, default: false },
+})
+const emit = defineEmits(['logout'])
+
 const healthStore = useHealthStore()
-const healthTitle = computed(() => `${healthStore.label}${healthStore.detail ? `：${healthStore.detail}` : ''}`)
+const healthTitle = computed(() => `${healthStore.label}${healthStore.detail ? `: ${healthStore.detail}` : ''}`)
+const userLabel = computed(() => props.user?.nickname || props.user?.email || '已登录')
 
 function call(method) {
   const api = window.pywebview && window.pywebview.api
   if (api && api[method]) api[method]()
 }
 
-// On a frameless window the title bar must initiate dragging itself. We hand
-// off to the OS via the Win32 native move loop (api.start_drag) on left-button
-// mousedown over the drag region; this is far more reliable than the CSS
-// .pywebview-drag-region / window.move approach. Window-control buttons stop
-// propagation so clicking them never starts a drag.
 function onDragStart(e) {
   if (e.button !== 0) return
   call('start_drag')
@@ -27,14 +29,27 @@ function onDragStart(e) {
   <header class="titlebar" @mousedown="onDragStart" @dblclick="call('toggle_maximize')">
     <div class="brand">
       <span class="logo-dot" />
-      <span class="brand-name">连续性批量创作</span>
-      <span class="brand-sub">Batch Anime Studio</span>
+      <span class="brand-name">vmo studio</span>
+      <span class="brand-sub">local creative suite</span>
     </div>
     <div class="spacer" />
-    <button class="health-pill" :class="healthStore.status" :title="healthTitle" @mousedown.stop @click="healthStore.check()">
+    <button
+      v-if="authenticated"
+      class="health-pill"
+      :class="healthStore.status"
+      :title="healthTitle"
+      @mousedown.stop
+      @click="healthStore.check()"
+    >
       <span />
       {{ healthStore.status === 'online' ? '已连接' : (healthStore.checking ? '检查中' : '连接异常') }}
     </button>
+    <div v-if="authenticated" class="user-chip" :title="userLabel" @mousedown.stop>
+      <span>{{ userLabel }}</span>
+      <button title="退出登录" @click="emit('logout')">
+        <n-icon :component="LogOutOutline" />
+      </button>
+    </div>
     <div class="win-controls" @mousedown.stop @dblclick.stop>
       <button class="win-btn" title="最小化" @click="call('minimize')">
         <n-icon :component="RemoveOutline" />
@@ -73,13 +88,14 @@ function onDragStart(e) {
   align-self: center;
 }
 .brand-name {
-  font-weight: 700;
-  letter-spacing: 0.5px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: lowercase;
 }
 .brand-sub {
   color: var(--app-text-muted);
   font-size: 11px;
-  letter-spacing: 1px;
+  letter-spacing: 0;
 }
 .spacer {
   flex: 1;
@@ -116,6 +132,41 @@ function onDragStart(e) {
 .health-pill.offline span {
   background: #ff5d6c;
   box-shadow: 0 0 8px color-mix(in srgb, #ff5d6c 70%, transparent);
+}
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 230px;
+  height: 26px;
+  margin-right: 8px;
+  border: 1px solid var(--app-border);
+  border-radius: 999px;
+  background: var(--app-surface-2);
+  color: var(--app-text-secondary);
+  overflow: hidden;
+  font-size: 12px;
+}
+.user-chip span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 8px 0 10px;
+}
+.user-chip button {
+  width: 28px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-left: 1px solid var(--app-border);
+  background: transparent;
+  color: var(--app-text-muted);
+  cursor: pointer;
+}
+.user-chip button:hover {
+  color: var(--app-text-primary);
+  background: var(--app-surface);
 }
 .win-controls {
   display: flex;

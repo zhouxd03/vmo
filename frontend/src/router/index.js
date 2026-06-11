@@ -8,6 +8,7 @@ const routes = [
   { path: '/worktable', name: 'worktable', component: () => import('../views/WorktableView.vue'), meta: { title: '批量工作台', icon: 'worktable', fullBleed: true, gen: true } },
   { path: '/library', name: 'library', component: () => import('../views/LibraryView.vue'), meta: { title: '批次库', icon: 'library' } },
   { path: '/templates', name: 'templates', component: () => import('../views/TemplatesView.vue'), meta: { title: '提示词模板', icon: 'templates' } },
+  { path: '/doubao-pool', name: 'doubaoPool', component: () => import('../views/DoubaoPoolView.vue'), meta: { title: '豆包号池', icon: 'doubaoPool' } },
   { path: '/settings', name: 'settings', component: () => import('../views/SettingsView.vue'), meta: { title: '设置 / 凭据库', icon: 'settings' } },
   { path: '/logs', name: 'logs', component: () => import('../views/LogsView.vue'), meta: { title: '日志调试', icon: 'logs' } },
 ]

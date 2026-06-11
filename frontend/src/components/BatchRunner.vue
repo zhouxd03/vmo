@@ -102,14 +102,25 @@ async function selectBatch(bid) {
 const progress = computed(() => {
   if (!current.value) return 0
   const t = current.value.tasks.length || 1
-  const d = current.value.tasks.filter((x) => x.status === 'done').length
+  const d = current.value.tasks.filter((x) => ['done', 'error', 'skipped'].includes(x.status)).length
   return Math.round((d / t) * 100)
 })
 const counts = computed(() => {
-  const c = { pending: 0, running: 0, done: 0, error: 0 }
-  current.value?.tasks.forEach((t) => { c[t.status] = (c[t.status] || 0) + 1 })
+  const c = { pending: 0, running: 0, done: 0, error: 0, skipped: 0, dismissed: 0 }
+  current.value?.tasks.forEach((t) => {
+    const s = viewStatus(t)
+    c[s] = (c[s] || 0) + 1
+  })
   return c
 })
+const currentBatchStatus = computed(() => {
+  if (current.value?.status === 'error' && !counts.value.error && counts.value.dismissed) return 'dismissed'
+  return current.value?.status || 'pending'
+})
+function batchListStatus(b) {
+  if (b?.status === 'error' && !Number(b?.error || 0)) return 'dismissed'
+  return b?.status || 'pending'
+}
 
 function startPolling() {
   if (poll) clearInterval(poll)
@@ -145,10 +156,18 @@ async function removeBatch(b) {
 }
 
 function tagType(s) {
-  return { done: 'success', error: 'error', running: 'warning', pending: 'default' }[s] || 'default'
+  return { done: 'success', error: 'error', running: 'warning', pending: 'default', skipped: 'default', dismissed: 'default' }[s] || 'default'
 }
 function tagLabel(s) {
+  if (s === 'dismissed') return '已清除'
+  if (s === 'skipped') return '已跳过'
   return { done: '完成', error: '失败', running: '生成中', pending: '等待' }[s] || s
+}
+function isDismissedError(t) {
+  return t?.status === 'error' && !!t?.error_dismissed_at
+}
+function viewStatus(t) {
+  return isDismissedError(t) ? 'dismissed' : (t?.status || 'pending')
 }
 function thumbUrl(t) {
   return t.result?.filename ? api.outputUrl(store.current.id, current.value.id, t.result.filename) : null
@@ -248,7 +267,7 @@ function thumbUrl(t) {
               <div class="bitem-main">
                 <div class="bname">{{ b.name }}</div>
                 <div class="bmeta">
-                  <n-tag size="tiny" :type="tagType(b.status)" :bordered="false">{{ b.status }}</n-tag>
+                  <n-tag size="tiny" :type="tagType(batchListStatus(b))" :bordered="false">{{ tagLabel(batchListStatus(b)) }}</n-tag>
                   <span>{{ b.done }}/{{ b.total }}</span>
                   <span v-if="b.error" class="err">✗{{ b.error }}</span>
                 </div>
@@ -276,7 +295,7 @@ function thumbUrl(t) {
             <div class="dhead">
               <div>
                 <div class="dtitle">{{ current.name }}
-                  <n-tag size="small" :type="tagType(current.status)" :bordered="false">{{ current.status }}</n-tag>
+                  <n-tag size="small" :type="tagType(currentBatchStatus)" :bordered="false">{{ tagLabel(currentBatchStatus) }}</n-tag>
                 </div>
                 <div class="dsub">{{ isVideo ? '视频' : '图像' }}批次 · 并发 {{ current.concurrency }} · {{ current.tasks.length }} 任务</div>
               </div>
@@ -294,31 +313,31 @@ function thumbUrl(t) {
               </div>
             </div>
             <n-progress type="line" :percentage="progress" :indicator-placement="'inside'"
-              :status="current.status === 'error' ? 'error' : 'success'" style="margin-top: 12px" />
+              :status="counts.error ? 'error' : 'success'" style="margin-top: 12px" />
             <div class="legend">
               <span>完成 {{ counts.done }}</span><span>生成中 {{ counts.running }}</span>
-              <span>等待 {{ counts.pending }}</span><span class="err">失败 {{ counts.error }}</span>
+              <span>等待 {{ counts.pending }}</span><span v-if="counts.skipped">已跳过 {{ counts.skipped }}</span><span v-if="counts.dismissed">已清除 {{ counts.dismissed }}</span><span class="err">失败 {{ counts.error }}</span>
             </div>
           </n-card>
 
           <n-card title="任务" :bordered="false" class="panel">
             <n-grid :cols="isVideo ? 3 : 4" :x-gap="12" :y-gap="12">
               <n-gi v-for="t in current.tasks" :key="t.id">
-                <div class="task" :class="t.status">
+                <div class="task" :class="viewStatus(t)">
                   <div class="task-thumb">
                     <n-image v-if="thumbUrl(t) && !isVideo" :src="thumbUrl(t)" object-fit="cover" width="100%" />
                     <video v-else-if="thumbUrl(t) && isVideo" :src="thumbUrl(t)" controls width="100%" />
-                    <div v-else class="task-ph">{{ tagLabel(t.status) }}</div>
+                    <div v-else class="task-ph">{{ tagLabel(viewStatus(t)) }}</div>
                   </div>
                   <div class="task-info">
                     <span class="sn">{{ t.shot_no }}</span>
-                    <n-tag size="tiny" :type="tagType(t.status)" :bordered="false">{{ tagLabel(t.status) }}</n-tag>
+                    <n-tag size="tiny" :type="tagType(viewStatus(t))" :bordered="false">{{ tagLabel(viewStatus(t)) }}</n-tag>
                   </div>
                   <n-tooltip v-if="t.prompt" trigger="hover">
                     <template #trigger><div class="task-prompt">{{ t.prompt }}</div></template>
                     {{ t.prompt }}
                   </n-tooltip>
-                  <div v-if="t.error" class="task-err">{{ t.error }}</div>
+                  <div v-if="t.error && !isDismissedError(t)" class="task-err">{{ t.error }}</div>
                 </div>
               </n-gi>
             </n-grid>

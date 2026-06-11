@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, h, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NSelect, NButton, NIcon, NEmpty, NInput, NTag, NImage, NSwitch, NTooltip,
@@ -10,10 +10,10 @@ import {
 import {
   ImageOutline, VideocamOutline, LockClosedOutline, LockOpenOutline,
   SparklesOutline, AlbumsOutline, EyeOutline, PlayOutline,
-  DownloadOutline, RefreshOutline, SettingsOutline, PauseOutline,
+  CopyOutline, DownloadOutline, EllipsisVerticalOutline, RefreshOutline, SettingsOutline, PauseOutline,
   FilmOutline, AddOutline, FlashOutline, ChevronDownOutline, ChevronForwardOutline, GitMergeOutline,
   ExpandOutline, CheckmarkCircleOutline, AlertCircleOutline, TimeOutline,
-  SyncOutline, HourglassOutline,
+  SwapHorizontalOutline, SyncOutline, HourglassOutline, TrashOutline,
 } from '@vicons/ionicons5'
 import PageHeader from '../components/PageHeader.vue'
 import EpisodeBar from '../components/EpisodeBar.vue'
@@ -40,6 +40,7 @@ const fullBatchCache = reactive({}) // bid -> full batch detail used by error dr
 const showErrorDrawer = ref(false)
 const errorDrawerMode = ref('episode') // episode | shot
 const errorDrawerShot = ref('')
+const errorClearing = ref(false)
 const continuityState = ref(null)
 const bridgeBusy = reactive({}) // transition key -> action
 const manualBridge = reactive({}) // next shot_no -> manual continuity decision
@@ -55,7 +56,7 @@ const tb = reactive({
   continuityMode: 'auto',
   aiReview: true,
   decisionLlm: true,  // 默认直接开启 LLM 升级决策（无凭据时后端自动回退规则）
-  batchPollMaxMinutes: 30,
+  batchPollMaxMinutes: 5,
 })
 const TB_STORAGE_PREFIX = 'wt:tb:'
 function tbStorageKey(pid = store.currentId) { return `${TB_STORAGE_PREFIX}${pid || 'none'}` }
@@ -163,7 +164,7 @@ function resetTb() {
     resolution: '720p',
     aspect: '16:9',
     model: '',
-    batchPollMaxMinutes: 30,
+    batchPollMaxMinutes: 5,
   })
 }
 
@@ -484,15 +485,32 @@ async function refreshVideoPrompts(shotNos) {
 }
 // 真·LLM 逐镜推理：调用 /infer_shot_prompt，喂入连续性(上一镜 handoff)+本镜关联资产
 // 说明+结构字段，产出干净规范的图片/视频提示词并回填（覆盖）。失败自动后端兜底确定性合成。
-async function inferShot(no) {
+async function refreshPromptState(shotNos, { force = false, quiet = false } = {}) {
+  if (!store.current || !shotNos.length) return
+  try {
+    await store.reloadCurrent()
+    ensureRows(shots.value)
+    await fillPrompts(shotNos, { force })
+  } catch (e) {
+    console.warn('[Worktable] prompt refresh after AI inference failed:', e)
+    if (!quiet) message.warning('AI 推理结果已保存，但当前列表刷新失败；输入框已保留本次返回的新内容')
+  }
+}
+
+async function inferShot(no, { showVideo = false } = {}) {
   const r = rowState[no]
   if (!r || !store.current) return null
   const res = await api.inferShotPrompt(store.current.id, {
     episode_id: store.currentEpisodeId, shot_no: no,
   })
-  if (res.image) r.imagePrompt = res.image
-  if (res.video) r.videoPrompt = res.video
+  const saved = res?.prompt_overrides || {}
+  const image = res.image || saved.image || ''
+  const video = res.video || saved.video || ''
+  if (image) r.imagePrompt = image
+  if (video) r.videoPrompt = video
   if (Array.isArray(res.refs)) r.refs = res.refs
+  if (showVideo && video) r.mode = 'video'
+  await nextTick()
   return res
 }
 async function inferRow(no) {
@@ -500,12 +518,16 @@ async function inferRow(no) {
   if (!r) return
   r.inferring = true
   try {
-    const res = await inferShot(no)
+    const res = await inferShot(no, { showVideo: true })
     if (res?.source === 'fallback') message.warning(`${no}：LLM 推理失败，已用确定性合成兜底`)
     else if (res?.source === 'llm_partial_fallback') message.warning(`${no}：AI 仅返回部分结果，视频词已用默认动态补齐`)
+    else if (res?.source === 'llm_timeline') message.success(`已 AI 优化 ${no} 的动作时间轴`)
     else message.success(`已 AI 推理并保存 ${no} 图片/视频提示词`)
-    await reload()
-  } catch (e) { message.error('AI 推理失败：' + e.message) }
+    await refreshPromptState([no], { force: true })
+  } catch (e) {
+    const hint = e?.code === 'timeout' ? 'AI 时间轴推理耗时较长，请稍后重试或检查 LLM 超时设置：' : 'AI 推理失败：'
+    message.error(hint + e.message)
+  }
   finally { r.inferring = false }
 }
 
@@ -553,7 +575,7 @@ async function inferAll() {
   }
   inferAllRunning.value = false
   message.success(`AI 推理并保存完成：成功 ${ok}${fb ? `，兜底 ${fb}` : ''}（共 ${targets.length} 镜）`)
-  await reload()
+  await refreshPromptState(targets, { force: true, quiet: true })
 }
 
 watch(shots, (list) => ensureRows(list), { immediate: true })
@@ -653,7 +675,14 @@ async function rebuildMaterials() {
       if (!no) return
       if (!mat[no]) mat[no] = []
       if (t.status === 'done' && t.result?.filename) {
-        mat[no].push({ bid: full.id, filename: t.result.filename, kind: full.kind, status: 'done' })
+        mat[no].push({
+          bid: full.id,
+          taskId: t.id,
+          filename: t.result.filename,
+          kind: full.kind,
+          status: 'done',
+          updated: t.updated_at || full.updated_at || 0,
+        })
       }
       if (full.kind === 'video' && t.status === 'running') {
         mat[no].push({
@@ -667,6 +696,7 @@ async function rebuildMaterials() {
           progress: Number(t.progress || 0),
         })
       }
+      if (t.status === 'error' && t.error_dismissed_at) return
       // track latest task status per shot (newest wins) for the live status badge
       const cand = {
         status: t.status, attempts: t.attempts || 0, error: taskError(t),
@@ -677,7 +707,7 @@ async function rebuildMaterials() {
       // overall progress: only count tasks belonging to currently-active batches
       if (batchActive) {
         pgActive = true; pgTotal++; pgKind = full.kind; pgName = full.name || ''
-        if (t.status === 'done' || t.status === 'error') pgDone++
+        if (t.status === 'done' || t.status === 'error' || t.status === 'skipped') pgDone++
         if (t.status === 'running') {
           pgRunning = no
           pgStageLabel = t.stage_label || ''
@@ -729,8 +759,15 @@ const STATUS_META = {
   paused: { label: '已暂停', type: 'warning', icon: PauseOutline },
   done: { label: '已完成', type: 'success', icon: CheckmarkCircleOutline },
   error: { label: '失败', type: 'error', icon: AlertCircleOutline },
+  skipped: { label: '已跳过', type: 'default', icon: PauseOutline },
 }
-function statusMeta(no) { return STATUS_META[statusByShot[no]?.status] || null }
+function statusMeta(no) {
+  const st = statusByShot[no]
+  if (st?.status === 'skipped' && st.stage === 'manual') {
+    return { label: '待手动', type: 'warning', icon: PauseOutline }
+  }
+  return STATUS_META[st?.status] || null
+}
 function decisionLabel(no) {
   const d = statusByShot[no]?.decision
   if (!d) return ''
@@ -764,6 +801,8 @@ function shotProgressText(no) {
 function statusTitle(no) {
   const st = statusByShot[no]
   if (!st) return ''
+  if (st.status === 'skipped' && st.stage === 'manual') return st.stageLabel || '豆包半自动：素材和提示词已填入，请在豆包网页中手动生成'
+  if (st.status === 'skipped') return st.error || st.stageLabel || '已跳过：前置条件未通过，未消耗调用'
   if (st.status === 'error') return st.error || '生成失败，请检查提示词/参数后手动重新提交'
   const stage = st.stageLabel ? `${st.stageLabel}${st.progress ? ` ${Math.round(st.progress)}%` : ''}，` : ''
   return `${stage}当前进度：${genProgress.done}/${genProgress.total || 0}，已用时：${elapsedText.value}`
@@ -789,12 +828,14 @@ function collectErrors() {
     if (!full || !isEpisodeBatch(full)) continue
     for (const t of full.tasks || []) {
       if (t.status !== 'error') continue
+      if (t.error_dismissed_at) continue
       const shotNo = t.shot_no || t.id
       const id = `${full.id}:${t.id || shotNo}:${t.updated_at || 0}:${taskError(t) || ''}`
       if (dismissedErrorIds.has(id)) continue
       out.push({
         id,
         batchId: full.id,
+        taskId: t.id,
         batchName: full.name || '',
         shotNo,
         kind: full.kind,
@@ -849,15 +890,38 @@ function materialSame(a, b) {
   return !!a && !!b && a.bid === b.bid && a.filename === b.filename
 }
 
-function clearVisibleErrors() {
+function renderMenuIcon(icon) {
+  return () => h(NIcon, { component: icon })
+}
+
+async function clearVisibleErrors() {
+  if (errorClearing.value) return
   const errs = visibleErrors.value
   if (!errs.length) return
-  errs.forEach((e) => dismissedErrorIds.add(e.id))
-  for (const e of errs) {
-    const st = statusByShot[e.shotNo]
-    if (st?.status === 'error' && st.kind === e.kind) delete statusByShot[e.shotNo]
+  const payload = errs
+    .filter((e) => e.batchId && e.taskId)
+    .map((e) => ({ batch_id: e.batchId, task_id: e.taskId }))
+  if (!payload.length) return
+  errorClearing.value = true
+  try {
+    const res = await api.dismissBatchErrors(store.current.id, { items: payload })
+    for (const full of res?.batches || []) {
+      if (full?.id) fullBatchCache[full.id] = full
+    }
+    errs.forEach((e) => dismissedErrorIds.add(e.id))
+    for (const e of errs) {
+      const st = statusByShot[e.shotNo]
+      if (st?.status === 'error' && st.kind === e.kind) delete statusByShot[e.shotNo]
+    }
+    await tasks.refreshBatches()
+    await rebuildMaterials()
+    if (!visibleErrors.value.length) showErrorDrawer.value = false
+    message.success(`已清空 ${res?.dismissed || errs.length} 条错误提示`)
+  } catch (e) {
+    message.error('清除错误失败：' + e.message)
+  } finally {
+    errorClearing.value = false
   }
-  message.success(`已清空 ${errs.length} 条错误提示`)
 }
 function materialStatusLabel(m) { return m?.stageLabel || (m?.status === 'running' ? '生成中' : '') }
 function materialProgress(m) {
@@ -865,6 +929,7 @@ function materialProgress(m) {
   return Math.max(0, Math.min(100, Number.isFinite(n) ? Math.round(n) : 0))
 }
 function matUrl(m) { return api.outputUrl(store.current.id, m.bid, m.filename) }
+function absoluteMatUrl(m) { return new URL(matUrl(m), window.location.origin).href }
 function currentMaterial(no) {
   const list = (materialsByShot[no] || []).filter((m) => !isVirtualMaterial(m))
   const chosen = rowState[no]?.chosen
@@ -874,6 +939,111 @@ function currentMaterial(no) {
   // default: prefer the latest video (this is a video-first preview), else latest image
   const vids = list.filter((m) => isVideoFile(m.filename))
   return vids.at(-1) || list.at(-1) || null
+}
+const materialMenu = reactive({
+  show: false,
+  x: 0,
+  y: 0,
+  shotNo: '',
+  material: null,
+})
+const materialMenuOptions = computed(() => {
+  const m = materialMenu.material
+  const no = materialMenu.shotNo
+  const isCurrent = !!m && materialSame(currentMaterial(no), m)
+  const kindLabel = m && isVideoFile(m.filename) ? '视频' : '图片'
+  return [
+    { label: isCurrent ? '已是当前素材' : `设为当前${kindLabel}`, key: 'set-current', icon: renderMenuIcon(SwapHorizontalOutline), disabled: !m || isCurrent },
+    { label: '预览', key: 'preview', icon: renderMenuIcon(EyeOutline), disabled: !m },
+    { type: 'divider', key: 'd1' },
+    { label: '下载素材', key: 'download', icon: renderMenuIcon(DownloadOutline), disabled: !m },
+    { label: '复制本地链接', key: 'copy-url', icon: renderMenuIcon(CopyOutline), disabled: !m },
+    { type: 'divider', key: 'd2' },
+    { label: `删除该${kindLabel}`, key: 'delete', icon: renderMenuIcon(TrashOutline), disabled: !m || !m.taskId },
+  ]
+})
+function openMaterialMenu(no, m, ev) {
+  if (!m || isVirtualMaterial(m)) return
+  ev?.preventDefault?.()
+  ev?.stopPropagation?.()
+  materialMenu.show = false
+  nextTick(() => {
+    materialMenu.shotNo = no
+    materialMenu.material = m
+    materialMenu.x = Number(ev?.clientX || 0)
+    materialMenu.y = Number(ev?.clientY || 0)
+    materialMenu.show = true
+  })
+}
+function openMaterialViewer(no, m) {
+  if (!m || isVirtualMaterial(m)) return
+  viewerMat.value = m
+  viewerShot.value = no
+  showViewer.value = true
+}
+function downloadMaterial(m) {
+  if (!m) return
+  const a = document.createElement('a')
+  a.href = matUrl(m)
+  a.download = m.filename || 'material'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+}
+async function copyMaterialLink(m) {
+  if (!m) return
+  const url = absoluteMatUrl(m)
+  try {
+    await navigator.clipboard.writeText(url)
+    message.success('已复制素材链接')
+  } catch {
+    message.info(url)
+  }
+}
+function removeMaterialLocally(no, m) {
+  const list = (materialsByShot[no] || []).filter((item) => !materialSame(item, m))
+  materialsByShot[no] = list
+  const full = fullBatchCache[m.bid]
+  const task = (full?.tasks || []).find((t) => t.id === m.taskId || t.result?.filename === m.filename)
+  if (task) {
+    task.result = null
+    task.deleted_result = { filename: m.filename, deleted_at: Date.now() / 1000 }
+    task.stage = 'deleted'
+    task.stage_label = '素材已删除'
+  }
+  if (materialSame(rowState[no]?.chosen, m)) {
+    rowState[no].chosen = null
+    patchShotSelectedMaterial(no, null)
+    saveMaterialSelections()
+  }
+}
+async function deleteMaterial(no, m) {
+  if (!m?.taskId) {
+    message.error('这个素材缺少任务编号，无法精确删除')
+    return
+  }
+  const label = `${no} 的${isVideoFile(m.filename) ? '视频' : '图片'}素材`
+  if (!window.confirm(`确定删除${label}吗？文件会从本项目输出目录中移除。`)) return
+  try {
+    await api.deleteBatchTaskResult(store.current.id, m.bid, m.taskId)
+    removeMaterialLocally(no, m)
+    await tasks.refreshBatches()
+    await rebuildMaterials()
+    message.success('素材已删除')
+  } catch (e) {
+    message.error('删除素材失败：' + e.message)
+  }
+}
+async function onMaterialMenuSelect(key) {
+  const no = materialMenu.shotNo
+  const m = materialMenu.material
+  materialMenu.show = false
+  if (!no || !m) return
+  if (key === 'set-current') return setCurrent(no, m)
+  if (key === 'preview') return openMaterialViewer(no, m)
+  if (key === 'download') return downloadMaterial(m)
+  if (key === 'copy-url') return copyMaterialLink(m)
+  if (key === 'delete') return deleteMaterial(no, m)
 }
 function patchShotSelectedMaterial(no, selected) {
   const ep = store.currentEpisode
@@ -1166,8 +1336,13 @@ function fmtProp(v) { const n = stripMark(v); return n ? '$' + n : '' }
 
 // 字幕：优先台词（真正的字幕），其次动作描述；去掉「画面展示/镜头展示」等冗余引导词。
 const _LEAD_FILLER = /^(画面|镜头|本镜|此镜|该镜)?(展示|呈现|显示|表现|描绘|描述|刻画|出现)[：:，,]?/
+function displayDialogue(v) {
+  return String(v || '')
+    .replace(/(?:对白|对话|画外旁白|旁白|内心OS|吐槽)\s*[-—]\s*@([^：:\n；]+)[：:]/g, '$1：')
+    .trim()
+}
 function subtitleText(s) {
-  let t = (s.dialogue && s.dialogue.trim()) || (s.action || '').trim() || stripMark(s.scene)
+  let t = (s.dialogue && displayDialogue(s.dialogue)) || (s.action || '').trim() || stripMark(s.scene)
   return t.replace(_LEAD_FILLER, '').trim()
 }
 function actionText(s) {
@@ -1344,7 +1519,7 @@ async function genBatch(kind) {
     await api.startBatch(store.current.id, b.id)
     message.success(`已提交批量${kind === 'video' ? '生视频' : '生图'}（${targets.length} 镜${locks.value.size ? `，跳过 ${locks.value.size} 锁定` : ''}）`)
     // surface the progress bar immediately; heavy polling (store) starts after 100s
-    await tasks.ensureBatchPolling({ immediate: true })
+    await tasks.ensureBatchPolling({ immediate: true, maxMinutes: tb.batchPollMaxMinutes })
     await reload()
   } catch (e) { message.error(e.message) }
 }
@@ -1412,7 +1587,7 @@ async function submitEpiGen() {
     const n = r.created?.length || 0
     const sk = r.skipped?.length ? `，跳过 ${r.skipped.length} 集` : ''
     message.success(`已启动 ${n} 集并发${epiGen.kind === 'video' ? '生视频' : '生图'}（最多 ${r.max_parallel} 集同时运行，单集串行）${sk}`)
-    await tasks.ensureBatchPolling({ immediate: true })
+    await tasks.ensureBatchPolling({ immediate: true, maxMinutes: tb.batchPollMaxMinutes })
     await reload()
   } catch (e) { message.error(e.message) }
 }
@@ -1598,7 +1773,7 @@ async function exportJianying() {
                   <template #trigger>
                     <button
                       class="st-badge"
-                      :class="`st-${statusByShot[s.shot_no].status}`"
+                      :class="[`st-${statusByShot[s.shot_no].status}`, { 'st-manual': statusByShot[s.shot_no].stage === 'manual' }]"
                       :title="statusByShot[s.shot_no].status === 'error' ? '查看本镜错误详情' : ''"
                       @click.stop="openShotError(s.shot_no)"
                     >
@@ -1646,6 +1821,7 @@ async function exportJianying() {
                   class="opt-cell"
                   :class="{ active: m && !isVirtualMaterial(m) && materialSame(currentMaterial(s.shot_no), m), empty: !m, generating: isVirtualMaterial(m) }"
                   @click="m && !isVirtualMaterial(m) && setCurrent(s.shot_no, m)"
+                  @contextmenu.prevent.stop="openMaterialMenu(s.shot_no, m, $event)"
                 >
                   <template v-if="isVirtualMaterial(m)">
                     <div class="opt-generating">
@@ -1658,6 +1834,14 @@ async function exportJianying() {
                   <template v-else-if="m">
                     <video v-if="isVideoFile(m.filename)" :src="matUrl(m)" muted class="opt-media" />
                     <img v-else :src="matUrl(m)" class="opt-media" />
+                    <button
+                      class="opt-menu-btn"
+                      type="button"
+                      title="素材菜单"
+                      @click.stop="openMaterialMenu(s.shot_no, m, $event)"
+                    >
+                      <n-icon :component="EllipsisVerticalOutline" />
+                    </button>
                   </template>
                 </div>
               </div>
@@ -1718,6 +1902,17 @@ async function exportJianying() {
         </div>
         </template>
       </n-scrollbar>
+
+      <n-dropdown
+        trigger="manual"
+        placement="bottom-start"
+        :show="materialMenu.show"
+        :x="materialMenu.x"
+        :y="materialMenu.y"
+        :options="materialMenuOptions"
+        @select="onMaterialMenuSelect"
+        @clickoutside="materialMenu.show = false"
+      />
 
       <!-- bottom toolbar: compact centered pill -->
       <Transition name="toolbar-morph">
@@ -1925,7 +2120,14 @@ async function exportJianying() {
         <div class="err-panel">
           <div class="err-summary">
             <span>{{ visibleErrors.length }} 条错误</span>
-            <n-button v-if="visibleErrors.length" size="tiny" type="warning" ghost @click="clearVisibleErrors">
+            <n-button
+              v-if="visibleErrors.length"
+              size="tiny"
+              type="warning"
+              ghost
+              :loading="errorClearing"
+              :disabled="errorClearing"
+              @click="clearVisibleErrors">
               一键清空
             </n-button>
             <n-button v-if="errorDrawerMode === 'shot'" size="tiny" quaternary @click="openEpisodeErrors()">
@@ -2196,6 +2398,8 @@ async function exportJianying() {
 .st-running { color: #4098fc; background: color-mix(in srgb, #4098fc 14%, transparent); }
 .st-done { color: #46c98b; background: color-mix(in srgb, #46c98b 16%, transparent); }
 .st-error { color: #f56c6c; background: color-mix(in srgb, #f56c6c 15%, transparent); cursor: pointer; }
+.st-skipped { color: var(--app-text-muted); background: color-mix(in srgb, var(--app-text-muted) 14%, transparent); }
+.st-manual { color: #d97706; background: color-mix(in srgb, #d97706 16%, transparent); }
 .st-decision {
   font-size: 10px; color: var(--app-accent, #46c98b);
   padding: 1px 6px; border-radius: 6px;
@@ -2393,6 +2597,7 @@ async function exportJianying() {
 }
 .opt-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
 .opt-cell {
+  position: relative;
   height: 96px; border-radius: 8px; overflow: hidden;
   border: 2px solid transparent; cursor: pointer;
 }
@@ -2408,6 +2613,32 @@ async function exportJianying() {
   cursor: default;
 }
 .opt-media { width: 100%; height: 100%; object-fit: cover; display: block; }
+.opt-menu-btn {
+  position: absolute;
+  right: 6px;
+  top: 6px;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255,255,255,.18);
+  border-radius: 6px;
+  background: rgba(0,0,0,.48);
+  color: #fff;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s, background .12s, transform .12s;
+}
+.opt-cell:hover .opt-menu-btn,
+.opt-cell.active .opt-menu-btn,
+.opt-menu-btn:focus-visible {
+  opacity: 1;
+}
+.opt-menu-btn:hover {
+  background: rgba(0,0,0,.68);
+  transform: translateY(-1px);
+}
 .opt-generating {
   height: 100%;
   display: grid;

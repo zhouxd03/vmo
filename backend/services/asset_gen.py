@@ -73,7 +73,11 @@ def generate_ref_image(pid: str, asset_id: str, *, model: Optional[str] = None,
         save_dir=_asset_dir(pid),
         filename_prefix=f"{asset['type']}_{asset_id}",
     )
-    patch = {"ref_image": result["filename"]}
+    patch = {
+        "ref_image": result["filename"],
+        "ref_original_image": result["filename"],
+        "ref_source": "generated",
+    }
     out = {"asset_id": asset_id, "filename": result["filename"], "prompt": prompt}
 
     assets_core.update_asset(pid, asset_id, patch)
@@ -84,7 +88,8 @@ _IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 
 
 def import_ref_image(pid: str, asset_id: str, src_path: str,
-                     orig_name: str = "") -> dict:
+                     orig_name: str = "", purpose: str = "import",
+                     base_image: str = "", line_options: Optional[dict] = None) -> dict:
     """Copy an external image file into the project's asset folder and bind it
     as the asset's reference image (persisted under data/projects/<pid>/assets/).
 
@@ -106,7 +111,31 @@ def import_ref_image(pid: str, asset_id: str, src_path: str,
     fname = f"{asset['type']}_{asset_id}_import_{uuid.uuid4().hex[:6]}{ext}"
     dest = _asset_dir(pid) / fname
     shutil.copyfile(src, dest)
-    assets_core.update_asset(pid, asset_id, {"ref_image": fname, "ref_source": "import"})
+    purpose = (purpose or "import").strip().lower()
+    if purpose == "line":
+        original = asset.get("ref_original_image") or base_image or asset.get("ref_image") or fname
+        patch = {
+            "ref_image": fname,
+            "ref_original_image": original,
+            "ref_source": "line",
+            "ref_line_base": base_image or original,
+        }
+        if line_options:
+            patch["ref_line_options"] = line_options
+    elif purpose == "collage":
+        patch = {
+            "ref_image": fname,
+            "ref_original_image": fname,
+            "ref_source": "collage",
+            "asset_kind": "collage",
+        }
+    else:
+        patch = {
+            "ref_image": fname,
+            "ref_original_image": fname,
+            "ref_source": "import",
+        }
+    assets_core.update_asset(pid, asset_id, patch)
     return {"asset_id": asset_id, "filename": fname}
 
 
@@ -139,6 +168,7 @@ def import_ref_image_from_asset(pid: str, asset_id: str, source_pid: str,
     shutil.copyfile(src, dest)
     assets_core.update_asset(pid, asset_id, {
         "ref_image": fname,
+        "ref_original_image": fname,
         "ref_source": "library",
     })
     return {
@@ -147,6 +177,26 @@ def import_ref_image_from_asset(pid: str, asset_id: str, source_pid: str,
         "source_project_id": source_pid,
         "source_asset_id": source_asset_id,
     }
+
+
+def restore_original_ref_image(pid: str, asset_id: str) -> dict:
+    project = projects.get_project(pid)
+    if not project:
+        raise image_gen.GenerationError("项目不存在")
+    asset = next((a for a in project.get("assets", []) if a["id"] == asset_id), None)
+    if not asset:
+        raise image_gen.GenerationError("资产不存在")
+    original = asset.get("ref_original_image") or asset.get("ref_image")
+    if not original:
+        raise image_gen.GenerationError("这个资产没有可恢复的原图")
+    src = _asset_dir(pid) / original
+    if not src.is_file():
+        raise image_gen.GenerationError("原图文件不存在")
+    assets_core.update_asset(pid, asset_id, {
+        "ref_image": original,
+        "ref_source": "restore",
+    })
+    return {"asset_id": asset_id, "filename": original}
 
 
 def _concurrency(override: Optional[int] = None) -> int:

@@ -84,6 +84,7 @@ def list_masked() -> dict:
                 "base_url": e.get("base_url", ""),
                 "model": e.get("model", ""),
                 "provider": e.get("provider", ""),
+                "managed": e.get("provider", "") in {"doubao_pool", "doubao_pool_intl"},
                 "enabled": e.get("enabled", True),
                 "is_default": e.get("is_default", False),
                 "api_key_masked": _mask(_deobfuscate(e.get("api_key", ""))),
